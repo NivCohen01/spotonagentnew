@@ -136,6 +136,20 @@ class GuideOutput(BaseModel):
     notes: Optional[str] = None
     success: bool
 
+class ActionTraceEntry(BaseModel):
+    """Serialized representation of a single agent action and its DOM context."""
+
+    step: int
+    order: int
+    action: str
+    value: Optional[str] = None
+    page_url: Optional[str] = None
+    xpath: Optional[str] = None
+    element_text: Optional[str] = None
+    element_tag: Optional[str] = None
+    element_attributes: Optional[dict[str, Any]] = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
 VisionLevel = Literal["auto", "low", "high"]
 SessionState = Literal["queued", "starting", "running", "done", "error", "stopped"]
 DeviceType = Literal["mobile", "desktop", "custom"]
@@ -234,6 +248,8 @@ class Status(BaseModel):
     error: Optional[str] = None
     screenshots_dir: Optional[str] = None
     queue_position: Optional[int] = None
+    action_trace: Optional[list[ActionTraceEntry]] = None
+    action_trace_summary: Optional[dict[str, Any]] = None
 
 class ResultPayload(BaseModel):
     state: SessionState
@@ -241,6 +257,8 @@ class ResultPayload(BaseModel):
     result: Optional[str] = None
     error: Optional[str] = None
     screenshots_dir: Optional[str] = None
+    action_trace: Optional[list[ActionTraceEntry]] = None
+    action_trace_summary: Optional[dict[str, Any]] = None
 
 class OptimizeReq(BaseModel):
     task: str
@@ -464,6 +482,141 @@ def _shape_steps_with_placeholders(extracted: dict) -> dict:
     enriched["steps"] = shaped
     return enriched
 
+def _normalize_element_dict(element: Any) -> Optional[dict]:
+    """Convert DOMInteractedElement/dataclass instances into plain dictionaries."""
+    if element is None:
+        return None
+    if isinstance(element, dict):
+        return element
+    normalized = _maybe_to_dict(element)
+    if isinstance(normalized, dict):
+        return normalized
+    return None
+
+def _stringify_action_value(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(v) for v in value if v not in (None, "")]
+        return ", ".join(parts)
+    return str(value)
+
+def _extract_action_value(action_name: str, params: dict[str, Any]) -> Optional[str]:
+    """Best-effort extraction of the primary user-provided value for an action."""
+    if not isinstance(params, dict):
+        return None
+    preferred_keys = ("value", "text", "input_text", "keys", "content", "query", "prompt", "message")
+    for key in preferred_keys:
+        if key in params and params[key] not in (None, ""):
+            return _stringify_action_value(params[key])
+    # URLs and selectors provide great context for navigation actions
+    for fallback_key in ("url", "selector", "xpath"):
+        if fallback_key in params and params[fallback_key]:
+            return _stringify_action_value(params[fallback_key])
+    return None
+
+def _history_entries_from_result(agent_result: Any) -> list[dict[str, Any]]:
+    """Return history entries as dictionaries regardless of raw object type."""
+    # Try structured model_dump first (works for AgentHistoryList instances)
+    with contextlib.suppress(Exception):
+        if hasattr(agent_result, "model_dump"):
+            data = agent_result.model_dump()
+            if isinstance(data, dict) and isinstance(data.get("history"), list):
+                return data["history"]
+
+    # Next try accessing the .history attribute and dumping individual steps
+    history_attr = getattr(agent_result, "history", None)
+    if isinstance(history_attr, list) and history_attr:
+        entries: list[dict[str, Any]] = []
+        for item in history_attr:
+            item_dict = None
+            if hasattr(item, "model_dump"):
+                with contextlib.suppress(Exception):
+                    item_dict = item.model_dump()
+            if item_dict is None:
+                item_dict = _maybe_to_dict(item)
+            if isinstance(item_dict, dict):
+                entries.append(item_dict)
+        if entries:
+            return entries
+
+    # Finally, support plain dict responses (e.g., already serialized history)
+    maybe_dict = _maybe_to_dict(agent_result)
+    if isinstance(maybe_dict, dict) and isinstance(maybe_dict.get("history"), list):
+        return maybe_dict["history"]
+
+    return []
+
+def _build_action_trace(agent_result: Any) -> list[ActionTraceEntry]:
+    """Serialize every action from the agent history into ActionTraceEntry records."""
+    entries: list[ActionTraceEntry] = []
+    history_items = _history_entries_from_result(agent_result)
+    if not history_items:
+        return entries
+
+    order = 1
+    for step_index, history_item in enumerate(history_items, 1):
+        model_output = history_item.get("model_output") or {}
+        state = history_item.get("state") or {}
+        actions = model_output.get("action") or []
+        if not isinstance(actions, list) or not actions:
+            continue
+        page_url = state.get("url")
+        interacted_elements = state.get("interacted_element") or []
+        if not isinstance(interacted_elements, list):
+            interacted_elements = [interacted_elements]
+
+        for action_pos, action_dump in enumerate(actions):
+            if not isinstance(action_dump, dict) or not action_dump:
+                continue
+            action_name, action_params = next(iter(action_dump.items()))
+            if action_params is None:
+                params_dict: dict[str, Any] = {}
+            elif isinstance(action_params, dict):
+                params_dict = dict(action_params)
+            else:
+                maybe_dict = _maybe_to_dict(action_params)
+                params_dict = maybe_dict if isinstance(maybe_dict, dict) else {"value": str(maybe_dict)}
+
+            interacted_element = interacted_elements[action_pos] if action_pos < len(interacted_elements) else None
+            element_dict = _normalize_element_dict(interacted_element) or {}
+
+            entries.append(ActionTraceEntry(
+                step=step_index,
+                order=order,
+                action=action_name,
+                value=_extract_action_value(action_name, params_dict),
+                page_url=page_url,
+                xpath=element_dict.get("x_path") or element_dict.get("xpath"),
+                element_text=element_dict.get("node_value"),
+                element_tag=element_dict.get("node_name"),
+                element_attributes=element_dict.get("attributes"),
+                params=params_dict,
+            ))
+            order += 1
+
+    return entries
+
+def _summarize_action_trace(entries: list[ActionTraceEntry]) -> dict[str, Any]:
+    """Group action trace entries by action name for a compact summary."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        packed = {
+            "step": entry.step,
+            "order": entry.order,
+            "value": entry.value,
+            "xpath": entry.xpath,
+            "page_url": entry.page_url,
+            "element_text": entry.element_text,
+            "element_tag": entry.element_tag,
+        }
+        if entry.params:
+            packed["params"] = entry.params
+        grouped.setdefault(entry.action, []).append({k: v for k, v in packed.items() if v not in (None, "", [], {})})
+
+    summary: dict[str, Any] = {}
+    for action, items in grouped.items():
+        summary[action] = items[0] if len(items) == 1 else items
+    return summary
+
 def slugify_title_for_guide(title: str) -> str:
     base = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")
     base = re.sub(r"-{2,}", "-", base)
@@ -510,6 +663,8 @@ class Session:
         self.state: SessionState = "queued"
         self.final_response: Optional[str] = None
         self.result_only: Optional[str] = None
+        self.action_trace: Optional[list[ActionTraceEntry]] = None
+        self.action_trace_summary: Optional[dict[str, Any]] = None
         self.error: Optional[str] = None
 
         self.screenshots_dir: Path = (SCREENSHOTS_BASE / self.id / "images")
@@ -535,7 +690,9 @@ class Session:
             result=self.result_only,
             error=self.error,
             screenshots_dir=str(self.screenshots_dir) if self.action_screenshots_enabled else None,
-            queue_position=queue_position
+            queue_position=queue_position,
+            action_trace=self.action_trace,
+            action_trace_summary=self.action_trace_summary,
         )
 
 sessions: Dict[str, Session] = {}
@@ -1050,6 +1207,8 @@ async def run_session(sess: Session):
         log.info("agent running...")
 
         result = await agent.run()
+        sess.action_trace = _build_action_trace(result)
+        sess.action_trace_summary = _summarize_action_trace(sess.action_trace) if sess.action_trace else None
 
         # store full final response
         sess.final_response = _ensure_json_text(result)
@@ -1065,6 +1224,9 @@ async def run_session(sess: Session):
             if sess.action_screenshots_enabled:
                 with contextlib.suppress(Exception):
                     enriched = _attach_screenshots_to_steps(enriched, sess.screenshots_dir)
+            if sess.action_trace_summary:
+                enriched = dict(enriched)
+                enriched["action_trace"] = sess.action_trace_summary
             sess.result_only = _ensure_json_text(enriched)
 
             # Fill the placeholder guide (best-effort)
@@ -1232,6 +1394,8 @@ async def get_result(sid: str):
         result=sess.result_only,
         error=sess.error,
         screenshots_dir=str(sess.screenshots_dir) if sess.action_screenshots_enabled else None,
+        action_trace=sess.action_trace,
+        action_trace_summary=sess.action_trace_summary,
     )
 
 @app.get("/sessions/{sid}/screenshots", dependencies=[Depends(require_api_key)])
