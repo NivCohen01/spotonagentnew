@@ -54,6 +54,7 @@ from browser_use.agent.views import (
 	JudgementResult,
 	StepMetadata,
 )
+from browser_use.browser.profile import ViewportSize
 from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.config import CONFIG
@@ -185,6 +186,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		llm_screenshot_size: tuple[int, int] | None = None,
 		_url_shortening_limit: int = 25,
 		action_screenshots: ActionScreenshotSettings | dict | None = None,
+		device_type: Literal['mobile', 'desktop', 'custom'] | None = None,
+		viewport_width: int | None = None,
+		viewport_height: int | None = None,
 		**kwargs,
 	):
 		# Validate llm_screenshot_size
@@ -259,6 +263,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			browser_profile=browser_profile,
 			id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
 		)
+
+		if device_type:
+			try:
+				self._apply_device_profile(
+					self.browser_session.browser_profile,
+					device_type=device_type,
+					device_width=viewport_width,
+					device_height=viewport_height,
+				)
+			except Exception as e:
+				logger.warning(f'dY"? Could not apply device profile ({device_type}): {type(e).__name__}: {e}')
 
 		# Initialize available file paths as direct attribute
 		self.available_file_paths = available_file_paths
@@ -617,6 +632,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		except Exception as e:
 			self.logger.error(f'dY", Failed to initialize screenshot service: {e}.')
 			raise e
+
+	def _apply_device_profile(
+		self,
+		browser_profile: BrowserProfile,
+		device_type: Literal['mobile', 'desktop', 'custom'],
+		device_width: int | None,
+		device_height: int | None,
+	) -> None:
+		"""Force browser viewport characteristics to match requested device type."""
+		if device_type == 'desktop':
+			if browser_profile.viewport is None:
+				browser_profile.viewport = ViewportSize(width=1920, height=1080)
+			browser_profile.device_scale_factor = float(browser_profile.device_scale_factor or 1.0)
+			browser_profile.no_viewport = False
+		elif device_type == 'mobile':
+			browser_profile.viewport = ViewportSize(width=390, height=844)
+			browser_profile.device_scale_factor = 3.0
+			browser_profile.no_viewport = False
+		elif device_type == 'custom':
+			if device_width and device_height:
+				browser_profile.viewport = ViewportSize(width=int(device_width), height=int(device_height))
+				browser_profile.no_viewport = False
+			else:
+				self.logger.info('device_type="custom" requested without viewport dimensions; leaving defaults.')
+
 	def save_file_system_state(self) -> None:
 		"""Save current file system state to agent state"""
 		if self.file_system:

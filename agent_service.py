@@ -1040,6 +1040,9 @@ async def run_session(sess: Session):
             vision_detail_level=sess.vision_detail_level,
             directly_open_url=sess.directly_open_url,
             action_screenshots=action_screenshot_settings,
+            device_type=sess.device_type,
+            viewport_width=sess.viewport_width,
+            viewport_height=sess.viewport_height,
         )
 
         # starting -> running

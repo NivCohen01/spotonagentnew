@@ -64,8 +64,27 @@ def _apply_spotlight(img: Image.Image, bbox: tuple[int, int, int, int], pad: int
 	img.alpha_composite(overlay)
 
 
+def _bbox_from_coordinates(
+	img: Image.Image, dpr: float, x: float, y: float, size: int = 80
+) -> tuple[int, int, int, int]:
+	"""Return a square bounding box centered around viewport coordinates."""
+
+	center_x = int(max(0, min(img.width, x * dpr)))
+	center_y = int(max(0, min(img.height, y * dpr)))
+	half = size // 2
+
+	return (
+		max(0, center_x - half),
+		max(0, center_y - half),
+		min(img.width, center_x + half),
+		min(img.height, center_y + half),
+	)
+
+
 class ActionScreenshotRecorder:
 	"""Captures annotated screenshots for each interactive action."""
+
+	_CLICK_ACTION_NAMES = {'click'}
 
 	def __init__(self, settings: ActionScreenshotSettings, agent_directory: Path, session_id: str):
 		self.settings = settings
@@ -100,21 +119,30 @@ class ActionScreenshotRecorder:
 		if not self.enabled or browser_session is None:
 			return None
 
+		action_data = action.model_dump(exclude_unset=True)
+		action_name, action_params = next(iter(action_data.items()), (None, {}))
+		action_name = action_name or 'action'
+		action_params = action_params or {}
+
+		if action_name not in self._CLICK_ACTION_NAMES:
+			return None
+
 		target_index = action.get_index()
-		if target_index is None:
-			return None
+		if target_index is not None:
+			try:
+				target_index = int(target_index)
+			except (TypeError, ValueError):
+				self.logger.debug(f'Skipping action screenshot: invalid index {target_index!r}')
+				target_index = None
 
-		cached_state = getattr(browser_session, '_cached_browser_state_summary', None)
-		dom_state = getattr(cached_state, 'dom_state', None)
-		selector_map = getattr(dom_state, 'selector_map', None) if dom_state else None
-		if not selector_map or target_index not in selector_map:
-			return None
+		coordinate_x = action_params.get('coordinate_x')
+		coordinate_y = action_params.get('coordinate_y')
+		try:
+			coordinate_x = float(coordinate_x) if coordinate_x is not None else None
+			coordinate_y = float(coordinate_y) if coordinate_y is not None else None
+		except (TypeError, ValueError):
+			coordinate_x = coordinate_y = None
 
-		element = selector_map[target_index]
-		if element is None or element.absolute_position is None:
-			return None
-
-		rect = element.absolute_position
 		old_highlight = browser_profile.highlight_elements
 		browser_profile.highlight_elements = False
 		try:
@@ -122,8 +150,11 @@ class ActionScreenshotRecorder:
 		finally:
 			browser_profile.highlight_elements = old_highlight
 
+		dom_state = getattr(state, 'dom_state', None)
+		selector_map = getattr(dom_state, 'selector_map', None) if dom_state else None
 		screenshot_b64 = getattr(state, 'screenshot', None)
 		if not screenshot_b64:
+			self.logger.debug('Skipping action screenshot: screenshot data missing.')
 			return None
 
 		image_bytes = base64.b64decode(screenshot_b64)
@@ -133,14 +164,34 @@ class ActionScreenshotRecorder:
 		device_pixel_ratio, _, _ = await get_viewport_info_from_cdp(cdp_session)
 		dpr = device_pixel_ratio or 1.0
 
-		bbox = (
-			int(rect.x * dpr),
-			int(rect.y * dpr),
-			int((rect.x + rect.width) * dpr),
-			int((rect.y + rect.height) * dpr),
-		)
+		bbox: tuple[int, int, int, int] | None = None
+		if selector_map and target_index is not None and target_index in selector_map:
+			element = selector_map[target_index]
+			if element and element.absolute_position:
+				rect = element.absolute_position
+				bbox = (
+					int(rect.x * dpr),
+					int(rect.y * dpr),
+					int((rect.x + rect.width) * dpr),
+					int((rect.y + rect.height) * dpr),
+				)
+			else:
+				self.logger.debug(f'Skipping annotation: element missing position for index {target_index}.')
+		elif target_index is not None:
+			self.logger.debug(f'Selector map missing index {target_index}; falling back to coordinates.')
 
-		if self.settings.annotate:
+		if bbox is None and coordinate_x is not None and coordinate_y is not None:
+			bbox = _bbox_from_coordinates(image, dpr, coordinate_x, coordinate_y)
+			self.logger.debug(
+				f'Annotating screenshot for action "{action_name}" using coordinates ({coordinate_x}, {coordinate_y}).'
+			)
+		elif bbox is None:
+			self.logger.debug(
+				f'Skipping action screenshot for "{action_name}": no selector index or coordinates available.'
+			)
+			return None
+
+		if bbox and self.settings.annotate:
 			if self.settings.spotlight:
 				_apply_spotlight(image, bbox)
 			draw = ImageDraw.Draw(image)
@@ -149,11 +200,16 @@ class ActionScreenshotRecorder:
 
 		filename = self._build_filename(action, step_number, action_index, target_index)
 		output_path = self.base_dir / filename
+		output_path.parent.mkdir(parents=True, exist_ok=True)
 		await anyio.to_thread.run_sync(image.save, output_path, 'PNG')
+		self.logger.info(f'Saved action screenshot -> {output_path}')
 		return str(output_path)
 
-	def _build_filename(self, action: 'ActionModel', step_number: int, action_index: int, target_index: int) -> str:
+	def _build_filename(
+		self, action: 'ActionModel', step_number: int, action_index: int, target_index: int | None
+	) -> str:
 		action_data = action.model_dump(exclude_unset=True)
 		action_name = next(iter(action_data.keys()), 'action')
 		timestamp_ms = int(time.time() * 1000)
-		return f'step_{step_number:03d}_{action_name}_{action_index}_{target_index}_{timestamp_ms}.png'
+		index_fragment = str(target_index) if target_index is not None else 'na'
+		return f'step_{step_number:03d}_{action_name}_{action_index}_{index_fragment}_{timestamp_ms}.png'
