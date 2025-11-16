@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import datetime as dt
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from browser_use import Agent, Browser
+from browser_use.agent.task_optimizer import AgentTaskOptimizer, TaskOptimizationRequest
+from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use.screenshots.models import ActionScreenshotSettings
+from sqlalchemy import text
+
+from .service_browser import _safe_browser_stop, launch_chrome
+from .service_config import DEFAULT_AUTHOR_ID, OPENAI_MODEL, SCREENSHOTS_BASE
+from .service_db import SessionLocal, db_create_empty_guide, db_finish_run, db_insert_run, db_update_guide_from_result
+from .service_logging import run_id_ctx
+from .service_models import (
+    ActionScreenshotOptions,
+    ActionTraceEntry,
+    GuideOutput,
+    SessionState,
+    StartReq,
+)
+from .service_trace import (
+    _attach_screenshots_to_steps,
+    _build_action_trace,
+    _coerce_guide_output_dict,
+    _ensure_json_text,
+    _shape_steps_with_placeholders,
+    _summarize_action_trace,
+)
+
+
+class Session:
+    def __init__(self, session_id: str, req: StartReq):
+        self.id = session_id
+        self.task = req.task
+        self.start_url = req.start_url
+        self.headless = req.headless
+        self.workspace_id = req.workspace_id
+
+        self.use_vision = req.use_vision
+        self.max_failures = req.max_failures
+        self.extend_system_message = req.extend_system_message
+        self.generate_gif = req.generate_gif
+        self.max_actions_per_step = req.max_actions_per_step
+        self.use_thinking = req.use_thinking
+        self.flash_mode = req.flash_mode
+        self.calculate_cost = req.calculate_cost
+        self.vision_detail_level = req.vision_detail_level
+        self.step_timeout = req.step_timeout
+        self.directly_open_url = req.directly_open_url
+        self.optimize_task = req.optimize_task
+
+        opts = req.action_screenshots or ActionScreenshotOptions()
+        self.action_screenshot_options = opts
+        self.action_screenshots_enabled = opts.enabled
+        self.action_screenshots_annotate = opts.annotate
+        self.screenshot_spotlight = opts.spotlight
+        self.action_screenshots_include_files = opts.include_in_available_files
+        self.action_screenshots_session_dirs = opts.session_subdirectories
+
+        self.device_type = req.device_type
+        self.viewport_width = req.viewport_width
+        self.viewport_height = req.viewport_height
+
+        self.state: SessionState = "queued"
+        self.final_response: Optional[str] = None
+        self.result_only: Optional[str] = None
+        self.action_trace: Optional[list[ActionTraceEntry]] = None
+        self.action_trace_summary: Optional[dict[str, Any]] = None
+        self.error: Optional[str] = None
+
+        self.screenshots_dir: Path = SCREENSHOTS_BASE / self.id / "images"
+        self.chrome_proc: Optional[asyncio.subprocess.Process] = None
+        self.cdp_port: Optional[int] = None
+        self.cdp_ws_url: Optional[str] = None
+
+        self.log_lines: list[str] = []
+        self.log_seq: int = 0
+        self.finished_at: Optional[dt.datetime] = None
+
+        self.guide_id: Optional[int] = None
+        self.guide_slug: Optional[str] = None
+
+    def to_status(self, queue_position: Optional[int] = None) -> Dict[str, Any]:
+        return {
+            "session_id": self.id,
+            "state": self.state,
+            "task": self.task,
+            "start_url": self.start_url,
+            "final_response": self.final_response,
+            "result": self.result_only,
+            "error": self.error,
+            "screenshots_dir": str(self.screenshots_dir) if self.screenshots_dir else None,
+            "queue_position": queue_position,
+            "action_trace": self.action_trace,
+            "action_trace_summary": self.action_trace_summary,
+        }
+
+    def to_result(self) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "final_response": self.final_response,
+            "result": self.result_only,
+            "error": self.error,
+            "screenshots_dir": str(self.screenshots_dir) if self.screenshots_dir else None,
+            "action_trace": self.action_trace,
+            "action_trace_summary": self.action_trace_summary,
+        }
+
+
+sessions: Dict[str, Session] = {}
+
+
+async def run_session(sess: Session):
+    token = run_id_ctx.set(sess.id)
+    log = logging.getLogger("service")
+    browser: Optional[Browser] = None
+
+    sess.state = "starting"
+
+    with contextlib.suppress(Exception):
+        await db_insert_run(sess)
+
+    with contextlib.suppress(Exception):
+        await db_create_empty_guide(sess)
+
+    try:
+        ws = await launch_chrome(sess)
+        browser = Browser(cdp_url=ws)
+
+        if not (sess.task and sess.task.strip()):
+            raise ValueError("Empty task provided")
+        if sess.start_url is not None and not sess.start_url.strip():
+            raise ValueError("Empty start_url provided")
+
+        optimized_task = f"{sess.task} Start url: {sess.start_url}" if sess.start_url else sess.task
+        if sess.optimize_task:
+            try:
+                optimizer = AgentTaskOptimizer(llm=ChatOpenAI(model=OPENAI_MODEL))
+                optimized_resp = await optimizer.optimize_async(TaskOptimizationRequest(task=optimized_task, mode="regular"))
+                if optimized_resp.optimized_task.strip():
+                    optimized_task = optimized_resp.optimized_task.strip()
+            except Exception as exc:
+                log.info("optimizer failed; using original task | %r", exc)
+
+        prev = sess.extend_system_message or ""
+        sess.extend_system_message = (
+            "When you finish, call the `done` action. "
+            "The `done` payload MUST put the final answer under `data` with fields: "
+            "{title: string, steps: string[], links: string[], success: boolean, notes: string|null}. "
+            "Return each step as its own item in `steps`. "
+            "Notes may be null or omitted. "
+            f"{prev}"
+        )
+
+        screenshots_dir_str: Optional[str] = None
+        action_screenshot_settings: ActionScreenshotSettings | None = None
+        if sess.action_screenshots_enabled:
+            sess.screenshots_dir.mkdir(parents=True, exist_ok=True)
+            screenshots_dir_str = str(sess.screenshots_dir)
+            action_screenshot_settings = ActionScreenshotSettings(
+                enabled=True,
+                output_dir=screenshots_dir_str,
+                annotate=sess.action_screenshots_annotate,
+                spotlight=sess.screenshot_spotlight,
+                include_in_available_files=sess.action_screenshots_include_files,
+                session_subdirectories=sess.action_screenshots_session_dirs,
+            )
+
+        agent = Agent(
+            llm=ChatOpenAI(model=OPENAI_MODEL),
+            task=optimized_task,
+            start_url=sess.start_url,
+            headless=sess.headless,
+            workspace_id=sess.workspace_id,
+            use_vision=sess.use_vision,
+            max_failures=sess.max_failures,
+            step_timeout=sess.step_timeout,
+            browser=browser,
+            max_actions_per_step=sess.max_actions_per_step,
+            final_response_after_failure=True,
+            output_model_schema=GuideOutput,
+            extend_system_message=sess.extend_system_message,
+            generate_gif=sess.generate_gif,
+            use_thinking=sess.use_thinking,
+            flash_mode=sess.flash_mode,
+            calculate_cost=sess.calculate_cost,
+            vision_detail_level=sess.vision_detail_level,
+            directly_open_url=sess.directly_open_url,
+            action_screenshots=action_screenshot_settings,
+            device_type=sess.device_type,
+            viewport_width=sess.viewport_width,
+            viewport_height=sess.viewport_height,
+        )
+
+        sess.state = "running"
+        log.info("agent running...")
+
+        result = await agent.run()
+        sess.action_trace = _build_action_trace(result)
+        sess.action_trace_summary = _summarize_action_trace(sess.action_trace) if sess.action_trace else None
+
+        sess.final_response = _ensure_json_text(result)
+
+        extracted = _coerce_guide_output_dict(result)
+        if extracted is None:
+            with contextlib.suppress(Exception):
+                extracted = _coerce_guide_output_dict(json.loads(sess.final_response))
+
+        if extracted is not None:
+            enriched = _shape_steps_with_placeholders(extracted)
+            if sess.action_screenshots_enabled:
+                with contextlib.suppress(Exception):
+                    enriched = _attach_screenshots_to_steps(enriched, sess.screenshots_dir)
+            if sess.action_trace_summary:
+                enriched = dict(enriched)
+                enriched["action_trace"] = sess.action_trace_summary
+            sess.result_only = _ensure_json_text(enriched)
+
+            with contextlib.suppress(Exception):
+                await db_update_guide_from_result(sess, enriched)
+
+        sess.state = "done"
+        log.info("agent done")
+
+    except asyncio.CancelledError:
+        sess.state = "stopped"
+        logging.getLogger("service").warning("agent stopped")
+        with contextlib.suppress(Exception):
+            if SessionLocal:
+                async with SessionLocal() as db:
+                    await db.execute(
+                        text(
+                            """
+                        UPDATE guides
+                        SET status='draft', updated_at=:now, updated_by=:uid
+                        WHERE run_id=:run_id
+                    """
+                        ),
+                        {"now": dt.datetime.utcnow(), "uid": DEFAULT_AUTHOR_ID, "run_id": sess.id},
+                    )
+                    await db.commit()
+        raise
+    except Exception:
+        import traceback
+
+        sess.error = traceback.format_exc()
+        sess.state = "error"
+        logging.getLogger("service").error("ERROR:\n%s", sess.error)
+        with contextlib.suppress(Exception):
+            if SessionLocal:
+                async with SessionLocal() as db:
+                    await db.execute(
+                        text(
+                            """
+                        UPDATE guides
+                        SET status='draft', updated_at=:now, updated_by=:uid
+                        WHERE run_id=:run_id
+                    """
+                        ),
+                        {"now": dt.datetime.utcnow(), "uid": DEFAULT_AUTHOR_ID, "run_id": sess.id},
+                    )
+                    await db.commit()
+    finally:
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                await _safe_browser_stop(browser)
+        with contextlib.suppress(Exception):
+            if sess.chrome_proc and sess.chrome_proc.returncode is None:
+                sess.chrome_proc.terminate()
+                try:
+                    await asyncio.wait_for(sess.chrome_proc.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    sess.chrome_proc.kill()
+        with contextlib.suppress(Exception):
+            await db_finish_run(sess)
+        run_id_ctx.reset(token)
