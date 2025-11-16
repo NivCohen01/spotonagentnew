@@ -62,7 +62,8 @@ class StartReq(BaseModel):
     directly_open_url: bool = True
     optimize_task: bool = True
 
-    action_screenshots_enabled: bool = False  # legacy fields (prefer action_screenshots payload)
+    # legacy screenshot flags
+    action_screenshots_enabled: bool = False
     action_screenshots_annotate: bool = True
     action_screenshots_include_files: bool = True
     action_screenshots_session_dirs: bool = False
@@ -82,6 +83,14 @@ class StartReq(BaseModel):
         if not v or not str(v).strip():
             raise ValueError("task must not be empty")
         return v
+
+    @model_validator(mode="after")
+    def sync_workspace_id(self) -> "StartReq":
+        # accept either workspace_id or ws_id
+        if self.workspace_id is None and self.ws_id is not None:
+            self.workspace_id = self.ws_id
+        return self
+
 
 
 class Status(BaseModel):
