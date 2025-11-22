@@ -81,6 +81,65 @@ def _bbox_from_coordinates(
 	)
 
 
+def _shrink_bbox(bbox: tuple[int, int, int, int], max_inset: int = 4) -> tuple[int, int, int, int]:
+	"""Slightly shrink a bbox to avoid over-drawing element edges."""
+	x1, y1, x2, y2 = bbox
+	width = max(0, x2 - x1)
+	height = max(0, y2 - y1)
+	if width <= 2 or height <= 2:
+		return bbox
+
+	inset = min(max_inset, max(1, int(min(width, height) * 0.02)))
+	return (x1 + inset, y1 + inset, x2 - inset, y2 - inset)
+
+
+def _clamp_bbox_to_image(bbox: tuple[int, int, int, int], img: Image.Image) -> tuple[int, int, int, int]:
+	"""Ensure bbox stays within image bounds."""
+	x1, y1, x2, y2 = bbox
+	x1 = max(0, min(x1, img.width))
+	y1 = max(0, min(y1, img.height))
+	x2 = max(0, min(x2, img.width))
+	y2 = max(0, min(y2, img.height))
+	return (x1, y1, x2, y2)
+
+
+def _normalize_coordinates_to_viewport(
+	coord_x: float | None,
+	coord_y: float | None,
+	*,
+	browser_session: 'BrowserSession',
+	viewport_width: int | None,
+	viewport_height: int | None,
+	screenshot_width: int | None,
+	screenshot_height: int | None,
+) -> tuple[float | None, float | None]:
+	"""Scale coordinates from screenshot/device space back to CSS viewport space."""
+	if coord_x is None or coord_y is None:
+		return coord_x, coord_y
+
+	x, y = coord_x, coord_y
+
+	# If screenshots were resized for the LLM, map back using the recorded viewport size
+	if browser_session.llm_screenshot_size and browser_session._original_viewport_size:
+		llm_w, llm_h = browser_session.llm_screenshot_size
+		orig_w, orig_h = browser_session._original_viewport_size
+		if llm_w and llm_h and orig_w and orig_h:
+			x = (x / llm_w) * orig_w
+			y = (y / llm_h) * orig_h
+	# Otherwise, if the model likely returned device-pixel coordinates (mobile/high-DPI), scale down
+	elif (
+		viewport_width
+		and viewport_height
+		and screenshot_width
+		and screenshot_height
+		and (x > viewport_width or y > viewport_height)
+	):
+		x = (x / screenshot_width) * viewport_width
+		y = (y / screenshot_height) * viewport_height
+
+	return x, y
+
+
 class ActionScreenshotRecorder:
 	"""Captures annotated screenshots for each interactive action."""
 
@@ -160,9 +219,40 @@ class ActionScreenshotRecorder:
 		image_bytes = base64.b64decode(screenshot_b64)
 		image = Image.open(io.BytesIO(image_bytes)).convert('RGBA')
 
+		page_info = getattr(state, 'page_info', None)
+		viewport_width = getattr(page_info, 'viewport_width', None) if page_info else None
+		viewport_height = getattr(page_info, 'viewport_height', None) if page_info else None
+		if viewport_width is None and browser_profile.viewport:
+			vp = browser_profile.viewport
+			viewport_width = vp.get('width') if isinstance(vp, dict) else getattr(vp, 'width', None)
+			viewport_height = vp.get('height') if isinstance(vp, dict) else getattr(vp, 'height', None)
+
+		# Normalize coordinates back to viewport space so annotations line up on mobile/high-DPI captures
+		coordinate_x, coordinate_y = _normalize_coordinates_to_viewport(
+			coordinate_x,
+			coordinate_y,
+			browser_session=browser_session,
+			viewport_width=viewport_width,
+			viewport_height=viewport_height,
+			screenshot_width=image.width,
+			screenshot_height=image.height,
+		)
+
 		cdp_session = await browser_session.get_or_create_cdp_session()
 		device_pixel_ratio, _, _ = await get_viewport_info_from_cdp(cdp_session)
 		dpr = device_pixel_ratio or 1.0
+
+		# Prefer per-axis scale from screenshot vs viewport; fall back to CDP DPR.
+		scale_x = scale_y = dpr
+		if viewport_width and viewport_height:
+			scale_x = image.width / float(viewport_width)
+			scale_y = image.height / float(viewport_height)
+			self.logger.debug(
+				f'Using screenshot-derived scale for annotations: scale_x={scale_x:.3f}, scale_y={scale_y:.3f}, cdp_dpr={dpr:.3f}'
+			)
+		elif viewport_width:
+			scale_x = scale_y = image.width / float(viewport_width)
+			self.logger.debug(f'Using screenshot-derived scale (width only) for annotations: {scale_x:.3f}')
 
 		bbox: tuple[int, int, int, int] | None = None
 		if selector_map and target_index is not None and target_index in selector_map:
@@ -170,10 +260,10 @@ class ActionScreenshotRecorder:
 			if element and element.absolute_position:
 				rect = element.absolute_position
 				bbox = (
-					int(rect.x * dpr),
-					int(rect.y * dpr),
-					int((rect.x + rect.width) * dpr),
-					int((rect.y + rect.height) * dpr),
+					round(rect.x * scale_x),
+					round(rect.y * scale_y),
+					round((rect.x + rect.width) * scale_x),
+					round((rect.y + rect.height) * scale_y),
 				)
 			else:
 				self.logger.debug(f'Skipping annotation: element missing position for index {target_index}.')
@@ -181,7 +271,7 @@ class ActionScreenshotRecorder:
 			self.logger.debug(f'Selector map missing index {target_index}; falling back to coordinates.')
 
 		if bbox is None and coordinate_x is not None and coordinate_y is not None:
-			bbox = _bbox_from_coordinates(image, dpr, coordinate_x, coordinate_y)
+			bbox = _bbox_from_coordinates(image, scale_x, coordinate_x, coordinate_y)
 			self.logger.debug(
 				f'Annotating screenshot for action "{action_name}" using coordinates ({coordinate_x}, {coordinate_y}).'
 			)
@@ -192,6 +282,10 @@ class ActionScreenshotRecorder:
 			return None
 
 		if bbox and self.settings.annotate:
+			# Clamp to image bounds to avoid spillover, then only shrink when bbox is coordinate-derived
+			bbox = _clamp_bbox_to_image(bbox, image)
+			if target_index is None:
+				bbox = _shrink_bbox(bbox)
 			if self.settings.spotlight:
 				_apply_spotlight(image, bbox)
 			draw = ImageDraw.Draw(image)

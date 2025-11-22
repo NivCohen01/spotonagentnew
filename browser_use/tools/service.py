@@ -235,20 +235,63 @@ class Tools(Generic[Context]):
 
 		# Helper function for coordinate conversion
 		def _convert_llm_coordinates_to_viewport(llm_x: int, llm_y: int, browser_session: BrowserSession) -> tuple[int, int]:
-			"""Convert coordinates from LLM screenshot size to original viewport size."""
+			"""Convert LLM-provided coordinates to the current viewport."""
+
+			# Resized screenshot case (llm_screenshot_size)
 			if browser_session.llm_screenshot_size and browser_session._original_viewport_size:
 				original_width, original_height = browser_session._original_viewport_size
 				llm_width, llm_height = browser_session.llm_screenshot_size
 
-				# Convert coordinates using fractions
 				actual_x = int((llm_x / llm_width) * original_width)
 				actual_y = int((llm_y / llm_height) * original_height)
 
 				logger.info(
-					f'🔄 Converting coordinates: LLM ({llm_x}, {llm_y}) @ {llm_width}x{llm_height} '
-					f'→ Viewport ({actual_x}, {actual_y}) @ {original_width}x{original_height}'
+					f"?? Converting coordinates: LLM ({llm_x}, {llm_y}) @ {llm_width}x{llm_height} "
+					f"? Viewport ({actual_x}, {actual_y}) @ {original_width}x{original_height}"
 				)
 				return actual_x, actual_y
+
+			# High-DPI/mobile screenshots: model may send device-pixel coordinates
+			viewport_width = None
+			viewport_height = None
+			screenshot_width = None
+			screenshot_height = None
+
+			state = browser_session._cached_browser_state_summary
+			if state and state.page_info:
+				viewport_width = state.page_info.viewport_width
+				viewport_height = state.page_info.viewport_height
+			elif browser_session.browser_profile.viewport:
+				vp = browser_session.browser_profile.viewport
+				viewport_width = vp.get('width') if isinstance(vp, dict) else getattr(vp, 'width', None)
+				viewport_height = vp.get('height') if isinstance(vp, dict) else getattr(vp, 'height', None)
+
+			if state and state.screenshot:
+				try:
+					import base64
+					import io
+					from PIL import Image
+
+					img = Image.open(io.BytesIO(base64.b64decode(state.screenshot)))
+					screenshot_width, screenshot_height = img.size
+				except Exception:
+					pass
+
+			if (
+				viewport_width
+				and viewport_height
+				and screenshot_width
+				and screenshot_height
+				and (llm_x > viewport_width or llm_y > viewport_height)
+			):
+				actual_x = int((llm_x / screenshot_width) * viewport_width)
+				actual_y = int((llm_y / screenshot_height) * viewport_height)
+				logger.debug(
+					f"?? Normalized coordinates from screenshot space {llm_x}x{llm_y} to viewport space {actual_x}x{actual_y}"
+				)
+				return actual_x, actual_y
+
+			# Default: assume coordinates are already in viewport space
 			return llm_x, llm_y
 
 		# Element Interaction Actions
