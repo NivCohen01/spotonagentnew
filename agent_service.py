@@ -193,7 +193,13 @@ async def generate_video(sid: str):
     if not trace_entries:
         raise HTTPException(status_code=404, detail="action_trace not found for session")
 
-    video_path, applied, skipped = await replay_action_trace_to_video(sid, trace_entries)
+    video_path, applied, skipped = await replay_action_trace_to_video(
+        sid,
+        trace_entries,
+        device_type=sess.device_type if sess else "desktop",
+        viewport_width=sess.viewport_width if sess else None,
+        viewport_height=sess.viewport_height if sess else None,
+    )
     return GenerateVideoResponse(
         session_id=sid,
         video_path=str(video_path) if video_path else None,

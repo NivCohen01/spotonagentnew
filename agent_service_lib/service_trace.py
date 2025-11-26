@@ -263,7 +263,11 @@ def _history_entries_from_result(agent_result: Any) -> list[dict[str, Any]]:
 
 
 def _build_action_trace(agent_result: Any) -> list[ActionTraceEntry]:
-    """Serialize every action from the agent history into ActionTraceEntry records."""
+    """Serialize every action from the agent history into ActionTraceEntry records.
+
+    We only keep actions that executed without raising an error to avoid replaying
+    failed/irrelevant attempts in generated videos.
+    """
     entries: list[ActionTraceEntry] = []
     history_items = _history_entries_from_result(agent_result)
     if not history_items:
@@ -274,12 +278,15 @@ def _build_action_trace(agent_result: Any) -> list[ActionTraceEntry]:
         model_output = history_item.get("model_output") or {}
         state = history_item.get("state") or {}
         actions = model_output.get("action") or []
+        results = history_item.get("result") or []
         if not isinstance(actions, list) or not actions:
             continue
         page_url = state.get("url")
         interacted_elements = state.get("interacted_element") or []
         if not isinstance(interacted_elements, list):
             interacted_elements = [interacted_elements]
+        if not isinstance(results, list):
+            results = []
 
         for action_pos, action_dump in enumerate(actions):
             if not isinstance(action_dump, dict) or not action_dump:
@@ -295,6 +302,10 @@ def _build_action_trace(agent_result: Any) -> list[ActionTraceEntry]:
 
             interacted_element = interacted_elements[action_pos] if action_pos < len(interacted_elements) else None
             element_dict = _normalize_element_dict(interacted_element) or {}
+            action_result = results[action_pos] if action_pos < len(results) else None
+            if isinstance(action_result, dict) and action_result.get("error"):
+                # Skip actions that failed to execute; they add noise to replay video
+                continue
 
             entries.append(
                 ActionTraceEntry(
