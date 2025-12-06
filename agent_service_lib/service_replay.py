@@ -547,6 +547,14 @@ async def replay_action_trace_to_video(
                 initialized_url = True
 
         for entry in entries:
+            action_lower = (entry.action or "").lower()
+
+            # Only honor the first explicit navigate/go-to-url action. Subsequent navigations
+            # should happen naturally via the recorded clicks to keep the replay faithful.
+            if initialized_url and action_lower == "navigate":
+                skipped.append(f"{entry.action} (step {entry.step}): skipped extra navigate after initial load")
+                continue
+
             if not initialized_url and entry.page_url:
                 try:
                     await browser.goto(entry.page_url)
@@ -556,6 +564,8 @@ async def replay_action_trace_to_video(
             ok, reason = await _apply_replay_action(browser, entry, logger)
             if ok:
                 applied += 1
+                if action_lower == "navigate":
+                    initialized_url = True
             else:
                 skipped.append(f"{entry.action} (step {entry.step}): {reason or 'failed'}")
 
