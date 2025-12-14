@@ -4,6 +4,7 @@ import base64
 import logging
 import math
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -38,7 +39,7 @@ class VideoRecorderService:
 	It automatically resizes frames to match the target video dimensions.
 	"""
 
-	def __init__(self, output_path: Path, size: ViewportSize, framerate: int):
+	def __init__(self, output_path: Path, size: ViewportSize, framerate: int, warmup_seconds: float = 0.0):
 		"""
 		Initializes the video recorder.
 
@@ -46,13 +47,31 @@ class VideoRecorderService:
 		    output_path: The full path where the video will be saved.
 		    size: A ViewportSize object specifying the width and height of the video.
 		    framerate: The desired framerate for the output video.
+		    warmup_seconds: Optional initial window to skip frames (avoids blank/half-rendered frames).
 		"""
 		self.output_path = output_path
 		self.size = size
 		self.framerate = framerate
 		self._writer: Optional['Format.Writer'] = None
 		self._is_active = False
+		self._is_paused = False
 		self.padded_size = _get_padded_size(self.size)
+		self._frame_count = 0
+		self._first_frame_ts: float | None = None
+		self._last_frame_ts: float | None = None
+		self._start_wall_time: float | None = None
+		self._target_fps = max(1, int(self.framerate or 5))
+		self._warmup_seconds = max(0.0, float(warmup_seconds))
+		# Keep replication modest so gaps don't over-inflate the output duration.
+		self._max_replicate_per_frame = 4
+
+	def pause(self) -> None:
+		"""Temporarily pause adding frames to the recording."""
+		self._is_paused = True
+
+	def resume(self) -> None:
+		"""Resume adding frames to the recording."""
+		self._is_paused = False
 
 	def start(self) -> None:
 		"""
@@ -69,15 +88,20 @@ class VideoRecorderService:
 
 		try:
 			self.output_path.parent.mkdir(parents=True, exist_ok=True)
+			self._start_wall_time = time.monotonic()
+			self._frame_count = 0
+			self._first_frame_ts = None
+			self._last_frame_ts = None
 			# The macro_block_size is set to None because we handle padding ourselves
 			self._writer = iio.get_writer(
 				str(self.output_path),
-				fps=self.framerate,
+				fps=self._target_fps,
 				codec='libx264',
 				quality=8,  # A good balance of quality and file size (1-10 scale)
 				pixelformat='yuv420p',  # Ensures compatibility with most players
 				macro_block_size=None,
 			)
+			self._is_paused = False
 			self._is_active = True
 			logger.debug(f'Video recorder started. Output will be saved to {self.output_path}')
 		except Exception as e:
@@ -92,10 +116,26 @@ class VideoRecorderService:
 		Args:
 		    frame_data_b64: A base64-encoded string of the PNG frame data.
 		"""
-		if not self._is_active or not self._writer:
+		if not self._is_active or not self._writer or self._is_paused:
 			return
 
 		try:
+			if self._start_wall_time is not None and self._warmup_seconds > 0:
+				if (time.monotonic() - self._start_wall_time) < self._warmup_seconds:
+					return
+
+			now = time.monotonic()
+			if self._first_frame_ts is None:
+				self._first_frame_ts = now
+			dt = 0.0
+			if self._last_frame_ts is not None:
+				dt = max(0.0, min(now - self._last_frame_ts, 1.0))
+			self._last_frame_ts = now
+
+			# Replicate frames so video duration tracks the real elapsed time even if CDP frames are sparse.
+			replicate = max(1, int(round(dt * self._target_fps)))
+			replicate = min(self._max_replicate_per_frame, replicate)
+
 			frame_bytes = base64.b64decode(frame_data_b64)
 
 			# Build a filter chain for ffmpeg:
@@ -139,7 +179,9 @@ class VideoRecorderService:
 			# Convert the raw output bytes to a numpy array with the padded dimensions
 			img_array = np.frombuffer(out, dtype=np.uint8).reshape((self.padded_size['height'], self.padded_size['width'], 3))
 
-			self._writer.append_data(img_array)
+			for _ in range(replicate):
+				self._writer.append_data(img_array)
+			self._frame_count += replicate
 		except Exception as e:
 			logger.warning(f'Could not process and add video frame: {e}')
 
@@ -154,6 +196,18 @@ class VideoRecorderService:
 
 		try:
 			self._writer.close()
+			wall = (time.monotonic() - self._start_wall_time) if self._start_wall_time else None
+			video_duration = (self._frame_count / float(self._target_fps)) if self._target_fps else None
+			logger.info(
+				'[video_recorder] frames=%d, first_ts=%s, last_ts=%s, wall_clock_duration=%s, fps=%s, video_duration_estimate=%s, output=%s',
+				self._frame_count,
+				self._first_frame_ts,
+				self._last_frame_ts,
+				f'{wall:.3f}s' if wall is not None else 'unknown',
+				self._target_fps,
+				f'{video_duration:.3f}s' if video_duration is not None else 'unknown',
+				self.output_path,
+			)
 			logger.info(f'📹 Video recording saved successfully to: {self.output_path}')
 		except Exception as e:
 			logger.error(f'Failed to finalize and save video: {e}')

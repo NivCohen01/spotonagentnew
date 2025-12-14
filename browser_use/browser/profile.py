@@ -662,7 +662,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 	record_video_size: ViewportSize | None = Field(
 		default=None, description='Video frame size. If not set, it will use the viewport size.'
 	)
-	record_video_framerate: int = Field(default=30, description='The framerate to use for the video recording.')
+	record_video_framerate: int = Field(default=5, description='The framerate to use for the video recording.')
 
 	# TODO: finish implementing extension support in extensions.py
 	# extension_ids_to_preinstall: list[str] = Field(

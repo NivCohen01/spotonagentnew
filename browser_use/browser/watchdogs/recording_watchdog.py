@@ -47,7 +47,13 @@ class RecordingWatchdog(BaseWatchdog):
 		output_path = Path(profile.record_video_dir) / f'{uuid7str()}.{video_format}'
 
 		self.logger.debug(f'Initializing video recorder for format: {video_format}')
-		self._recorder = VideoRecorderService(output_path=output_path, size=size, framerate=profile.record_video_framerate)
+		self._recorder = VideoRecorderService(
+			output_path=output_path,
+			size=size,
+			framerate=profile.record_video_framerate,
+			# Keep warmup small so early frames are not skipped in the final video.
+			warmup_seconds=0.5,
+		)
 		self._recorder.start()
 
 		if not self._recorder._is_active:
@@ -119,6 +125,18 @@ class RecordingWatchdog(BaseWatchdog):
 			)
 		except Exception as e:
 			self.logger.debug(f'Failed to acknowledge screencast frame: {e}')
+
+	async def pause_recording(self) -> None:
+		"""Pause adding frames to the recorder (best-effort)."""
+		if self._recorder:
+			self.logger.debug('RecordingWatchdog: pausing video recorder')
+			self._recorder.pause()
+
+	async def resume_recording(self) -> None:
+		"""Resume adding frames to the recorder (best-effort)."""
+		if self._recorder:
+			self.logger.debug('RecordingWatchdog: resuming video recorder')
+			self._recorder.resume()
 
 	async def on_BrowserStopEvent(self, event: BrowserStopEvent) -> None:
 		"""

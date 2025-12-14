@@ -1779,6 +1779,16 @@ class BrowserSession(BaseModel):
 			return target.title
 		return 'Unknown page title'
 
+	async def pause_video_recording(self) -> None:
+		"""Pause video recording if the recording watchdog is active."""
+		if self._recording_watchdog and hasattr(self._recording_watchdog, 'pause_recording'):
+			await self._recording_watchdog.pause_recording()
+
+	async def resume_video_recording(self) -> None:
+		"""Resume video recording if the recording watchdog is active."""
+		if self._recording_watchdog and hasattr(self._recording_watchdog, 'resume_recording'):
+			await self._recording_watchdog.resume_recording()
+
 	async def navigate_to(self, url: str, new_tab: bool = False) -> None:
 		"""Navigate to a URL using the standard event system.
 
