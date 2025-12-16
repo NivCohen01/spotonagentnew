@@ -14,6 +14,7 @@ API_KEY = os.getenv("API_KEY", "").strip()
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 MAX_CONCURRENCY = max(1, int(os.getenv("MAX_CONCURRENCY", "4")))
+MAX_CHROME_CONCURRENCY = max(1, int(os.getenv("MAX_CHROME_CONCURRENCY", "2")))
 
 STRIP_ANSI = bool(int(os.getenv("STRIP_ANSI_IN_DB", "1")))
 COLLAPSE_INTERNAL_SPACES = bool(int(os.getenv("COLLAPSE_INTERNAL_SPACES", "0")))
@@ -52,4 +53,3 @@ BASE_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 CTRL_ZW_RE = re.compile("[" + "\u200B\u200C\u200D\u200E\u200F" + "\u2060" + "\uFEFF" + "]")
 STEP_IMG_RE = re.compile(r"step_(\d{1,3})_.*\.(png|jpg|jpeg)$", re.IGNORECASE)
-
