@@ -114,6 +114,8 @@ async def _generate_final_guide_with_evidence(
         "Constraints:\n"
         "- Use only evidence_ids from the provided evidence table.\n"
         "- Each evidence_id may appear in at most one guide step; merge steps if they would reuse the same evidence.\n"
+        "- Only assign evidence_ids whose page_url matches the step pageUrl when provided.\n"
+        "- For click steps, prefer click evidence that includes screenshot_before/after (best_image).\n"
         "- primary_evidence_id must be null or one of evidence_ids (prefer click evidence).\n"
         "- Combine related micro-actions from the same screen/evidence into a single clear instruction when it improves readability.\n"
         "- Keep step numbers sequential starting from 1 and use concise imperative descriptions."

@@ -500,6 +500,28 @@ def _matches_run_step(path: str, run_step_id: int | None) -> bool:
     return bool(info and info.get("run_step_id") == int(run_step_id))
 
 
+def _normalize_page_url(url: str | None) -> tuple[str | None, str | None]:
+    if not url:
+        return None, None
+    parsed = urlparse(url)
+    host = parsed.netloc or None
+    path = parsed.path or "/"
+    path = path.rstrip("/") or "/"
+    return host, path
+
+
+def _page_url_matches(step_url: str | None, evidence_url: str | None) -> bool:
+    if step_url is None:
+        return True
+    step_host, step_path = _normalize_page_url(step_url)
+    ev_host, ev_path = _normalize_page_url(evidence_url)
+    if ev_path is None:
+        return False
+    if step_host and ev_host and step_host != ev_host:
+        return False
+    return step_path == ev_path
+
+
 def _pick_primary_action(actions: list[str]) -> str | None:
     priority = {"click": 0, "input": 1, "navigate": 2, "extract": 3}
     if not actions:
@@ -666,6 +688,31 @@ def _is_click_only(ev: EvidenceEvent) -> bool:
     return ev.action_types and all(a == "click" for a in ev.action_types)
 
 
+_SCREENSHOT_VERBS = ("click", "select", "open", "choose", "press", "tap", "type", "enter", "fill", "send", "submit", "login", "log in")
+
+
+def _needs_screenshot(description: str | None) -> bool:
+    desc = (description or "").lower()
+    return any(k in desc for k in _SCREENSHOT_VERBS)
+
+
+def _preferred_action_kind(description: str | None) -> str:
+    desc = (description or "").lower()
+    if any(k in desc for k in ("click", "select", "open", "choose", "press", "tap", "submit", "send")):
+        return "click"
+    if any(k in desc for k in ("type", "enter", "fill", "login", "log in")):
+        return "input"
+    return "any"
+
+
+def _first_screenshot_evidence_id(step: GuideStepWithEvidence, ev_lookup: dict[int, EvidenceEvent]) -> int | None:
+    for eid in step.evidence_ids:
+        ev = ev_lookup.get(eid)
+        if ev and ev.best_image:
+            return eid
+    return None
+
+
 def _nearest_unused_evidence(
     intent: str,
     page_url: str | None,
@@ -723,65 +770,188 @@ def _nearest_unused_evidence(
     return best
 
 
+def _select_gap_fill_candidate(
+    step: GuideStepWithEvidence,
+    evidence_table: list[EvidenceEvent],
+    used: set[int],
+    last_screenshot_id: int | None,
+) -> EvidenceEvent | None:
+    if not step.pageUrl:
+        return None
+    candidates = [
+        ev for ev in evidence_table if ev.evidence_id not in used and ev.best_image and _page_url_matches(step.pageUrl, ev.page_url)
+    ]
+    if not candidates:
+        return None
+
+    preferred_kind = _preferred_action_kind(step.description)
+    if preferred_kind == "click":
+        preferred = [ev for ev in candidates if "click" in ev.action_types]
+    elif preferred_kind == "input":
+        preferred = [ev for ev in candidates if any(a in ev.action_types for a in ("input", "type", "send_keys"))]
+    else:
+        preferred = []
+    pool = preferred or candidates
+
+    if last_screenshot_id is None:
+        return min(pool, key=lambda ev: ev.evidence_id)
+
+    greater = [ev for ev in pool if ev.evidence_id > last_screenshot_id]
+    if greater:
+        return min(greater, key=lambda ev: ev.evidence_id)
+
+    return min(pool, key=lambda ev: (abs(ev.evidence_id - last_screenshot_id), ev.evidence_id))
+
+
 def _post_process_guide_steps(steps: list[Any], evidence_table: list[EvidenceEvent]) -> list[dict[str, Any]]:
     ev_lookup = {ev.evidence_id: ev for ev in evidence_table}
-    used: set[int] = set()
-    normalized_steps: list[dict[str, Any]] = []
+    if not steps:
+        return []
 
-    for step in steps or []:
+    step_objs: list[GuideStepWithEvidence] = []
+    original_ids_by_idx: dict[int, list[int]] = {}
+
+    for idx, step in enumerate(steps or [], 1):
         step_obj = step if isinstance(step, GuideStepWithEvidence) else GuideStepWithEvidence.model_validate(step)
-        intent = _intent_from_description(step_obj.description or "")
-        original_ids = list(step_obj.evidence_ids)
+        normalized_ids: list[int] = []
+        for raw_id in step_obj.evidence_ids or []:
+            try:
+                eid = int(raw_id)
+            except Exception:
+                continue
+            if eid in ev_lookup:
+                normalized_ids.append(eid)
+        step_obj.evidence_ids = list(dict.fromkeys(normalized_ids))
+        original_ids_by_idx[idx] = list(step_obj.evidence_ids)
+        step_objs.append(step_obj)
 
-        # Drop evidence not in lookup or already used
-        step_obj.evidence_ids = [eid for eid in step_obj.evidence_ids if eid in ev_lookup and eid not in used]
-
-        # Wait/state steps shouldn't steal click-only evidence when others exist
-        if intent == "wait":
-            click_only = [eid for eid in step_obj.evidence_ids if _is_click_only(ev_lookup[eid])]
-            non_click = [eid for eid in step_obj.evidence_ids if not _is_click_only(ev_lookup[eid])]
-            if non_click:
-                step_obj.evidence_ids = non_click
-
-        # For click/input prefer matching intent evidence if present
-        if intent in ("click", "input", "extract"):
-            matching = [eid for eid in step_obj.evidence_ids if _evidence_matches_intent(ev_lookup[eid], intent)]
-            if matching:
-                step_obj.evidence_ids = matching
-
-        # Repair: assign nearest unused matching evidence if none remain for click/input
-        if intent in ("click", "input") and not step_obj.evidence_ids:
-            candidate = _nearest_unused_evidence(intent, step_obj.pageUrl, used, evidence_table, anchor_ids=original_ids)
-            if candidate:
-                step_obj.evidence_ids.append(candidate.evidence_id)
-
-        # Enforce uniqueness across steps
-        step_obj.evidence_ids = [eid for eid in step_obj.evidence_ids if eid not in used]
-        for eid in step_obj.evidence_ids:
-            used.add(eid)
-
-        # Recompute primary
-        step_obj.primary_evidence_id = None
+    # A) Page-url coherence filter
+    for step_obj in step_objs:
+        if not step_obj.pageUrl:
+            continue
+        before = list(step_obj.evidence_ids)
+        filtered: list[int] = []
+        removed: list[int] = []
         for eid in step_obj.evidence_ids:
             ev = ev_lookup.get(eid)
-            if ev and ev.best_image and _evidence_matches_intent(ev, intent):
-                step_obj.primary_evidence_id = eid
-                break
-        if step_obj.primary_evidence_id is None and step_obj.evidence_ids:
-            step_obj.primary_evidence_id = step_obj.evidence_ids[0]
+            if ev and _page_url_matches(step_obj.pageUrl, ev.page_url):
+                filtered.append(eid)
+            else:
+                removed.append(eid)
+        if removed:
+            logger.debug(
+                "Step %s pageUrl=%s removed evidence_ids due to mismatch: %s", step_obj.number, step_obj.pageUrl, removed
+            )
+        step_obj.evidence_ids = filtered
 
-        # Images from primary evidence only
-        if step_obj.primary_evidence_id is not None:
-            ev = ev_lookup.get(step_obj.primary_evidence_id)
-            step_obj.images = [ev.best_image] if ev and ev.best_image else []
+    # B) Uniqueness constraint across steps
+    evidence_to_steps: dict[int, list[int]] = {}
+    for idx, step_obj in enumerate(step_objs):
+        for eid in step_obj.evidence_ids:
+            evidence_to_steps.setdefault(eid, []).append(idx)
+
+    for eid, idxs in evidence_to_steps.items():
+        if len(idxs) <= 1:
+            continue
+        ev = ev_lookup.get(eid)
+        matching_idxs = []
+        for idx in idxs:
+            st = step_objs[idx]
+            if ev and _page_url_matches(st.pageUrl, ev.page_url):
+                matching_idxs.append(idx)
+            elif st.pageUrl is None and (ev is None or ev.page_url is None):
+                matching_idxs.append(idx)
+        if matching_idxs:
+            keep_idx = min(matching_idxs, key=lambda i: step_objs[i].number or (i + 1))
         else:
-            step_obj.images = []
+            keep_idx = min(idxs, key=lambda i: step_objs[i].number or (i + 1))
+        drop_idxs = [i for i in idxs if i != keep_idx]
+        if drop_idxs:
+            logger.debug(
+                "Evidence %s duplicated across steps %s; keeping step %s, removing from %s",
+                eid,
+                [step_objs[i].number for i in idxs],
+                step_objs[keep_idx].number,
+                [step_objs[i].number for i in drop_idxs],
+            )
+        for idx in drop_idxs:
+            st = step_objs[idx]
+            st.evidence_ids = [val for val in st.evidence_ids if val != eid]
 
+    used: set[int] = {eid for st in step_objs for eid in st.evidence_ids}
+
+    # C) Fill missing screenshot evidence
+    last_screenshot_id: int | None = None
+    for step_obj in step_objs:
+        existing_screenshot_id = _first_screenshot_evidence_id(step_obj, ev_lookup)
+        if existing_screenshot_id is not None:
+            last_screenshot_id = existing_screenshot_id
+            continue
+
+        if not _needs_screenshot(step_obj.description):
+            continue
+
+        candidate = _select_gap_fill_candidate(step_obj, evidence_table, used, last_screenshot_id)
+        if candidate:
+            step_obj.evidence_ids.append(candidate.evidence_id)
+            used.add(candidate.evidence_id)
+            if not (
+                step_obj.primary_evidence_id
+                and step_obj.primary_evidence_id in ev_lookup
+                and ev_lookup[step_obj.primary_evidence_id].best_image
+            ):
+                step_obj.primary_evidence_id = candidate.evidence_id
+            last_screenshot_id = candidate.evidence_id
+            logger.debug(
+                "Gap fill assigned evidence_id=%s to step %s (pageUrl=%s)", candidate.evidence_id, step_obj.number, step_obj.pageUrl
+            )
+        else:
+            logger.debug(
+                "Gap fill: step %s needs screenshot but no unused evidence found on pageUrl=%s",
+                step_obj.number,
+                step_obj.pageUrl,
+            )
+
+    # D) Primary evidence choice and final normalization
+    normalized_steps: list[dict[str, Any]] = []
+    for step_obj in step_objs:
+        step_obj.evidence_ids = list(dict.fromkeys(step_obj.evidence_ids))
+        if not step_obj.evidence_ids:
+            step_obj.primary_evidence_id = None
+            step_obj.images = []
+        else:
+            if step_obj.primary_evidence_id not in step_obj.evidence_ids:
+                step_obj.primary_evidence_id = None
+            has_primary_image = bool(
+                step_obj.primary_evidence_id
+                and step_obj.primary_evidence_id in ev_lookup
+                and ev_lookup[step_obj.primary_evidence_id].best_image
+            )
+            if not has_primary_image:
+                image_candidates = [eid for eid in step_obj.evidence_ids if ev_lookup.get(eid) and ev_lookup[eid].best_image]
+                if image_candidates:
+                    old_primary = step_obj.primary_evidence_id
+                    step_obj.primary_evidence_id = image_candidates[0]
+                    if old_primary and old_primary != step_obj.primary_evidence_id:
+                        logger.debug(
+                            "Primary evidence switched for step %s from %s to %s to use screenshot",
+                            step_obj.number,
+                            old_primary,
+                            step_obj.primary_evidence_id,
+                        )
+            if step_obj.primary_evidence_id is None:
+                step_obj.primary_evidence_id = step_obj.evidence_ids[0]
+            step_obj.images = []
         normalized_steps.append(step_obj.model_dump())
 
-    # Renumber sequentially
-    for i, st in enumerate(normalized_steps, 1):
-        st["number"] = i
+    for idx, st in enumerate(normalized_steps, 1):
+        before = original_ids_by_idx.get(idx, [])
+        after = st.get("evidence_ids") or []
+        if before != after:
+            logger.debug("Step %s evidence_ids updated %s -> %s", st.get("number"), before, after)
+        else:
+            logger.debug("Step %s evidence_ids unchanged %s", st.get("number"), after)
+        st["number"] = idx
     return normalized_steps
 
 
