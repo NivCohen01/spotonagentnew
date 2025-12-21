@@ -46,9 +46,11 @@ from agent_service_lib.service_config import (
 )
 from agent_service_lib.service_db import (
     CREATE_TABLES_SQL,
-    MIGRATIONS_SQL,
     SessionLocal,
     db_fetch_action_trace,
+    derive_guide_family_key,
+    ensure_family_and_variant_guide,
+    run_migrations,
     engine,
 )
 from agent_service_lib.service_logging import PerRunDBAndMemoryHandler, RunIdFilter, _hijack_library_loggers
@@ -87,9 +89,7 @@ async def on_startup():
                 s = stmt.strip().rstrip(";")
                 if s:
                     await conn.execute(text(s))
-            for stmt in MIGRATIONS_SQL:
-                with contextlib.suppress(Exception):
-                    await conn.execute(text(stmt))
+            await run_migrations(conn)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
@@ -137,6 +137,35 @@ async def start_session(req: StartReq):
         raise HTTPException(status_code=400, detail="workspace_id (or ws_id) is required")
     session_id = uuid.uuid4().hex[:12]
     sess = Session(session_id=session_id, req=req)
+
+    family_key = req.guide_family_key or derive_guide_family_key(req.workspace_id, req.task, req.start_url)
+    sess.guide_family_key = family_key
+    try:
+        ensured = await ensure_family_and_variant_guide(
+            workspace_id=req.workspace_id,
+            family_key=family_key,
+            device_type=req.device_type,
+            run_id=session_id,
+            title=req.task or "Generating guide",
+            visibility="private",
+            status="generating",
+            guide_family_id=req.guide_family_id,
+            existing_guide_id=req.guide_id,
+        )
+    except Exception as exc:
+        logging.getLogger("service").error("Failed to ensure guide family/variant at start | %r", exc)
+        raise HTTPException(status_code=500, detail="failed to create guide family/variant")
+    if ensured:
+        sess.guide_family_id, sess.guide_id, sess.guide_slug = ensured
+        sess.guide_family_key = family_key
+        logging.getLogger("service").info(
+            "Session %s linked to guide_family_id=%s guide_id=%s device=%s",
+            session_id,
+            sess.guide_family_id,
+            sess.guide_id,
+            req.device_type,
+        )
+
     sessions[session_id] = sess
     pos = await queue_mgr.enqueue(session_id)
     return Status(**sess.to_status(queue_position=pos))
@@ -235,15 +264,21 @@ async def stop_session(sid: str):
             with contextlib.suppress(Exception):
                 if SessionLocal:
                     async with SessionLocal() as db:
+                        condition_sql = "id=:guide_id" if sess.guide_id else "run_id=:run_id"
                         await db.execute(
                             text(
-                                """
+                                f"""
                             UPDATE guides
                             SET status='draft', updated_at=:now, updated_by=:uid
-                            WHERE run_id=:run_id
+                            WHERE {condition_sql}
                         """
                             ),
-                            {"now": dt.datetime.utcnow(), "uid": DEFAULT_AUTHOR_ID, "run_id": sess.id},
+                            {
+                                "now": dt.datetime.utcnow(),
+                                "uid": DEFAULT_AUTHOR_ID,
+                                "run_id": sess.id,
+                                "guide_id": sess.guide_id,
+                            },
                         )
                         await db.commit()
             return Status(**sess.to_status(queue_position=None))
@@ -255,15 +290,21 @@ async def stop_session(sid: str):
     with contextlib.suppress(Exception):
         if SessionLocal:
             async with SessionLocal() as db:
+                condition_sql = "id=:guide_id" if sess.guide_id else "run_id=:run_id"
                 await db.execute(
                     text(
-                        """
+                        f"""
                     UPDATE guides
                     SET status='draft', updated_at=:now, updated_by=:uid
-                    WHERE run_id=:run_id
+                    WHERE {condition_sql}
                 """
                     ),
-                    {"now": dt.datetime.utcnow(), "uid": DEFAULT_AUTHOR_ID, "run_id": sess.id},
+                    {
+                        "now": dt.datetime.utcnow(),
+                        "uid": DEFAULT_AUTHOR_ID,
+                        "run_id": sess.id,
+                        "guide_id": sess.guide_id,
+                    },
                 )
                 await db.commit()
     return Status(**sess.to_status(queue_position=None))

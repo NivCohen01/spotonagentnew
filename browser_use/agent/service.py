@@ -2081,6 +2081,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			path = await self.action_screenshot_recorder.capture(
 				action=action,
 				step_number=self.state.n_steps,
+				run_step_id=self.state.n_steps,
 				action_index=action_index,
 				browser_session=self.browser_session,
 				browser_profile=self.browser_profile,

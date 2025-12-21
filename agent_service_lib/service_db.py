@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import json
+import logging
+import re
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from .service_config import DB_URL, DEFAULT_AUTHOR_ID
 from .service_models import ActionTraceEntry
@@ -48,25 +52,393 @@ CREATE TABLE IF NOT EXISTS run_logs (
     FOREIGN KEY (run_id) REFERENCES runs(id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS guide_families (
+  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+  workspace_id BIGINT NOT NULL,
+  family_key  VARCHAR(191) NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  deleted_at  DATETIME NULL,
+  UNIQUE KEY uq_guide_families_ws_key (workspace_id, family_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS guide_family_variants (
+  guide_family_id BIGINT NOT NULL,
+  guide_id        BIGINT NOT NULL,
+  device_type     ENUM('desktop','mobile') NOT NULL,
+  created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (guide_family_id, device_type),
+  UNIQUE KEY uq_guide_family_variants_guide_id (guide_id),
+  CONSTRAINT fk_guide_family_variants_family
+    FOREIGN KEY (guide_family_id) REFERENCES guide_families(id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_guide_family_variants_guide
+    FOREIGN KEY (guide_id) REFERENCES guides(id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 MIGRATIONS_SQL = [
-    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS ws_id BIGINT NULL AFTER id",
-    "CREATE INDEX IF NOT EXISTS idx_run_state ON runs (state)",
-    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS final_response LONGTEXT NULL AFTER finished_at",
-    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS result LONGTEXT NULL AFTER final_response",
-    "ALTER TABLE runs ADD COLUMN IF NOT EXISTS error LONGTEXT NULL AFTER result",
-    "CREATE INDEX IF NOT EXISTS idx_run_ts ON run_logs (run_id, ts)",
-    "ALTER TABLE guides ADD COLUMN IF NOT EXISTS run_id VARCHAR(16) NULL AFTER workspace_id",
-    "CREATE INDEX IF NOT EXISTS idx_guides_run_id ON guides (run_id)",
+    "ALTER TABLE runs ADD COLUMN ws_id BIGINT NULL AFTER id",
+    "CREATE INDEX idx_run_state ON runs (state)",
+    "ALTER TABLE runs ADD COLUMN final_response LONGTEXT NULL AFTER finished_at",
+    "ALTER TABLE runs ADD COLUMN result LONGTEXT NULL AFTER final_response",
+    "ALTER TABLE runs ADD COLUMN error LONGTEXT NULL AFTER result",
+    "CREATE INDEX idx_run_ts ON run_logs (run_id, ts)",
+    "ALTER TABLE guides ADD COLUMN run_id VARCHAR(16) NULL AFTER workspace_id",
+    "CREATE INDEX idx_guides_run_id ON guides (run_id)",
     "ALTER TABLE guides ADD CONSTRAINT fk_guides_runs FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL",
     "ALTER TABLE guides MODIFY COLUMN status ENUM('generating','draft','published','archived') NOT NULL DEFAULT 'draft'",
+    "ALTER TABLE guide_families ADD COLUMN family_key VARCHAR(191) NULL AFTER workspace_id",
+    "ALTER TABLE guide_families ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    "ALTER TABLE guide_families ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "ALTER TABLE guide_families ADD COLUMN deleted_at DATETIME NULL AFTER updated_at",
+    "CREATE UNIQUE INDEX uq_guide_families_ws_key ON guide_families (workspace_id, family_key)",
+    "ALTER TABLE guide_family_variants ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    "ALTER TABLE guide_family_variants ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+    "ALTER TABLE guide_family_variants MODIFY COLUMN device_type ENUM('desktop','mobile') NOT NULL",
+    "CREATE UNIQUE INDEX uq_guide_family_variants_guide_id ON guide_family_variants (guide_id)",
+    "ALTER TABLE guide_family_variants ADD CONSTRAINT fk_guide_family_variants_family FOREIGN KEY (guide_family_id) REFERENCES guide_families(id) ON DELETE CASCADE",
+    "ALTER TABLE guide_family_variants ADD CONSTRAINT fk_guide_family_variants_guide FOREIGN KEY (guide_id) REFERENCES guides(id) ON DELETE CASCADE",
 ]
+
+
+def _normalize_device_type(device_type: str | None) -> str:
+    if not device_type:
+        return "desktop"
+    lowered = device_type.lower()
+    return lowered if lowered in ("desktop", "mobile") else "desktop"
+
+
+def derive_guide_family_key(workspace_id: Optional[int], task: Optional[str], start_url: Optional[str]) -> str:
+    base_parts: list[str] = []
+    if workspace_id is not None:
+        base_parts.append(str(workspace_id))
+    if start_url:
+        base_parts.append(start_url.strip())
+    if task:
+        base_parts.append(task.strip())
+    raw = " | ".join(part for part in base_parts if part) or "guide"
+    cleaned = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    cleaned = cleaned[:160] if cleaned else "guide"
+    key = f"{cleaned}-{digest}"
+    return key[:191]
+
+
+async def _column_exists(conn: AsyncConnection, table: str, column: str) -> bool:
+    res = await conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND COLUMN_NAME = :column
+            LIMIT 1
+        """
+        ),
+        {"table": table, "column": column},
+    )
+    return res.scalar() is not None
+
+
+async def _index_exists(conn: AsyncConnection, table: str, index: str) -> bool:
+    res = await conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND INDEX_NAME = :index
+            LIMIT 1
+        """
+        ),
+        {"table": table, "index": index},
+    )
+    return res.scalar() is not None
+
+
+async def _constraint_exists(conn: AsyncConnection, table: str, constraint: str) -> bool:
+    res = await conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND CONSTRAINT_NAME = :constraint
+            LIMIT 1
+        """
+        ),
+        {"table": table, "constraint": constraint},
+    )
+    return res.scalar() is not None
+
+
+def _is_already_exists_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in ("already exists", "duplicate", "errno 1060", "errno 1061", "errno 1062"))
+
+
+async def _execute_ignoring_exists(conn: AsyncConnection, stmt: str, params: Optional[dict] = None) -> None:
+    try:
+        await conn.execute(text(stmt), params or {})
+    except Exception as exc:  # pragma: no cover - defensive
+        if _is_already_exists_error(exc):
+            logging.getLogger("service").info("Migration skipped (already exists): %s", stmt)
+            return
+        raise
+
+
+async def run_migrations(conn: AsyncConnection) -> None:
+    log = logging.getLogger("service")
+
+    if not await _column_exists(conn, "runs", "ws_id"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE runs ADD COLUMN ws_id BIGINT NULL AFTER id")
+    if not await _index_exists(conn, "runs", "idx_run_state"):
+        await _execute_ignoring_exists(conn, "CREATE INDEX idx_run_state ON runs (state)")
+    if not await _column_exists(conn, "runs", "final_response"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE runs ADD COLUMN final_response LONGTEXT NULL AFTER finished_at")
+    if not await _column_exists(conn, "runs", "result"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE runs ADD COLUMN result LONGTEXT NULL AFTER final_response")
+    if not await _column_exists(conn, "runs", "error"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE runs ADD COLUMN error LONGTEXT NULL AFTER result")
+    if not await _index_exists(conn, "run_logs", "idx_run_ts"):
+        await _execute_ignoring_exists(conn, "CREATE INDEX idx_run_ts ON run_logs (run_id, ts)")
+
+    if not await _column_exists(conn, "guides", "run_id"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE guides ADD COLUMN run_id VARCHAR(16) NULL AFTER workspace_id")
+    if not await _index_exists(conn, "guides", "idx_guides_run_id"):
+        await _execute_ignoring_exists(conn, "CREATE INDEX idx_guides_run_id ON guides (run_id)")
+    if not await _constraint_exists(conn, "guides", "fk_guides_runs"):
+        await _execute_ignoring_exists(
+            conn, "ALTER TABLE guides ADD CONSTRAINT fk_guides_runs FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL"
+        )
+    with contextlib.suppress(Exception):
+        await conn.execute(text("ALTER TABLE guides MODIFY COLUMN status ENUM('generating','draft','published','archived') NOT NULL DEFAULT 'draft'"))
+
+    # guide_families table columns/indexes for pre-existing tables
+    if not await _column_exists(conn, "guide_families", "family_key"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE guide_families ADD COLUMN family_key VARCHAR(191) NULL AFTER workspace_id")
+    if not await _column_exists(conn, "guide_families", "created_at"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE guide_families ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP")
+    if not await _column_exists(conn, "guide_families", "updated_at"):
+        await _execute_ignoring_exists(
+            conn, "ALTER TABLE guide_families ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+        )
+    if not await _column_exists(conn, "guide_families", "deleted_at"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE guide_families ADD COLUMN deleted_at DATETIME NULL AFTER updated_at")
+    if not await _index_exists(conn, "guide_families", "uq_guide_families_ws_key"):
+        await _execute_ignoring_exists(conn, "CREATE UNIQUE INDEX uq_guide_families_ws_key ON guide_families (workspace_id, family_key)")
+
+    if not await _column_exists(conn, "guide_family_variants", "created_at"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE guide_family_variants ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP")
+    if not await _column_exists(conn, "guide_family_variants", "updated_at"):
+        await _execute_ignoring_exists(
+            conn, "ALTER TABLE guide_family_variants ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+        )
+    with contextlib.suppress(Exception):
+        await conn.execute(text("ALTER TABLE guide_family_variants MODIFY COLUMN device_type ENUM('desktop','mobile') NOT NULL"))
+    if not await _index_exists(conn, "guide_family_variants", "uq_guide_family_variants_guide_id"):
+        await _execute_ignoring_exists(conn, "CREATE UNIQUE INDEX uq_guide_family_variants_guide_id ON guide_family_variants (guide_id)")
+    if not await _constraint_exists(conn, "guide_family_variants", "fk_guide_family_variants_family"):
+        await _execute_ignoring_exists(
+            conn,
+            "ALTER TABLE guide_family_variants ADD CONSTRAINT fk_guide_family_variants_family FOREIGN KEY (guide_family_id) REFERENCES guide_families(id) ON DELETE CASCADE",
+        )
+    if not await _constraint_exists(conn, "guide_family_variants", "fk_guide_family_variants_guide"):
+        await _execute_ignoring_exists(
+            conn,
+            "ALTER TABLE guide_family_variants ADD CONSTRAINT fk_guide_family_variants_guide FOREIGN KEY (guide_id) REFERENCES guides(id) ON DELETE CASCADE",
+        )
+
+    log.info("Migrations applied (idempotent check complete)")
+
+
+async def ensure_family_and_variant_guide(
+    workspace_id: Optional[int],
+    family_key: Optional[str],
+    device_type: str,
+    run_id: str,
+    title: str,
+    visibility: str = "private",
+    status: str = "generating",
+    guide_family_id: Optional[int] = None,
+    existing_guide_id: Optional[int] = None,
+) -> Optional[tuple[int, int, str]]:
+    """
+    Ensure there is a guide_family row and a single variant per (family, device_type).
+    Returns (family_id, guide_id, slug) when successful.
+    """
+    if not SessionLocal or workspace_id is None:
+        return None
+
+    log = logging.getLogger("service")
+    now = dt.datetime.utcnow()
+    normalized_device = _normalize_device_type(device_type)
+
+    cleaned_title = (title or "Generating guide").strip()
+    if len(cleaned_title) > 255:
+        cleaned_title = cleaned_title[:255]
+
+    family_key_val = (family_key or "").strip() or derive_guide_family_key(workspace_id, cleaned_title, None)
+    family_key_val = family_key_val[:191]
+
+    slug_value = ""
+    async with SessionLocal() as db:
+        async with db.begin():
+            fam_id = guide_family_id
+            if fam_id:
+                fam_row = await db.execute(text("SELECT id FROM guide_families WHERE id=:fid FOR UPDATE"), {"fid": fam_id})
+                fam_id = fam_row.scalar()
+
+            if not fam_id:
+                fam_row = await db.execute(
+                    text(
+                        "SELECT id FROM guide_families WHERE workspace_id=:ws_id AND family_key=:family_key LIMIT 1 FOR UPDATE"
+                    ),
+                    {"ws_id": workspace_id, "family_key": family_key_val},
+                )
+                fam_id = fam_row.scalar()
+
+            created_family = False
+            if not fam_id:
+                await db.execute(
+                    text(
+                        """
+                        INSERT INTO guide_families (workspace_id, family_key, created_at, updated_at)
+                        VALUES (:ws_id, :family_key, :created_at, :updated_at)
+                    """
+                    ),
+                    {"ws_id": workspace_id, "family_key": family_key_val, "created_at": now, "updated_at": now},
+                )
+                fam_row = await db.execute(text("SELECT LAST_INSERT_ID()"))
+                fam_id = fam_row.scalar()
+                created_family = True
+
+            await db.execute(text("UPDATE guide_families SET updated_at=:updated_at WHERE id=:fid"), {"updated_at": now, "fid": fam_id})
+
+            variant_row = await db.execute(
+                text(
+                    """
+                    SELECT guide_id FROM guide_family_variants
+                    WHERE guide_family_id=:family_id AND device_type=:device_type
+                    LIMIT 1 FOR UPDATE
+                """
+                ),
+                {"family_id": fam_id, "device_type": normalized_device},
+            )
+            linked_guide_id = variant_row.scalar()
+            guide_id = linked_guide_id or existing_guide_id
+            created_variant = False
+            created_variant_link = linked_guide_id is None
+
+            if guide_id:
+                update_params = {
+                    "guide_id": guide_id,
+                    "run_id": run_id,
+                    "status": status,
+                    "visibility": visibility,
+                    "updated_at": now,
+                    "updated_by": DEFAULT_AUTHOR_ID,
+                    "title": cleaned_title,
+                }
+                await db.execute(
+                    text(
+                        """
+                        UPDATE guides
+                        SET run_id=:run_id,
+                            title=:title,
+                            status=:status,
+                            visibility=:visibility,
+                            updated_at=:updated_at,
+                            updated_by=:updated_by
+                        WHERE id=:guide_id
+                        LIMIT 1
+                    """
+                    ),
+                    update_params,
+                )
+
+            if not guide_id:
+                slug = slugify_title_for_guide(cleaned_title)
+                data: Dict[str, Any] = {
+                    "workspace_id": workspace_id,
+                    "run_id": run_id,
+                    "slug": slug,
+                    "title": cleaned_title,
+                    "status": status,
+                    "visibility": visibility,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                if DEFAULT_AUTHOR_ID is not None:
+                    data["created_by"] = DEFAULT_AUTHOR_ID
+                    data["updated_by"] = DEFAULT_AUTHOR_ID
+
+                cols = ", ".join(data.keys())
+                params = ", ".join(f":{k}" for k in data.keys())
+                insert_sql = f"INSERT INTO guides ({cols}) VALUES ({params})"
+                await db.execute(text(insert_sql), data)
+                gid_row = await db.execute(text("SELECT LAST_INSERT_ID()"))
+                guide_id = gid_row.scalar()
+                created_variant = True
+                slug_value = slug
+            else:
+                slug_value_row = await db.execute(text("SELECT slug FROM guides WHERE id=:gid"), {"gid": guide_id})
+                slug_value = slug_value_row.scalar() or ""
+
+            try:
+                await db.execute(
+                    text(
+                        """
+                        INSERT INTO guide_family_variants (guide_family_id, guide_id, device_type, created_at, updated_at)
+                        VALUES (:family_id, :guide_id, :device_type, :created_at, :updated_at)
+                    """
+                    ),
+                    {
+                        "family_id": fam_id,
+                        "guide_id": guide_id,
+                        "device_type": normalized_device,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+            except Exception:
+                # duplicate variant - reuse the existing link
+                variant_row = await db.execute(
+                    text(
+                        """
+                        SELECT guide_id FROM guide_family_variants
+                        WHERE guide_family_id=:family_id AND device_type=:device_type
+                        LIMIT 1
+                    """
+                    ),
+                    {"family_id": fam_id, "device_type": normalized_device},
+                )
+                linked = variant_row.scalar()
+                if linked:
+                    guide_id = linked
+                    created_variant_link = False
+
+            if guide_id:
+                slug_row = await db.execute(text("SELECT slug FROM guides WHERE id=:gid"), {"gid": guide_id})
+                slug_value = slug_row.scalar() or slug_value
+
+            if created_family:
+                log.info("Created guide family %s (workspace=%s key=%s)", fam_id, workspace_id, family_key_val)
+            if created_variant:
+                log.info("Created guide variant %s for family %s device=%s", guide_id, fam_id, normalized_device)
+            elif guide_id and created_variant_link:
+                log.info("Linked existing guide %s to family %s device=%s", guide_id, fam_id, normalized_device)
+            elif guide_id:
+                log.info("Reused guide variant %s for family %s device=%s", guide_id, fam_id, normalized_device)
+
+    return (fam_id, guide_id, slug_value)
 
 
 async def db_insert_run(sess: "Session"):
     if not SessionLocal:
         return
+    log = logging.getLogger("service")
     async with SessionLocal() as db:
         await db.execute(
             text(
@@ -83,6 +455,30 @@ async def db_insert_run(sess: "Session"):
             },
         )
         await db.commit()
+
+    family_key = getattr(sess, "guide_family_key", None) or derive_guide_family_key(sess.workspace_id, sess.task, sess.start_url)
+    title = (sess.task or "Generating guide").strip()
+    ensured = await ensure_family_and_variant_guide(
+        workspace_id=sess.workspace_id,
+        family_key=family_key,
+        device_type=sess.device_type,
+        run_id=sess.id,
+        title=title or "Generating guide",
+        visibility="private",
+        status="generating",
+        guide_family_id=getattr(sess, "guide_family_id", None),
+        existing_guide_id=getattr(sess, "guide_id", None),
+    )
+    if ensured:
+        sess.guide_family_id, sess.guide_id, sess.guide_slug = ensured
+        sess.guide_family_key = family_key
+        log.info(
+            "Ensured guide family/link for run %s | family_id=%s guide_id=%s device=%s",
+            sess.id,
+            sess.guide_family_id,
+            sess.guide_id,
+            sess.device_type,
+        )
 
 
 async def db_finish_run(sess: "Session"):
@@ -150,36 +546,23 @@ async def db_create_empty_guide(sess: "Session") -> None:
     if not SessionLocal or sess.workspace_id is None:
         return
 
-    now = dt.datetime.utcnow()
-    placeholder_slug = f"run-{sess.id}"
+    family_key = getattr(sess, "guide_family_key", None) or derive_guide_family_key(sess.workspace_id, sess.task, sess.start_url)
     title = (sess.task or "Generating guide").strip()
-    if len(title) > 255:
-        title = title[:255]
 
-    data: Dict[str, Any] = {
-        "workspace_id": sess.workspace_id,
-        "run_id": sess.id,
-        "slug": placeholder_slug,
-        "title": title or "Generating guide",
-        "status": "generating",
-        "visibility": "private",
-        "created_at": now,
-        "updated_at": now,
-    }
-    if DEFAULT_AUTHOR_ID is not None:
-        data["created_by"] = DEFAULT_AUTHOR_ID
-        data["updated_by"] = DEFAULT_AUTHOR_ID
-
-    cols = ", ".join(data.keys())
-    params = ", ".join(f":{k}" for k in data.keys())
-    sql = f"INSERT INTO guides ({cols}) VALUES ({params})"
-
-    async with SessionLocal() as db:
-        await db.execute(text(sql), data)
-        gid_row = await db.execute(text("SELECT LAST_INSERT_ID()"))
-        sess.guide_id = gid_row.scalar()
-        sess.guide_slug = placeholder_slug
-        await db.commit()
+    ensured = await ensure_family_and_variant_guide(
+        workspace_id=sess.workspace_id,
+        family_key=family_key,
+        device_type=sess.device_type,
+        run_id=sess.id,
+        title=title or "Generating guide",
+        visibility="private",
+        status="generating",
+        guide_family_id=getattr(sess, "guide_family_id", None),
+        existing_guide_id=getattr(sess, "guide_id", None),
+    )
+    if ensured:
+        sess.guide_family_id, sess.guide_id, sess.guide_slug = ensured
+        sess.guide_family_key = family_key
 
 
 async def db_update_guide_from_result(sess: "Session", enriched: dict):
@@ -195,21 +578,24 @@ async def db_update_guide_from_result(sess: "Session", enriched: dict):
     description_json = json.dumps(enriched, ensure_ascii=False)
     now = dt.datetime.utcnow()
 
-    update_sql = text(
-        """
-        UPDATE guides
-        SET title=:title,
-            slug=:slug,
-            description=:description,
-            status=:status,
-            visibility=:visibility,
-            updated_at=:updated_at,
-            updated_by=:updated_by
-        WHERE run_id=:run_id
-        LIMIT 1
-    """
-    )
+    if sess.workspace_id is not None:
+        family_key = getattr(sess, "guide_family_key", None) or derive_guide_family_key(sess.workspace_id, sess.task, sess.start_url)
+        ensured = await ensure_family_and_variant_guide(
+            workspace_id=sess.workspace_id,
+            family_key=family_key,
+            device_type=sess.device_type,
+            run_id=sess.id,
+            title=title,
+            visibility="private",
+            status="draft",
+            guide_family_id=getattr(sess, "guide_family_id", None),
+            existing_guide_id=getattr(sess, "guide_id", None),
+        )
+        if ensured:
+            sess.guide_family_id, sess.guide_id, sess.guide_slug = ensured
+            sess.guide_family_key = family_key
 
+    condition_sql = "id=:guide_id" if sess.guide_id else "run_id=:run_id"
     params_update = {
         "title": title,
         "slug": new_slug,
@@ -218,8 +604,25 @@ async def db_update_guide_from_result(sess: "Session", enriched: dict):
         "visibility": "private",
         "updated_at": now,
         "updated_by": DEFAULT_AUTHOR_ID,
+        "guide_id": sess.guide_id,
         "run_id": sess.id,
     }
+
+    update_sql = text(
+        f"""
+        UPDATE guides
+        SET title=:title,
+            slug=:slug,
+            description=:description,
+            status=:status,
+            visibility=:visibility,
+            updated_at=:updated_at,
+            updated_by=:updated_by,
+            run_id=:run_id
+        WHERE {condition_sql}
+        LIMIT 1
+    """
+    )
 
     async with SessionLocal() as db:
         res = await db.execute(update_sql, params_update)
@@ -256,4 +659,25 @@ async def db_update_guide_from_result(sess: "Session", enriched: dict):
                 "updated_at": now,
             },
         )
+        gid_row = await db.execute(text("SELECT LAST_INSERT_ID()"))
+        maybe_new_id = gid_row.scalar()
+        if sess.guide_family_id and maybe_new_id:
+            with contextlib.suppress(Exception):
+                await db.execute(
+                    text(
+                        """
+                        INSERT INTO guide_family_variants (guide_family_id, guide_id, device_type, created_at, updated_at)
+                        VALUES (:family_id, :guide_id, :device_type, :created_at, :updated_at)
+                    """
+                    ),
+                    {
+                        "family_id": sess.guide_family_id,
+                        "guide_id": maybe_new_id,
+                        "device_type": _normalize_device_type(sess.device_type),
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+            sess.guide_id = maybe_new_id
+            sess.guide_slug = new_slug
         await db.commit()

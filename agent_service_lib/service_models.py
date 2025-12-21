@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 VisionLevel = Literal["auto", "low", "high"]
 SessionState = Literal["queued", "starting", "running", "done", "error", "stopped"]
-DeviceType = Literal["mobile", "desktop", "custom"]
+DeviceType = Literal["mobile", "desktop"]
 
 
 class GuideOutput(BaseModel):
@@ -15,6 +15,65 @@ class GuideOutput(BaseModel):
     links: list[str] = []
     notes: Optional[str] = None
     success: bool
+
+
+class GuideStepWithEvidence(BaseModel):
+    """Guide step enriched with evidence identifiers and image slots."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    number: int
+    description: str
+    pageUrl: Optional[str] = None
+    evidence_ids: list[int] = Field(default_factory=list)
+    primary_evidence_id: Optional[int] = None
+    images: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _ensure_primary_is_listed(self) -> "GuideStepWithEvidence":
+        if self.primary_evidence_id is not None and self.primary_evidence_id not in self.evidence_ids:
+            self.evidence_ids.append(self.primary_evidence_id)
+        return self
+
+
+class GuideOutputWithEvidence(BaseModel):
+    """Final guide schema with deterministic evidence mapping."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    title: str
+    steps: list[GuideStepWithEvidence]
+    links: list[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+    success: bool
+
+
+class EvidenceImage(BaseModel):
+    """Screenshot manifest entry associated with a run step."""
+
+    file: str
+    phase: Optional[str] = None
+    run_step_id: int
+    action_index: Optional[int] = None
+    click_index: Optional[int] = None
+    page_url: Optional[str] = None
+    ts: Optional[int] = None
+
+
+class EvidenceEvent(BaseModel):
+    """Compact, LLM-friendly evidence descriptor derived from trace + screenshots."""
+
+    evidence_id: int
+    action_types: list[str] = Field(default_factory=list)
+    page_url: Optional[str] = None
+    element_tag: Optional[str] = None
+    element_text: Optional[str] = None
+    label: Optional[str] = None
+    best_image: Optional[str] = None
+    before_image: Optional[str] = None
+    after_image: Optional[str] = None
+    images: list[EvidenceImage] = Field(default_factory=list)
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class ActionTraceEntry(BaseModel):
@@ -48,6 +107,11 @@ class StartReq(BaseModel):
     headless: bool = True
     workspace_id: Optional[int] = None
     ws_id: Optional[int] = Field(None, alias="ws_id")  # alias accepted
+    guide_family_id: Optional[int] = None
+    guide_id: Optional[int] = None
+    guide_family_key: Optional[str] = Field(None, alias="family_key")
+    guide_family_id: Optional[int] = None
+    guide_id: Optional[int] = None
 
     use_vision: bool = True
     max_failures: int = 3

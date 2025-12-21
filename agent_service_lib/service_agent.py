@@ -11,28 +11,150 @@ from typing import Any, Dict, Optional
 from browser_use import Agent, Browser
 from browser_use.agent.task_optimizer import AgentTaskOptimizer, TaskOptimizationRequest
 from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use.llm.messages import ContentPartTextParam, SystemMessage, UserMessage
 from browser_use.screenshots.models import ActionScreenshotSettings
 from sqlalchemy import text
 
 from .service_browser import _safe_browser_stop, launch_chrome
 from .service_config import DEFAULT_AUTHOR_ID, OPENAI_MODEL, SCREENSHOTS_BASE
-from .service_db import SessionLocal, db_create_empty_guide, db_finish_run, db_insert_run, db_update_guide_from_result
+from .service_db import SessionLocal, db_finish_run, db_insert_run, db_update_guide_from_result
 from .service_logging import run_id_ctx
 from .service_models import (
     ActionScreenshotOptions,
     ActionTraceEntry,
     GuideOutput,
+    GuideOutputWithEvidence,
+    GuideStepWithEvidence,
+    EvidenceEvent,
     SessionState,
     StartReq,
 )
 from .service_trace import (
-    _attach_screenshots_to_steps,
+    _attach_images_by_evidence,
+    _build_evidence_table,
     _build_action_trace,
     _coerce_guide_output_dict,
     _ensure_json_text,
+    _format_evidence_table,
+    _discover_screenshots,
     _shape_steps_with_placeholders,
     _summarize_action_trace,
 )
+
+
+def _draft_steps_to_text(draft_steps: list[Any]) -> str:
+    lines: list[str] = []
+    for idx, step in enumerate(draft_steps, 1):
+        if isinstance(step, dict):
+            desc = step.get("description") or step.get("text") or step.get("title") or json.dumps(step)
+        else:
+            desc = str(step)
+        lines.append(f"{idx}. {desc}")
+        if idx >= 25:
+            lines.append("... truncated ...")
+            break
+    return "\n".join(lines)
+
+
+def _fallback_guide_from_evidence(task: str, draft: dict | None, evidence_table: list[EvidenceEvent]) -> GuideOutputWithEvidence:
+    title = (draft or {}).get("title") or task
+    links = (draft or {}).get("links") or []
+    notes = (draft or {}).get("notes")
+    success = bool((draft or {}).get("success", True))
+    steps: list[GuideStepWithEvidence] = []
+
+    for i, ev in enumerate(evidence_table, 1):
+        desc = ev.label or ev.element_text or ev.element_tag or (ev.action_types[0] if ev.action_types else "Step")
+        steps.append(
+            GuideStepWithEvidence(
+                number=i,
+                description=str(desc),
+                pageUrl=ev.page_url,
+                evidence_ids=[ev.evidence_id],
+                primary_evidence_id=ev.evidence_id,
+                images=[],
+            )
+        )
+
+    if not steps and draft:
+        for i, step in enumerate(draft.get("steps") or [], 1):
+            if isinstance(step, dict):
+                desc = step.get("description") or step.get("text") or step.get("title") or ""
+                page_url = step.get("pageUrl") or step.get("page_url")
+            else:
+                desc = str(step)
+                page_url = None
+            steps.append(
+                GuideStepWithEvidence(
+                    number=i,
+                    description=desc,
+                    pageUrl=page_url,
+                    evidence_ids=[],
+                    primary_evidence_id=None,
+                    images=[],
+                )
+            )
+
+    return GuideOutputWithEvidence(title=title, steps=steps, links=links, notes=notes, success=success)
+
+
+async def _generate_final_guide_with_evidence(
+    task: str,
+    draft: dict | None,
+    evidence_table: list[EvidenceEvent],
+    model_name: str,
+) -> GuideOutputWithEvidence:
+    llm = ChatOpenAI(model=model_name)
+    draft = draft or {}
+    evidence_table = evidence_table or []
+
+    system_text = (
+        "You are preparing the final user-facing guide from a browser automation run.\n"
+        "Return strict JSON only.\n"
+        "Constraints:\n"
+        "- Use only evidence_ids from the provided evidence table.\n"
+        "- Each evidence_id may appear in at most one guide step; merge steps if they would reuse the same evidence.\n"
+        "- primary_evidence_id must be null or one of evidence_ids (prefer click evidence).\n"
+        "- Combine related micro-actions from the same screen/evidence into a single clear instruction when it improves readability.\n"
+        "- Keep step numbers sequential starting from 1 and use concise imperative descriptions."
+    )
+
+    draft_steps_text = _draft_steps_to_text(draft.get("steps") or [])
+    evidence_text = _format_evidence_table(evidence_table) or "No evidence captured. Leave evidence_ids empty."
+
+    user_payload = (
+        f"User task: {task}\n"
+        f"Draft title: {draft.get('title') or task}\n"
+        f"Draft success flag: {draft.get('success', True)}\n"
+        f"Draft steps:\n{draft_steps_text or 'None'}\n\n"
+        f"Evidence table:\n{evidence_text}\n\n"
+        "Requirements:\n"
+        "- Every step MUST list evidence_ids (empty only when evidence table is empty).\n"
+        "- Never repeat an evidence_id across steps; merge content instead.\n"
+        "- primary_evidence_id must be either null or one of evidence_ids.\n"
+        "- Prefer click evidence when picking primary_evidence_id because those have screenshots."
+    )
+
+    try:
+        result = await llm.ainvoke(
+            [
+                SystemMessage(content=[ContentPartTextParam(text=system_text)]),
+                UserMessage(content=[ContentPartTextParam(text=user_payload)]),
+            ],
+            output_format=GuideOutputWithEvidence,
+        )
+
+        completion = result.completion
+        return GuideOutputWithEvidence(
+            title=completion.title,
+            steps=list(completion.steps),
+            links=completion.links,
+            notes=completion.notes,
+            success=completion.success,
+        )
+    except Exception as exc:  # pragma: no cover - safeguard
+        logging.getLogger("service").warning("Guide generation with evidence failed, using fallback | %r", exc)
+        return _fallback_guide_from_evidence(task, draft, evidence_table)
 
 
 class Session:
@@ -42,6 +164,9 @@ class Session:
         self.start_url = req.start_url
         self.headless = req.headless
         self.workspace_id = req.workspace_id
+        self.guide_family_id: Optional[int] = req.guide_family_id
+        self.guide_id: Optional[int] = req.guide_id
+        self.guide_family_key: Optional[str] = req.guide_family_key
 
         self.use_vision = req.use_vision
         self.max_failures = req.max_failures
@@ -84,7 +209,6 @@ class Session:
         self.log_seq: int = 0
         self.finished_at: Optional[dt.datetime] = None
 
-        self.guide_id: Optional[int] = None
         self.guide_slug: Optional[str] = None
 
     def to_status(self, queue_position: Optional[int] = None) -> Dict[str, Any]:
@@ -126,9 +250,6 @@ async def run_session(sess: Session):
 
     with contextlib.suppress(Exception):
         await db_insert_run(sess)
-
-    with contextlib.suppress(Exception):
-        await db_create_empty_guide(sess)
 
     try:
         ws = await launch_chrome(sess)
@@ -208,23 +329,57 @@ async def run_session(sess: Session):
 
         sess.final_response = _ensure_json_text(result)
 
+        evidence_images = []
+        evidence_table: list[EvidenceEvent] = []
+        if sess.action_screenshots_enabled:
+            with contextlib.suppress(Exception):
+                evidence_images = _discover_screenshots(sess.screenshots_dir)
+        with contextlib.suppress(Exception):
+            evidence_table = _build_evidence_table(sess.action_trace or [], evidence_images)
+
+        if evidence_table:
+            log.info("Evidence table:\n%s", _format_evidence_table(evidence_table))
+        else:
+            log.info("Evidence table empty (no captured screenshots or trace-derived evidence).")
+
+        if evidence_table:
+            for ev in evidence_table:
+                log.info("Evidence item | id=%s actions=%s best_image=%s", ev.evidence_id, ev.action_types, ev.best_image)
+
         extracted = _coerce_guide_output_dict(result)
         if extracted is None:
             with contextlib.suppress(Exception):
                 extracted = _coerce_guide_output_dict(json.loads(sess.final_response))
 
-        if extracted is not None:
-            enriched = _shape_steps_with_placeholders(extracted)
-            if sess.action_screenshots_enabled:
-                with contextlib.suppress(Exception):
-                    enriched = _attach_screenshots_to_steps(enriched, sess.screenshots_dir)
-            if sess.action_trace_summary:
-                enriched = dict(enriched)
-                enriched["action_trace"] = sess.action_trace_summary
-            sess.result_only = _ensure_json_text(enriched)
+        draft = _shape_steps_with_placeholders(extracted) if extracted is not None else None
 
-            with contextlib.suppress(Exception):
-                await db_update_guide_from_result(sess, enriched)
+        final_guide = await _generate_final_guide_with_evidence(
+            task=sess.task, draft=draft, evidence_table=evidence_table, model_name=OPENAI_MODEL
+        )
+
+        final_with_images = _attach_images_by_evidence(final_guide, evidence_table)
+        if not final_with_images and isinstance(final_guide, GuideOutputWithEvidence):
+            final_with_images = final_guide.model_dump()
+        elif not final_with_images:
+            final_with_images = draft or {}
+        if sess.action_trace_summary:
+            final_with_images = dict(final_with_images)
+            final_with_images["action_trace"] = sess.action_trace_summary
+        if evidence_table:
+            final_with_images = dict(final_with_images)
+            final_with_images["evidence"] = [ev.model_dump() for ev in evidence_table]
+
+        sess.result_only = _ensure_json_text(final_with_images)
+
+        if final_with_images.get("steps"):
+            lines = [
+                f"step {step.get('number')}: evidence_ids={step.get('evidence_ids')} primary={step.get('primary_evidence_id')} image={step.get('images') or []}"
+                for step in final_with_images.get("steps", [])
+            ]
+            log.info("Guide step evidence mapping:\n%s", "\n".join(lines))
+
+        with contextlib.suppress(Exception):
+            await db_update_guide_from_result(sess, final_with_images)
 
         sess.state = "done"
         log.info("agent done")
@@ -235,15 +390,21 @@ async def run_session(sess: Session):
         with contextlib.suppress(Exception):
             if SessionLocal:
                 async with SessionLocal() as db:
+                    condition_sql = "id=:guide_id" if sess.guide_id else "run_id=:run_id"
                     await db.execute(
                         text(
-                            """
+                            f"""
                         UPDATE guides
                         SET status='draft', updated_at=:now, updated_by=:uid
-                        WHERE run_id=:run_id
+                        WHERE {condition_sql}
                     """
                         ),
-                        {"now": dt.datetime.utcnow(), "uid": DEFAULT_AUTHOR_ID, "run_id": sess.id},
+                        {
+                            "now": dt.datetime.utcnow(),
+                            "uid": DEFAULT_AUTHOR_ID,
+                            "run_id": sess.id,
+                            "guide_id": sess.guide_id,
+                        },
                     )
                     await db.commit()
         raise
@@ -256,15 +417,21 @@ async def run_session(sess: Session):
         with contextlib.suppress(Exception):
             if SessionLocal:
                 async with SessionLocal() as db:
+                    condition_sql = "id=:guide_id" if sess.guide_id else "run_id=:run_id"
                     await db.execute(
                         text(
-                            """
+                            f"""
                         UPDATE guides
                         SET status='draft', updated_at=:now, updated_by=:uid
-                        WHERE run_id=:run_id
+                        WHERE {condition_sql}
                     """
                         ),
-                        {"now": dt.datetime.utcnow(), "uid": DEFAULT_AUTHOR_ID, "run_id": sess.id},
+                        {
+                            "now": dt.datetime.utcnow(),
+                            "uid": DEFAULT_AUTHOR_ID,
+                            "run_id": sess.id,
+                            "guide_id": sess.guide_id,
+                        },
                     )
                     await db.commit()
     finally:
