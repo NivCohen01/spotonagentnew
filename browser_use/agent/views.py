@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Literal
 
-from openai import RateLimitError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model, model_validator
 from typing_extensions import TypeVar
 from uuid_extensions import uuid7str
@@ -15,7 +14,6 @@ from uuid_extensions import uuid7str
 from browser_use.agent.message_manager.views import MessageManagerState
 from browser_use.browser.views import BrowserStateHistory
 from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES, DOMInteractedElement, DOMSelectorMap
-from browser_use.screenshots.models import ActionScreenshotSettings
 
 # from browser_use.dom.history_tree_processor.service import (
 # 	DOMElementNode,
@@ -43,7 +41,7 @@ class AgentSettings(BaseModel):
 	override_system_message: str | None = None
 	extend_system_message: str | None = None
 	include_attributes: list[str] | None = DEFAULT_INCLUDE_ATTRIBUTES
-	max_actions_per_step: int = 4
+	max_actions_per_step: int = 3
 	use_thinking: bool = True
 	flash_mode: bool = False  # If enabled, disables evaluation_previous_goal and next_goal, and sets use_thinking = False
 	use_judge: bool = True
@@ -56,7 +54,6 @@ class AgentSettings(BaseModel):
 	llm_timeout: int = 60  # Timeout in seconds for LLM calls (auto-detected: 30s for gemini, 90s for o3, 60s default)
 	step_timeout: int = 180  # Timeout in seconds for each step
 	final_response_after_failure: bool = True  # If True, attempt one final recovery call after max_failures
-	action_screenshots: ActionScreenshotSettings = Field(default_factory=ActionScreenshotSettings)
 
 
 class AgentState(BaseModel):
@@ -155,12 +152,23 @@ class ActionResult(BaseModel):
 		return self
 
 
+class RerunSummaryAction(BaseModel):
+	"""AI-generated summary for rerun completion"""
+
+	summary: str = Field(description='Summary of what happened during the rerun')
+	success: bool = Field(description='Whether the rerun completed successfully based on visual inspection')
+	completion_status: Literal['complete', 'partial', 'failed'] = Field(
+		description='Status of rerun completion: complete (all steps succeeded), partial (some steps succeeded), failed (task did not complete)'
+	)
+
+
 class StepMetadata(BaseModel):
 	"""Metadata for a single step including timing and token information"""
 
 	step_start_time: float
 	step_end_time: float
 	step_number: int
+	step_interval: float | None = None
 
 	@property
 	def duration_seconds(self) -> float:
@@ -355,7 +363,7 @@ class AgentHistory(BaseModel):
 		# Handle action serialization
 		model_output_dump = None
 		if self.model_output:
-			action_dump = [action.model_dump(exclude_none=True) for action in self.model_output.action]
+			action_dump = [action.model_dump(exclude_none=True, mode='json') for action in self.model_output.action]
 
 			# Filter sensitive data only from input action parameters if sensitive_data is provided
 			if sensitive_data:
@@ -376,7 +384,7 @@ class AgentHistory(BaseModel):
 
 		# Handle result serialization - don't filter ActionResult data
 		# as it should contain meaningful information for the agent
-		result_dump = [r.model_dump(exclude_none=True) for r in self.result]
+		result_dump = [r.model_dump(exclude_none=True, mode='json') for r in self.result]
 
 		return {
 			'model_output': model_output_dump,
@@ -495,7 +503,7 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 	def last_action(self) -> None | dict:
 		"""Last action in history"""
 		if self.history and self.history[-1].model_output:
-			return self.history[-1].model_output.action[-1].model_dump(exclude_none=True)
+			return self.history[-1].model_output.action[-1].model_dump(exclude_none=True, mode='json')
 		return None
 
 	def errors(self) -> list[str | None]:
@@ -621,7 +629,7 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 				# Guard against None interacted_element before zipping
 				interacted_elements = h.state.interacted_element or [None] * len(h.model_output.action)
 				for action, interacted_element in zip(h.model_output.action, interacted_elements):
-					output = action.model_dump(exclude_none=True)
+					output = action.model_dump(exclude_none=True, mode='json')
 					output['interacted_element'] = interacted_element
 					outputs.append(output)
 		return outputs
@@ -637,7 +645,7 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 				interacted_elements = h.state.interacted_element or [None] * len(h.model_output.action)
 				# Zip actions with interacted elements and results
 				for action, interacted_element, result in zip(h.model_output.action, interacted_elements, h.result):
-					action_output = action.model_dump(exclude_none=True)
+					action_output = action.model_dump(exclude_none=True, mode='json')
 					action_output['interacted_element'] = interacted_element
 					# Only keep long_term_memory from result
 					action_output['result'] = result.long_term_memory if result and result.long_term_memory else None
@@ -686,8 +694,8 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 			# Get actions from model_output
 			if h.model_output and h.model_output.action:
-				# Use existing model_dump to get action dicts
-				actions_list = [action.model_dump(exclude_none=True) for action in h.model_output.action]
+				# Use model_dump with mode='json' to serialize enums properly
+				actions_list = [action.model_dump(exclude_none=True, mode='json') for action in h.model_output.action]
 				action_json = json.dumps(actions_list, indent=1)
 				step_text += f'Actions: {action_json}\n'
 
@@ -720,6 +728,23 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
 		return None
 
+	def get_structured_output(self, output_model: type[AgentStructuredOutput]) -> AgentStructuredOutput | None:
+		"""Get the structured output from history, parsing with the provided schema.
+
+		Use this method when accessing structured output from sandbox execution,
+		since the _output_model_schema private attribute is not preserved during serialization.
+
+		Args:
+			output_model: The Pydantic model class to parse the output with
+
+		Returns:
+			The parsed structured output, or None if no final result exists
+		"""
+		final_result = self.final_result()
+		if final_result is not None:
+			return output_model.model_validate_json(final_result)
+		return None
+
 
 class AgentError:
 	"""Container for agent error handling"""
@@ -734,6 +759,9 @@ class AgentError:
 		message = ''
 		if isinstance(error, ValidationError):
 			return f'{AgentError.VALIDATION_ERROR}\nDetails: {str(error)}'
+		# Lazy import to avoid loading openai SDK (~800ms) at module level
+		from openai import RateLimitError
+
 		if isinstance(error, RateLimitError):
 			return AgentError.RATE_LIMIT_ERROR
 
@@ -755,3 +783,18 @@ class AgentError:
 		if include_trace:
 			return f'{str(error)}\nStacktrace:\n{traceback.format_exc()}'
 		return f'{str(error)}'
+
+
+class DetectedVariable(BaseModel):
+	"""A detected variable in agent history"""
+
+	name: str
+	original_value: str
+	type: str = 'string'
+	format: str | None = None
+
+
+class VariableMetadata(BaseModel):
+	"""Metadata about detected variables in history"""
+
+	detected_variables: dict[str, DetectedVariable] = Field(default_factory=dict)

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Literal, Optional
 from browser_use.dom.views import NodeType, SimplifiedNode
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
 from browser_use.observability import observe_debug
-from browser_use.utils import is_new_tab_page
+from browser_use.utils import is_new_tab_page, sanitize_surrogates
 
 if TYPE_CHECKING:
 	from browser_use.agent.views import AgentStepInfo
@@ -16,17 +16,19 @@ if TYPE_CHECKING:
 class SystemPrompt:
 	def __init__(
 		self,
-		max_actions_per_step: int = 10,
+		max_actions_per_step: int = 3,
 		override_system_message: str | None = None,
 		extend_system_message: str | None = None,
 		use_thinking: bool = True,
 		flash_mode: bool = False,
 		is_anthropic: bool = False,
+		is_browser_use_model: bool = False,
 	):
 		self.max_actions_per_step = max_actions_per_step
 		self.use_thinking = use_thinking
 		self.flash_mode = flash_mode
 		self.is_anthropic = is_anthropic
+		self.is_browser_use_model = is_browser_use_model
 		prompt = ''
 		if override_system_message is not None:
 			prompt = override_system_message
@@ -42,8 +44,16 @@ class SystemPrompt:
 	def _load_prompt_template(self) -> None:
 		"""Load the prompt template from the markdown file."""
 		try:
-			# Choose the appropriate template based on flash_mode, use_thinking, and is_anthropic
-			if self.flash_mode and self.is_anthropic:
+			# Choose the appropriate template based on model type and mode
+			# Browser-use models use simplified prompts optimized for fine-tuned models
+			if self.is_browser_use_model:
+				if self.flash_mode:
+					template_filename = 'system_prompt_browser_use_flash.md'
+				elif self.use_thinking:
+					template_filename = 'system_prompt_browser_use.md'
+				else:
+					template_filename = 'system_prompt_browser_use_no_thinking.md'
+			elif self.flash_mode and self.is_anthropic:
 				template_filename = 'system_prompt_flash_anthropic.md'
 			elif self.flash_mode:
 				template_filename = 'system_prompt_flash.md'
@@ -53,7 +63,11 @@ class SystemPrompt:
 				template_filename = 'system_prompt_no_thinking.md'
 
 			# This works both in development and when installed as a package
-			with importlib.resources.files('browser_use.agent').joinpath(template_filename).open('r', encoding='utf-8') as f:
+			with (
+				importlib.resources.files('browser_use.agent.system_prompts')
+				.joinpath(template_filename)
+				.open('r', encoding='utf-8') as f
+			):
 				self.prompt_template = f.read()
 		except Exception as e:
 			raise RuntimeError(f'Failed to load system prompt template: {e}')
@@ -90,6 +104,7 @@ class AgentMessagePrompt:
 		sample_images: list[ContentPartTextParam | ContentPartImageParam] | None = None,
 		read_state_images: list[dict] | None = None,
 		llm_screenshot_size: tuple[int, int] | None = None,
+		unavailable_skills_info: str | None = None,
 	):
 		self.browser_state: 'BrowserStateSummary' = browser_state_summary
 		self.file_system: 'FileSystem | None' = file_system
@@ -107,6 +122,7 @@ class AgentMessagePrompt:
 		self.include_recent_events = include_recent_events
 		self.sample_images = sample_images or []
 		self.read_state_images = read_state_images or []
+		self.unavailable_skills_info: str | None = unavailable_skills_info
 		self.llm_screenshot_size = llm_screenshot_size
 		assert self.browser_state
 
@@ -232,12 +248,7 @@ class AgentMessagePrompt:
 					elements_text = f'... {pages_above:.1f} pages above ...\n{elements_text}'
 			else:
 				elements_text = f'[Start of page]\n{elements_text}'
-			if has_content_below:
-				if self.browser_state.page_info:
-					pi = self.browser_state.page_info
-					pages_below = pi.pixels_below / pi.viewport_height if pi.viewport_height > 0 else 0
-					elements_text = f'{elements_text}\n... {pages_below:.1f} pages below ...'
-			else:
+			if not has_content_below:
 				elements_text = f'{elements_text}\n[End of page]'
 		else:
 			elements_text = 'empty page'
@@ -352,15 +363,6 @@ Available tabs:
 			logging.getLogger(__name__).warning(f'Failed to resize screenshot: {e}, using original')
 			return screenshot_b64
 
-	@staticmethod
-	def _sanitize_surrogates(text: str) -> str:
-		"""Remove surrogate characters that can't be encoded in UTF-8.
-
-		Surrogate pairs (U+D800 to U+DFFF) are invalid in UTF-8 when unpaired.
-		These often appear in DOM content from mathematical symbols or emojis.
-		"""
-		return text.encode('utf-8', errors='ignore').decode('utf-8')
-
 	@observe_debug(ignore_input=True, ignore_output=True, name='get_user_message')
 	def get_user_message(self, use_vision: bool = True) -> UserMessage:
 		"""Get complete state as a single cached message"""
@@ -391,8 +393,12 @@ Available tabs:
 			state_description += self.page_filtered_actions + '\n'
 			state_description += '</page_specific_actions>\n'
 
+		# Add unavailable skills information if any
+		if self.unavailable_skills_info:
+			state_description += '\n' + self.unavailable_skills_info + '\n'
+
 		# Sanitize surrogates from all text content
-		state_description = self._sanitize_surrogates(state_description)
+		state_description = sanitize_surrogates(state_description)
 
 		# Check if we have images to include (from read_file action)
 		has_images = bool(self.read_state_images)
@@ -460,3 +466,97 @@ Available tabs:
 			return UserMessage(content=content_parts, cache=True)
 
 		return UserMessage(content=state_description, cache=True)
+
+
+def get_rerun_summary_prompt(original_task: str, total_steps: int, success_count: int, error_count: int) -> str:
+	return f'''You are analyzing the completion of a rerun task. Based on the screenshot and execution info, provide a summary.
+
+Original task: {original_task}
+
+Execution statistics:
+- Total steps: {total_steps}
+- Successful steps: {success_count}
+- Failed steps: {error_count}
+
+Analyze the screenshot to determine:
+1. Whether the task completed successfully
+2. What the final state shows
+3. Overall completion status (complete/partial/failed)
+
+Respond with:
+- summary: A clear, concise summary of what happened during the rerun
+- success: Whether the task completed successfully (true/false)
+- completion_status: One of "complete", "partial", or "failed"'''
+
+
+def get_rerun_summary_message(prompt: str, screenshot_b64: str | None = None) -> UserMessage:
+	"""
+	Build a UserMessage for rerun summary generation.
+
+	Args:
+		prompt: The prompt text
+		screenshot_b64: Optional base64-encoded screenshot
+
+	Returns:
+		UserMessage with prompt and optional screenshot
+	"""
+	if screenshot_b64:
+		# With screenshot: use multi-part content
+		content_parts: list[ContentPartTextParam | ContentPartImageParam] = [
+			ContentPartTextParam(type='text', text=prompt),
+			ContentPartImageParam(
+				type='image_url',
+				image_url=ImageURL(url=f'data:image/png;base64,{screenshot_b64}'),
+			),
+		]
+		return UserMessage(content=content_parts)
+	else:
+		# Without screenshot: use simple string content
+		return UserMessage(content=prompt)
+
+
+def get_ai_step_system_prompt() -> str:
+	"""
+	Get system prompt for AI step action used during rerun.
+
+	Returns:
+		System prompt string for AI step
+	"""
+	return """
+You are an expert at extracting data from webpages.
+
+<input>
+You will be given:
+1. A query describing what to extract
+2. The markdown of the webpage (filtered to remove noise)
+3. Optionally, a screenshot of the current page state
+</input>
+
+<instructions>
+- Extract information from the webpage that is relevant to the query
+- ONLY use the information available in the webpage - do not make up information
+- If the information is not available, mention that clearly
+- If the query asks for all items, list all of them
+</instructions>
+
+<output>
+- Present ALL relevant information in a concise way
+- Do not use conversational format - directly output the relevant information
+- If information is unavailable, state that clearly
+</output>
+""".strip()
+
+
+def get_ai_step_user_prompt(query: str, stats_summary: str, content: str) -> str:
+	"""
+	Build user prompt for AI step action.
+
+	Args:
+		query: What to extract or analyze
+		stats_summary: Content statistics summary
+		content: Page markdown content
+
+	Returns:
+		Formatted prompt string
+	"""
+	return f'<query>\n{query}\n</query>\n\n<content_stats>\n{stats_summary}\n</content_stats>\n\n<webpage_content>\n{content}\n</webpage_content>'

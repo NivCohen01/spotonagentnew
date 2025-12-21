@@ -1,5 +1,4 @@
 import asyncio
-import enum
 import json
 import logging
 import os
@@ -14,6 +13,7 @@ from pydantic import BaseModel
 from browser_use.agent.views import ActionModel, ActionResult
 from browser_use.browser import BrowserSession
 from browser_use.browser.events import (
+	ClickCoordinateEvent,
 	ClickElementEvent,
 	CloseTabEvent,
 	GetDropdownOptionsEvent,
@@ -36,6 +36,7 @@ from browser_use.tools.registry.service import Registry
 from browser_use.tools.utils import get_click_description
 from browser_use.tools.views import (
 	ClickElementAction,
+	ClickElementActionIndexOnly,
 	CloseTabAction,
 	DoneAction,
 	ExtractAction,
@@ -51,7 +52,7 @@ from browser_use.tools.views import (
 	SwitchTabAction,
 	UploadFileAction,
 )
-from browser_use.utils import create_task_with_error_handling, time_execution_sync
+from browser_use.utils import create_task_with_error_handling, sanitize_surrogates, time_execution_sync
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +105,14 @@ def handle_browser_error(e: BrowserError) -> ActionResult:
 class Tools(Generic[Context]):
 	def __init__(
 		self,
-		exclude_actions: list[str] = [],
+		exclude_actions: list[str] | None = None,
 		output_model: type[T] | None = None,
 		display_files_in_done_text: bool = True,
 	):
-		self.registry = Registry[Context](exclude_actions)
+		self.registry = Registry[Context](exclude_actions if exclude_actions is not None else [])
 		self.display_files_in_done_text = display_files_in_done_text
+		self._output_model: type[BaseModel] | None = output_model
+		self._coordinate_clicking_enabled: bool = False
 
 		"""Register all default browser actions"""
 
@@ -235,63 +238,20 @@ class Tools(Generic[Context]):
 
 		# Helper function for coordinate conversion
 		def _convert_llm_coordinates_to_viewport(llm_x: int, llm_y: int, browser_session: BrowserSession) -> tuple[int, int]:
-			"""Convert LLM-provided coordinates to the current viewport."""
-
-			# Resized screenshot case (llm_screenshot_size)
+			"""Convert coordinates from LLM screenshot size to original viewport size."""
 			if browser_session.llm_screenshot_size and browser_session._original_viewport_size:
 				original_width, original_height = browser_session._original_viewport_size
 				llm_width, llm_height = browser_session.llm_screenshot_size
 
+				# Convert coordinates using fractions
 				actual_x = int((llm_x / llm_width) * original_width)
 				actual_y = int((llm_y / llm_height) * original_height)
 
 				logger.info(
-					f"?? Converting coordinates: LLM ({llm_x}, {llm_y}) @ {llm_width}x{llm_height} "
-					f"? Viewport ({actual_x}, {actual_y}) @ {original_width}x{original_height}"
+					f'🔄 Converting coordinates: LLM ({llm_x}, {llm_y}) @ {llm_width}x{llm_height} '
+					f'→ Viewport ({actual_x}, {actual_y}) @ {original_width}x{original_height}'
 				)
 				return actual_x, actual_y
-
-			# High-DPI/mobile screenshots: model may send device-pixel coordinates
-			viewport_width = None
-			viewport_height = None
-			screenshot_width = None
-			screenshot_height = None
-
-			state = browser_session._cached_browser_state_summary
-			if state and state.page_info:
-				viewport_width = state.page_info.viewport_width
-				viewport_height = state.page_info.viewport_height
-			elif browser_session.browser_profile.viewport:
-				vp = browser_session.browser_profile.viewport
-				viewport_width = vp.get('width') if isinstance(vp, dict) else getattr(vp, 'width', None)
-				viewport_height = vp.get('height') if isinstance(vp, dict) else getattr(vp, 'height', None)
-
-			if state and state.screenshot:
-				try:
-					import base64
-					import io
-					from PIL import Image
-
-					img = Image.open(io.BytesIO(base64.b64decode(state.screenshot)))
-					screenshot_width, screenshot_height = img.size
-				except Exception:
-					pass
-
-			if (
-				viewport_width
-				and viewport_height
-				and screenshot_width
-				and screenshot_height
-				and (llm_x > viewport_width or llm_y > viewport_height)
-			):
-				actual_x = int((llm_x / screenshot_width) * viewport_width)
-				actual_y = int((llm_y / screenshot_height) * viewport_height)
-				logger.debug(
-					f"?? Normalized coordinates from screenshot space {llm_x}x{llm_y} to viewport space {actual_x}x{actual_y}"
-				)
-				return actual_x, actual_y
-
-			# Default: assume coordinates are already in viewport space
 			return llm_x, llm_y
 
 		# Element Interaction Actions
@@ -309,15 +269,20 @@ class Tools(Generic[Context]):
 				# Highlight the coordinate being clicked (truly non-blocking)
 				asyncio.create_task(browser_session.highlight_coordinate_click(actual_x, actual_y))
 
-				# Use Actor (page.mouse.click) for coordinate-based clicking
-				page = await browser_session.get_current_page()
-				if page is None:
-					return ActionResult(error='No active page found')
+				# Dispatch ClickCoordinateEvent - handler will check for safety and click
+				event = browser_session.event_bus.dispatch(
+					ClickCoordinateEvent(coordinate_x=actual_x, coordinate_y=actual_y, force=True)
+				)
+				await event
+				# Wait for handler to complete and get any exception or metadata
+				click_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
 
-				mouse = await page.mouse
-				await mouse.click(actual_x, actual_y)
+				# Check for validation errors (only happens when force=False)
+				if isinstance(click_metadata, dict) and 'validation_error' in click_metadata:
+					error_msg = click_metadata['validation_error']
+					return ActionResult(error=error_msg)
 
-				memory = f'Clicked on coordinate {actual_x}, {actual_y}'
+				memory = f'Clicked on coordinate {params.coordinate_x}, {params.coordinate_y}'
 				msg = f'🖱️ {memory}'
 				logger.info(msg)
 
@@ -325,11 +290,15 @@ class Tools(Generic[Context]):
 					extracted_content=memory,
 					metadata={'click_x': actual_x, 'click_y': actual_y},
 				)
+			except BrowserError as e:
+				return handle_browser_error(e)
 			except Exception as e:
 				error_msg = f'Failed to click at coordinates ({params.coordinate_x}, {params.coordinate_y}).'
 				return ActionResult(error=error_msg)
 
-		async def _click_by_index(params: ClickElementAction, browser_session: BrowserSession) -> ActionResult:
+		async def _click_by_index(
+			params: ClickElementAction | ClickElementActionIndexOnly, browser_session: BrowserSession
+		) -> ActionResult:
 			assert params.index is not None
 			try:
 				assert params.index != 0, (
@@ -386,24 +355,15 @@ class Tools(Generic[Context]):
 				error_msg = f'Failed to click element {params.index}: {str(e)}'
 				return ActionResult(error=error_msg)
 
-		@self.registry.action(
-			'Click element by index or coordinates. Prefer index over coordinates when possible. Either provide coordinates or index.',
-			param_model=ClickElementAction,
-		)
-		async def click(params: ClickElementAction, browser_session: BrowserSession):
-			# Validate that either index or coordinates are provided
-			if params.index is None and (params.coordinate_x is None or params.coordinate_y is None):
-				return ActionResult(error='Must provide either index or both coordinate_x and coordinate_y')
+		# Store click handlers for re-registration
+		self._click_by_index = _click_by_index
+		self._click_by_coordinate = _click_by_coordinate
 
-			# Try index-based clicking first if index is provided
-			if params.index is not None:
-				return await _click_by_index(params, browser_session)
-			# Coordinate-based clicking when index is not provided
-			else:
-				return await _click_by_coordinate(params, browser_session)
+		# Register click action (index-only by default)
+		self._register_click_action()
 
 		@self.registry.action(
-			'Input text into element with index.',
+			'Input text into element by index.',
 			param_model=InputTextAction,
 		)
 		async def input(
@@ -785,6 +745,10 @@ You will be given a query and the markdown of a webpage that has been filtered t
 </output>
 """.strip()
 
+			# Sanitize surrogates from content to prevent UTF-8 encoding errors
+			content = sanitize_surrogates(content)
+			query = sanitize_surrogates(query)
+
 			prompt = f'<query>\n{query}\n</query>\n\n<content_stats>\n{stats_summary}\n</content_stats>\n\n<webpage_content>\n{content}\n</webpage_content>'
 
 			try:
@@ -819,7 +783,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				raise RuntimeError(str(e))
 
 		@self.registry.action(
-			"""Scroll by pages (down=True/False, pages=0.5-10.0, default 1.0). Use index for scroll containers (dropdowns/custom UI). High pages (10) reaches bottom. Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page.""",
+			"""Scroll by pages. REQUIRED: down=True/False (True=scroll down, False=scroll up, default=True). Optional: pages=0.5-10.0 (default 1.0). Use index for scroll containers (dropdowns/custom UI). High pages (10) reaches bottom. Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page.""",
 			param_model=ScrollAction,
 		)
 		async def scroll(params: ScrollAction, browser_session: BrowserSession):
@@ -878,7 +842,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 							completed_scrolls += 1
 
 							# Small delay to ensure scroll completes before next one
-							await asyncio.sleep(0.3)
+							await asyncio.sleep(0.15)
 
 						except Exception as e:
 							logger.warning(f'Scroll {i + 1}/{num_full_pages} failed: {e}')
@@ -1213,8 +1177,23 @@ Validated Code (after quote fixing):
 				# Don't log the code - it's already visible in the user's cell
 				logger.debug(f'JavaScript executed successfully, result length: {len(result_text)}')
 
+				# Memory handling: keep full result in extracted_content for current step,
+				# but use truncated version in long_term_memory if too large
+				MAX_MEMORY_LENGTH = 1000
+				if len(result_text) < MAX_MEMORY_LENGTH:
+					memory = result_text
+					include_extracted_content_only_once = False
+				else:
+					memory = f'JavaScript executed successfully, result length: {len(result_text)} characters.'
+					include_extracted_content_only_once = True
+
 				# Return only the result, not the code (code is already in user's cell)
-				return ActionResult(extracted_content=result_text, metadata=metadata)
+				return ActionResult(
+					extracted_content=result_text,
+					long_term_memory=memory,
+					include_extracted_content_only_once=include_extracted_content_only_once,
+					metadata=metadata,
+				)
 
 			except Exception as e:
 				# CDP communication or other system errors
@@ -1236,7 +1215,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(r'\\\\([.*+?^${}()|[\]])', r'\\\1', fixed_code)
 
 		# Pattern 3: Fix XPath expressions with mixed quotes
-		xpath_pattern = r'document\.evaluate\s*\(\s*"([^"]*\'[^"]*)"'
+		xpath_pattern = r'document\.evaluate\s*\(\s*"([^"]*)"\s*,'
 
 		def fix_xpath_quotes(match):
 			xpath_with_quotes = match.group(1)
@@ -1245,7 +1224,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(xpath_pattern, fix_xpath_quotes, fixed_code)
 
 		# Pattern 4: Fix querySelector/querySelectorAll with mixed quotes
-		selector_pattern = r'(querySelector(?:All)?)\s*\(\s*"([^"]*\'[^"]*)"'
+		selector_pattern = r'(querySelector(?:All)?)\s*\(\s*"([^"]*)"\s*\)'
 
 		def fix_selector_quotes(match):
 			method_name = match.group(1)
@@ -1255,7 +1234,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(selector_pattern, fix_selector_quotes, fixed_code)
 
 		# Pattern 5: Fix closest() calls with mixed quotes
-		closest_pattern = r'\.closest\s*\(\s*"([^"]*\'[^"]*)"'
+		closest_pattern = r'\.closest\s*\(\s*"([^"]*)"\s*\)'
 
 		def fix_closest_quotes(match):
 			selector_with_quotes = match.group(1)
@@ -1264,7 +1243,7 @@ Validated Code (after quote fixing):
 		fixed_code = re.sub(closest_pattern, fix_closest_quotes, fixed_code)
 
 		# Pattern 6: Fix .matches() calls with mixed quotes (similar to closest)
-		matches_pattern = r'\.matches\s*\(\s*"([^"]*\'[^"]*)"'
+		matches_pattern = r'\.matches\s*\(\s*"([^"]*)"\s*\)'
 
 		def fix_matches_quotes(match):
 			selector_with_quotes = match.group(1)
@@ -1297,12 +1276,8 @@ Validated Code (after quote fixing):
 			)
 			async def done(params: StructuredOutputAction):
 				# Exclude success from the output JSON since it's an internal parameter
-				output_dict = params.data.model_dump()
-
-				# Enums are not serializable, convert to string
-				for key, value in output_dict.items():
-					if isinstance(value, enum.Enum):
-						output_dict[key] = value.value
+				# Use mode='json' to properly serialize enums at all nesting levels
+				output_dict = params.data.model_dump(mode='json')
 
 				return ActionResult(
 					is_done=True,
@@ -1357,7 +1332,12 @@ Validated Code (after quote fixing):
 				)
 
 	def use_structured_output_action(self, output_model: type[T]):
+		self._output_model = output_model
 		self._register_done_action(output_model)
+
+	def get_output_model(self) -> type[BaseModel] | None:
+		"""Get the output model if structured output is configured."""
+		return self._output_model
 
 	# Register ---------------------------------------------------------------
 
@@ -1367,6 +1347,71 @@ Validated Code (after quote fixing):
 		@param description: Describe the LLM what the function does (better description == better function calling)
 		"""
 		return self.registry.action(description, **kwargs)
+
+	def exclude_action(self, action_name: str) -> None:
+		"""Exclude an action from the tools registry.
+
+		This method can be used to remove actions after initialization,
+		useful for enforcing constraints like disabling screenshot when use_vision != 'auto'.
+
+		Args:
+			action_name: Name of the action to exclude (e.g., 'screenshot')
+		"""
+		self.registry.exclude_action(action_name)
+
+	def _register_click_action(self) -> None:
+		"""Register the click action with or without coordinate support based on current setting."""
+		# Remove existing click action if present
+		if 'click' in self.registry.registry.actions:
+			del self.registry.registry.actions['click']
+
+		if self._coordinate_clicking_enabled:
+			# Register click action WITH coordinate support
+			@self.registry.action(
+				'Click element by index or coordinates. Use coordinates only if the index is not available. Either provide coordinates or index.',
+				param_model=ClickElementAction,
+			)
+			async def click(params: ClickElementAction, browser_session: BrowserSession):
+				# Validate that either index or coordinates are provided
+				if params.index is None and (params.coordinate_x is None or params.coordinate_y is None):
+					return ActionResult(error='Must provide either index or both coordinate_x and coordinate_y')
+
+				# Try index-based clicking first if index is provided
+				if params.index is not None:
+					return await self._click_by_index(params, browser_session)
+				# Coordinate-based clicking when index is not provided
+				else:
+					return await self._click_by_coordinate(params, browser_session)
+		else:
+			# Register click action WITHOUT coordinate support (index only)
+			@self.registry.action(
+				'Click element by index.',
+				param_model=ClickElementActionIndexOnly,
+			)
+			async def click(params: ClickElementActionIndexOnly, browser_session: BrowserSession):
+				return await self._click_by_index(params, browser_session)
+
+	def set_coordinate_clicking(self, enabled: bool) -> None:
+		"""Enable or disable coordinate-based clicking.
+
+		When enabled, the click action accepts both index and coordinate parameters.
+		When disabled (default), only index-based clicking is available.
+
+		This is automatically enabled for models that support coordinate clicking:
+		- claude-sonnet-4-5
+		- claude-opus-4-5
+		- gemini-3-pro
+		- browser-use/* models
+
+		Args:
+			enabled: True to enable coordinate clicking, False to disable
+		"""
+		if enabled == self._coordinate_clicking_enabled:
+			return  # No change needed
+
+		self._coordinate_clicking_enabled = enabled
+		self._register_click_action()
+		logger.debug(f'Coordinate clicking {"enabled" if enabled else "disabled"}')
 
 	# Act --------------------------------------------------------------------
 	@observe_debug(ignore_input=True, ignore_output=True, name='act')

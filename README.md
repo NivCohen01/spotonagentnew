@@ -38,9 +38,11 @@
 
 </br>
 
+🌤️ Want to skip the setup? Use our <b>[cloud](https://cloud.browser-use.com)</b> for faster, scalable, stealth-enabled browser automation!
+
 # 🤖 LLM Quickstart
 
-1. Direct your favorite coding agent (Cursor, ClaudeS, etc) to [Agents.md](https://docs.browser-use.com/llms-full.txt)
+1. Direct your favorite coding agent (Cursor, Claude Code, etc) to [Agents.md](https://docs.browser-use.com/llms-full.txt)
 2. Prompt away!
 
 <br/>
@@ -183,8 +185,8 @@ We optimized **ChatBrowserUse()** specifically for browser automation tasks. On 
 
 **Pricing (per 1M tokens):**
 - Input tokens: $0.20
+- Cached input tokens: $0.02
 - Output tokens: $2.00
-- Cached tokens: $0.02
 
 For other LLM providers, see our [supported models documentation](https://docs.browser-use.com/supported-models).
 </details>

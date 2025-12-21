@@ -24,16 +24,37 @@ URL_PATTERN = re.compile(r'https?://[^\s<>"\']+|www\.[^\s<>"\']+|[^\s<>"\']+\.[a
 
 logger = logging.getLogger(__name__)
 
-# Import error types - these may need to be adjusted based on actual import paths
-try:
-	from openai import BadRequestError as OpenAIBadRequestError
-except ImportError:
-	OpenAIBadRequestError = None
+# Lazy import for error types
+# Use sentinel to avoid retrying import when package is not installed
+_IMPORT_NOT_FOUND: type = type('_ImportNotFound', (), {})
+_openai_bad_request_error: type | None = None
+_groq_bad_request_error: type | None = None
 
-try:
-	from groq import BadRequestError as GroqBadRequestError  # type: ignore[import-not-found]
-except ImportError:
-	GroqBadRequestError = None
+
+def _get_openai_bad_request_error() -> type | None:
+	"""Lazy loader for OpenAI BadRequestError."""
+	global _openai_bad_request_error
+	if _openai_bad_request_error is None:
+		try:
+			from openai import BadRequestError
+
+			_openai_bad_request_error = BadRequestError
+		except ImportError:
+			_openai_bad_request_error = _IMPORT_NOT_FOUND
+	return _openai_bad_request_error if _openai_bad_request_error is not _IMPORT_NOT_FOUND else None
+
+
+def _get_groq_bad_request_error() -> type | None:
+	"""Lazy loader for Groq BadRequestError."""
+	global _groq_bad_request_error
+	if _groq_bad_request_error is None:
+		try:
+			from groq import BadRequestError  # type: ignore[import-not-found]
+
+			_groq_bad_request_error = BadRequestError
+		except ImportError:
+			_groq_bad_request_error = _IMPORT_NOT_FOUND
+	return _groq_bad_request_error if _groq_bad_request_error is not _IMPORT_NOT_FOUND else None
 
 
 # Global flag to prevent duplicate exit messages
@@ -733,3 +754,18 @@ def create_task_with_error_handling(
 
 	task.add_done_callback(_handle_task_exception)
 	return task
+
+
+def sanitize_surrogates(text: str) -> str:
+	"""Remove surrogate characters that can't be encoded in UTF-8.
+
+	Surrogate pairs (U+D800 to U+DFFF) are invalid in UTF-8 when unpaired.
+	These often appear in DOM content from mathematical symbols or emojis.
+
+	Args:
+		text: The text to sanitize
+
+	Returns:
+		Text with surrogate characters removed
+	"""
+	return text.encode('utf-8', errors='ignore').decode('utf-8')

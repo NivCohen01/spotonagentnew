@@ -42,6 +42,12 @@ class ClickElementAction(BaseModel):
 	# click_count: int = 1  # TODO
 
 
+class ClickElementActionIndexOnly(BaseModel):
+	model_config = ConfigDict(title='ClickElementAction')
+
+	index: int = Field(ge=1, description='Element index from browser_state')
+
+
 class InputTextAction(BaseModel):
 	index: int = Field(ge=0, description='from browser_state')
 	text: str
@@ -71,7 +77,7 @@ class CloseTabAction(BaseModel):
 
 
 class ScrollAction(BaseModel):
-	down: bool = Field(description='down=True=scroll down, down=False scroll up')
+	down: bool = Field(default=True, description='down=True=scroll down, down=False scroll up')
 	pages: float = Field(default=1.0, description='0.5=half page, 1=full page, 10=to bottom/top')
 	index: int | None = Field(default=None, description='Optional element index to scroll within specific container')
 

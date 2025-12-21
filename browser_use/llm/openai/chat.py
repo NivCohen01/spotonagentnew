@@ -146,13 +146,15 @@ class ChatOpenAI(BaseChatModel):
 		return usage
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: None = None) -> ChatInvokeCompletion[str]: ...
+	async def ainvoke(
+		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T]) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None
+		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model with the given messages.
@@ -190,8 +192,8 @@ class ChatOpenAI(BaseChatModel):
 
 			if self.reasoning_models and any(str(m).lower() in str(self.model).lower() for m in self.reasoning_models):
 				model_params['reasoning_effort'] = self.reasoning_effort
-				del model_params['temperature']
-				del model_params['frequency_penalty']
+				model_params.pop('temperature', None)
+				model_params.pop('frequency_penalty', None)
 
 			if output_format is None:
 				# Return string response

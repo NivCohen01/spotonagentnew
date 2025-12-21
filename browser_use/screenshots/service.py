@@ -11,16 +11,14 @@ from browser_use.observability import observe_debug
 
 
 class ScreenshotService:
-	"""Simple screenshot storage service that saves screenshots to disk."""
+	"""Simple screenshot storage service that saves screenshots to disk"""
 
-	def __init__(self, agent_directory: str | Path, session_id: str | None = None):
-		"""Initialize with agent directory path and optional session scope."""
+	def __init__(self, agent_directory: str | Path):
+		"""Initialize with agent directory path"""
 		self.agent_directory = Path(agent_directory) if isinstance(agent_directory, str) else agent_directory
-		self.session_id = session_id
 
+		# Create screenshots subdirectory
 		self.screenshots_dir = self.agent_directory / 'screenshots'
-		if self.session_id:
-			self.screenshots_dir = self.screenshots_dir / self.session_id
 		self.screenshots_dir.mkdir(parents=True, exist_ok=True)
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='store_screenshot')

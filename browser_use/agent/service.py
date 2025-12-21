@@ -8,8 +8,11 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+	from browser_use.skills.views import Skill
 
 from dotenv import load_dotenv
 
@@ -22,6 +25,7 @@ from browser_use.agent.cloud_events import (
 )
 from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam, UserMessage
 from browser_use.tokens.service import TokenCost
 
@@ -51,17 +55,16 @@ from browser_use.agent.views import (
 	AgentStepInfo,
 	AgentStructuredOutput,
 	BrowserStateHistory,
+	DetectedVariable,
 	JudgementResult,
 	StepMetadata,
 )
-from browser_use.browser.profile import ViewportSize
 from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
-from browser_use.screenshots.models import ActionScreenshotSettings
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tools.registry.views import ActionModel
@@ -134,6 +137,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		browser: Browser | None = None,  # Alias for browser_session
 		tools: Tools[Context] | None = None,
 		controller: Tools[Context] | None = None,  # Alias for tools
+		# Skills integration
+		skill_ids: list[str | Literal['*']] | None = None,
+		skills: list[str | Literal['*']] | None = None,  # Alias for skill_ids
 		# Initial agent run parameters
 		sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		initial_actions: list[dict[str, dict[str, Any]]] | None = None,
@@ -161,11 +167,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		generate_gif: bool | str = False,
 		available_file_paths: list[str] | None = None,
 		include_attributes: list[str] | None = None,
-		max_actions_per_step: int = 10,
+		max_actions_per_step: int = 3,
 		use_thinking: bool = True,
 		flash_mode: bool = False,
+		demo_mode: bool | None = None,
 		max_history_items: int | None = None,
 		page_extraction_llm: BaseChatModel | None = None,
+		fallback_llm: BaseChatModel | None = None,
 		use_judge: bool = True,
 		ground_truth: str | None = None,
 		judge_llm: BaseChatModel | None = None,
@@ -185,10 +193,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		final_response_after_failure: bool = True,
 		llm_screenshot_size: tuple[int, int] | None = None,
 		_url_shortening_limit: int = 25,
-		action_screenshots: ActionScreenshotSettings | dict | None = None,
-		device_type: Literal['mobile', 'desktop', 'custom'] | None = None,
-		viewport_width: int | None = None,
-		viewport_height: int | None = None,
 		**kwargs,
 	):
 		# Validate llm_screenshot_size
@@ -238,6 +242,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				"""Determine timeout based on model name"""
 				model_name = getattr(llm_model, 'model', '').lower()
 				if 'gemini' in model_name:
+					if '3-pro' in model_name:
+						return 90
 					return 45
 				elif 'groq' in model_name:
 					return 30
@@ -252,39 +258,36 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.task_id: str = self.id
 		self.session_id: str = uuid7str()
 
-		browser_profile = browser_profile or DEFAULT_BROWSER_PROFILE
+		base_profile = browser_profile or DEFAULT_BROWSER_PROFILE
+		if base_profile is DEFAULT_BROWSER_PROFILE:
+			base_profile = base_profile.model_copy()
+		if demo_mode is not None and base_profile.demo_mode != demo_mode:
+			base_profile = base_profile.model_copy(update={'demo_mode': demo_mode})
+		browser_profile = base_profile
 
 		# Handle browser vs browser_session parameter (browser takes precedence)
 		if browser and browser_session:
 			raise ValueError('Cannot specify both "browser" and "browser_session" parameters. Use "browser" for the cleaner API.')
 		browser_session = browser or browser_session
 
+		if browser_session is not None and demo_mode is not None and browser_session.browser_profile.demo_mode != demo_mode:
+			browser_session.browser_profile = browser_session.browser_profile.model_copy(update={'demo_mode': demo_mode})
+
 		self.browser_session = browser_session or BrowserSession(
 			browser_profile=browser_profile,
 			id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
 		)
 
-		if device_type:
-			try:
-				self._apply_device_profile(
-					self.browser_session.browser_profile,
-					device_type=device_type,
-					device_width=viewport_width,
-					device_height=viewport_height,
-				)
-			except Exception as e:
-				logger.warning(f'dY"? Could not apply device profile ({device_type}): {type(e).__name__}: {e}')
+		self._demo_mode_enabled: bool = bool(self.browser_profile.demo_mode) if self.browser_session else False
+		if self._demo_mode_enabled and getattr(self.browser_profile, 'headless', False):
+			self.logger.warning(
+				'Demo mode is enabled but the browser is headless=True; set headless=False to view the in-browser panel.'
+			)
 
 		# Initialize available file paths as direct attribute
 		self.available_file_paths = available_file_paths
 
-		# Core components
-		self.task = self._enhance_task_with_schema(task, output_model_schema)
-		self.llm = llm
-		self.judge_llm = judge_llm
-		self.directly_open_url = directly_open_url
-		self.include_recent_events = include_recent_events
-		self._url_shortening_limit = _url_shortening_limit
+		# Set up tools first (needed to detect output_model_schema)
 		if tools is not None:
 			self.tools = tools
 		elif controller is not None:
@@ -294,16 +297,65 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			exclude_actions = ['screenshot'] if use_vision != 'auto' else []
 			self.tools = Tools(exclude_actions=exclude_actions, display_files_in_done_text=display_files_in_done_text)
 
-		# Structured output
+		# Enforce screenshot exclusion when use_vision != 'auto', even if user passed custom tools
+		if use_vision != 'auto':
+			self.tools.exclude_action('screenshot')
+
+		# Enable coordinate clicking for models that support it
+		model_name = getattr(llm, 'model', '').lower()
+		supports_coordinate_clicking = any(
+			pattern in model_name for pattern in ['claude-sonnet-4', 'claude-opus-4', 'gemini-3-pro', 'browser-use/']
+		)
+		if supports_coordinate_clicking:
+			self.tools.set_coordinate_clicking(True)
+
+		# Handle skills vs skill_ids parameter (skills takes precedence)
+		if skills and skill_ids:
+			raise ValueError('Cannot specify both "skills" and "skill_ids" parameters. Use "skills" for the cleaner API.')
+		skill_ids = skills or skill_ids
+
+		# Skills integration
+		self.skill_service = None
+		self._skills_registered = False
+		if skill_ids:
+			from browser_use.skills import SkillService
+
+			self.skill_service = SkillService(skill_ids=skill_ids)
+
+		# Structured output - use explicit param or detect from tools
+		tools_output_model = self.tools.get_output_model()
+		if output_model_schema is not None and tools_output_model is not None:
+			# Both provided - warn if they differ
+			if output_model_schema is not tools_output_model:
+				logger.warning(
+					f'output_model_schema ({output_model_schema.__name__}) differs from Tools output_model '
+					f'({tools_output_model.__name__}). Using Agent output_model_schema.'
+				)
+		elif output_model_schema is None and tools_output_model is not None:
+			# Only tools has it - use that (cast is safe: both are BaseModel subclasses)
+			output_model_schema = cast(type[AgentStructuredOutput], tools_output_model)
 		self.output_model_schema = output_model_schema
 		if self.output_model_schema is not None:
 			self.tools.use_structured_output_action(self.output_model_schema)
+
+		# Core components - task enhancement now has access to output_model_schema from tools
+		self.task = self._enhance_task_with_schema(task, output_model_schema)
+		self.llm = llm
+		self.judge_llm = judge_llm
+
+		# Fallback LLM configuration
+		self._fallback_llm: BaseChatModel | None = fallback_llm
+		self._using_fallback_llm: bool = False
+		self._original_llm: BaseChatModel = llm  # Store original for reference
+		self.directly_open_url = directly_open_url
+		self.include_recent_events = include_recent_events
+		self._url_shortening_limit = _url_shortening_limit
 
 		self.sensitive_data = sensitive_data
 
 		self.sample_images = sample_images
 
-		settings_payload = dict(
+		self.settings = AgentSettings(
 			use_vision=use_vision,
 			vision_detail_level=vision_detail_level,
 			save_conversation_path=save_conversation_path,
@@ -326,10 +378,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			use_judge=use_judge,
 			ground_truth=ground_truth,
 		)
-		if action_screenshots is not None:
-			settings_payload['action_screenshots'] = action_screenshots
-
-		self.settings = AgentSettings(**settings_payload)
 
 		# Token cost service
 		self.token_cost_service = TokenCost(include_cost=calculate_cost)
@@ -349,7 +397,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		timestamp = int(time.time())
 		base_tmp = Path(tempfile.gettempdir())
 		self.agent_directory = base_tmp / f'browser_use_agent_{self.id}_{timestamp}'
-		self.action_screenshot_recorder = None
 
 		# Initialize file system and screenshot service
 		self._set_file_system(file_system_path)
@@ -380,9 +427,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.warning('⚠️ DeepSeek models do not support use_vision=True yet. Setting use_vision=False for now...')
 			self.settings.use_vision = False
 
-		# Handle users trying to use use_vision=True with XAI models
-		if 'grok' in self.llm.model.lower():
-			self.logger.warning('⚠️ XAI models do not support use_vision=True yet. Setting use_vision=False for now...')
+		# Handle users trying to use use_vision=True with XAI models that don't support it
+		# grok-3 variants and grok-code don't support vision; grok-2 and grok-4 do
+		model_lower = self.llm.model.lower()
+		if 'grok-3' in model_lower or 'grok-code' in model_lower:
+			self.logger.warning('⚠️ This XAI model does not support use_vision=True yet. Setting use_vision=False for now...')
 			self.settings.use_vision = False
 
 		logger.debug(
@@ -399,6 +448,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		is_anthropic = isinstance(self.llm, ChatAnthropic)
 
+		# Check if model is a browser-use fine-tuned model (uses simplified prompts)
+		is_browser_use_model = 'browser-use/' in self.llm.model.lower()
+
 		# Initialize message manager with state
 		# Initial system prompt with all actions - will be updated during each step
 		self._message_manager = MessageManager(
@@ -410,6 +462,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				use_thinking=self.settings.use_thinking,
 				flash_mode=self.settings.flash_mode,
 				is_anthropic=is_anthropic,
+				is_browser_use_model=is_browser_use_model,
 			).get_system_message(),
 			file_system=self.file_system,
 			state=self.state.message_manager_state,
@@ -524,19 +577,30 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	@property
 	def logger(self) -> logging.Logger:
 		"""Get instance-specific logger with task ID in the name"""
-
-		_browser_session_id = self.browser_session.id if self.browser_session else '----'
+		# logger may be called in __init__ so we don't assume self.* attributes have been initialized
+		_task_id = task_id[-4:] if (task_id := getattr(self, 'task_id', None)) else '----'
+		_browser_session_id = browser_session.id[-4:] if (browser_session := getattr(self, 'browser_session', None)) else '----'
 		_current_target_id = (
-			self.browser_session.agent_focus_target_id[-2:]
-			if self.browser_session and self.browser_session.agent_focus_target_id
+			browser_session.agent_focus_target_id[-2:]
+			if (browser_session := getattr(self, 'browser_session', None)) and browser_session.agent_focus_target_id
 			else '--'
 		)
-		return logging.getLogger(f'browser_use.Agent🅰 {self.task_id[-4:]} ⇢ 🅑 {_browser_session_id[-4:]} 🅣 {_current_target_id}')
+		return logging.getLogger(f'browser_use.Agent🅰 {_task_id} ⇢ 🅑 {_browser_session_id} 🅣 {_current_target_id}')
 
 	@property
 	def browser_profile(self) -> BrowserProfile:
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 		return self.browser_session.browser_profile
+
+	@property
+	def is_using_fallback_llm(self) -> bool:
+		"""Check if the agent is currently using the fallback LLM."""
+		return self._using_fallback_llm
+
+	@property
+	def current_llm_model(self) -> str:
+		"""Get the model name of the currently active LLM."""
+		return self.llm.model if hasattr(self.llm, 'model') else 'unknown'
 
 	async def _check_and_update_downloads(self, context: str = '') -> None:
 		"""Check for new downloads and update available file paths."""
@@ -613,49 +677,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.state.file_system_state = self.file_system.get_state()
 
 		self.logger.debug(f'💾 File system path: {self.file_system_path}')
+
 	def _set_screenshot_service(self) -> None:
 		"""Initialize screenshot service using agent directory"""
 		try:
-			from browser_use.screenshots.action_recorder import ActionScreenshotRecorder
 			from browser_use.screenshots.service import ScreenshotService
-			self.screenshot_service = ScreenshotService(self.agent_directory, session_id=self.session_id)
-			self.logger.debug(f'dY", Screenshot service initialized in: {self.screenshot_service.screenshots_dir}')
-			if self.settings.action_screenshots.enabled:
-				self.action_screenshot_recorder = ActionScreenshotRecorder(
-					self.settings.action_screenshots, self.agent_directory, self.session_id
-				)
-				self.logger.debug(
-					f'dY", Action screenshot recorder ready at: {self.action_screenshot_recorder.base_dir}'
-				)
-			else:
-				self.action_screenshot_recorder = None
-		except Exception as e:
-			self.logger.error(f'dY", Failed to initialize screenshot service: {e}.')
-			raise e
 
-	def _apply_device_profile(
-		self,
-		browser_profile: BrowserProfile,
-		device_type: Literal['mobile', 'desktop', 'custom'],
-		device_width: int | None,
-		device_height: int | None,
-	) -> None:
-		"""Force browser viewport characteristics to match requested device type."""
-		if device_type == 'desktop':
-			if browser_profile.viewport is None:
-				browser_profile.viewport = ViewportSize(width=1920, height=1080)
-			browser_profile.device_scale_factor = float(browser_profile.device_scale_factor or 1.0)
-			browser_profile.no_viewport = False
-		elif device_type == 'mobile':
-			browser_profile.viewport = ViewportSize(width=390, height=844)
-			browser_profile.device_scale_factor = 3.0
-			browser_profile.no_viewport = False
-		elif device_type == 'custom':
-			if device_width and device_height:
-				browser_profile.viewport = ViewportSize(width=int(device_width), height=int(device_height))
-				browser_profile.no_viewport = False
-			else:
-				self.logger.info('device_type="custom" requested without viewport dimensions; leaving defaults.')
+			self.screenshot_service = ScreenshotService(self.agent_directory)
+			self.logger.debug(f'📸 Screenshot service initialized in: {self.agent_directory}/screenshots')
+		except Exception as e:
+			self.logger.error(f'📸 Failed to initialize screenshot service: {e}.')
+			raise e
 
 	def save_file_system_state(self) -> None:
 		"""Save current file system state to agent state"""
@@ -708,6 +740,202 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
 		else:
 			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.DoneActionModel)
+
+	def _get_skill_slug(self, skill: 'Skill', all_skills: list['Skill']) -> str:
+		"""Generate a clean slug from skill title for action names
+
+		Converts title to lowercase, removes special characters, replaces spaces with underscores.
+		Adds UUID suffix if there are duplicate slugs.
+
+		Args:
+			skill: The skill to get slug for
+			all_skills: List of all skills to check for duplicates
+
+		Returns:
+			Slug like "cloned_github_stars_tracker" or "get_weather_data_a1b2" if duplicate
+
+		Examples:
+			"[Cloned] Github Stars Tracker" -> "cloned_github_stars_tracker"
+			"Get Weather Data" -> "get_weather_data"
+		"""
+		import re
+
+		# Remove special characters and convert to lowercase
+		slug = re.sub(r'[^\w\s]', '', skill.title.lower())
+		# Replace whitespace and hyphens with underscores
+		slug = re.sub(r'[\s\-]+', '_', slug)
+		# Remove leading/trailing underscores
+		slug = slug.strip('_')
+
+		# Check for duplicates and add UUID suffix if needed
+		same_slug_count = sum(
+			1 for s in all_skills if re.sub(r'[\s\-]+', '_', re.sub(r'[^\w\s]', '', s.title.lower()).strip('_')) == slug
+		)
+		if same_slug_count > 1:
+			return f'{slug}_{skill.id[:4]}'
+		else:
+			return slug
+
+	async def _register_skills_as_actions(self) -> None:
+		"""Register each skill as a separate action using slug as action name"""
+		if not self.skill_service or self._skills_registered:
+			return
+
+		self.logger.info('🔧 Registering skill actions...')
+
+		# Fetch all skills (auto-initializes if needed)
+		skills = await self.skill_service.get_all_skills()
+
+		if not skills:
+			self.logger.warning('No skills loaded from SkillService')
+			return
+
+		# Register each skill as its own action
+		for skill in skills:
+			slug = self._get_skill_slug(skill, skills)
+			param_model = skill.parameters_pydantic(exclude_cookies=True)
+
+			# Create description with skill title in quotes
+			description = f'{skill.description} (Skill: "{skill.title}")'
+
+			# Create handler for this specific skill
+			def make_skill_handler(skill_id: str):
+				async def skill_handler(params: BaseModel) -> ActionResult:
+					"""Execute a specific skill"""
+					assert self.skill_service is not None, 'SkillService not initialized'
+
+					# Convert parameters to dict
+					if isinstance(params, BaseModel):
+						skill_params = params.model_dump()
+					elif isinstance(params, dict):
+						skill_params = params
+					else:
+						return ActionResult(extracted_content=None, error=f'Invalid parameters type: {type(params)}')
+
+					# Get cookies from browser
+					_cookies = await self.browser_session.cookies()
+
+					try:
+						result = await self.skill_service.execute_skill(
+							skill_id=skill_id, parameters=skill_params, cookies=_cookies
+						)
+
+						if result.success:
+							return ActionResult(
+								extracted_content=str(result.result) if result.result else None,
+								error=None,
+							)
+						else:
+							return ActionResult(extracted_content=None, error=result.error or 'Skill execution failed')
+					except Exception as e:
+						# Check if it's a MissingCookieException
+						if type(e).__name__ == 'MissingCookieException':
+							# Format: "Missing cookies (name): description"
+							cookie_name = getattr(e, 'cookie_name', 'unknown')
+							cookie_description = getattr(e, 'cookie_description', str(e))
+							error_msg = f'Missing cookies ({cookie_name}): {cookie_description}'
+							return ActionResult(extracted_content=None, error=error_msg)
+						return ActionResult(extracted_content=None, error=f'Skill execution error: {type(e).__name__}: {e}')
+
+				return skill_handler
+
+			# Create the handler for this skill
+			handler = make_skill_handler(skill.id)
+			handler.__name__ = slug
+
+			# Register the action with the slug as the action name
+			self.tools.registry.action(description=description, param_model=param_model)(handler)
+
+		# Mark as registered
+		self._skills_registered = True
+
+		# Rebuild action models to include the new skill actions
+		self._setup_action_models()
+
+		# Reconvert initial actions with the new ActionModel type if they exist
+		if self.initial_actions:
+			# Convert back to dict form first
+			initial_actions_dict = []
+			for action in self.initial_actions:
+				action_dump = action.model_dump(exclude_unset=True)
+				initial_actions_dict.append(action_dump)
+			# Reconvert using new ActionModel
+			self.initial_actions = self._convert_initial_actions(initial_actions_dict)
+
+		self.logger.info(f'✓ Registered {len(skills)} skill actions')
+
+	async def _get_unavailable_skills_info(self) -> str:
+		"""Get information about skills that are unavailable due to missing cookies
+
+		Returns:
+			Formatted string describing unavailable skills and how to make them available
+		"""
+		if not self.skill_service:
+			return ''
+
+		try:
+			# Get all skills
+			skills = await self.skill_service.get_all_skills()
+			if not skills:
+				return ''
+
+			# Get current cookies
+			current_cookies = await self.browser_session.cookies()
+			cookie_dict = {cookie['name']: cookie['value'] for cookie in current_cookies}
+
+			# Check each skill for missing required cookies
+			unavailable_skills: list[dict[str, Any]] = []
+
+			for skill in skills:
+				# Get cookie parameters for this skill
+				cookie_params = [p for p in skill.parameters if p.type == 'cookie']
+
+				if not cookie_params:
+					# No cookies needed, skip
+					continue
+
+				# Check for missing required cookies
+				missing_cookies: list[dict[str, str]] = []
+				for cookie_param in cookie_params:
+					is_required = cookie_param.required if cookie_param.required is not None else True
+
+					if is_required and cookie_param.name not in cookie_dict:
+						missing_cookies.append(
+							{'name': cookie_param.name, 'description': cookie_param.description or 'No description provided'}
+						)
+
+				if missing_cookies:
+					unavailable_skills.append(
+						{
+							'id': skill.id,
+							'title': skill.title,
+							'description': skill.description,
+							'missing_cookies': missing_cookies,
+						}
+					)
+
+			if not unavailable_skills:
+				return ''
+
+			# Format the unavailable skills info with slugs
+			lines = ['Unavailable Skills (missing required cookies):']
+			for skill_info in unavailable_skills:
+				# Get the full skill object to use the slug helper
+				skill_obj = next((s for s in skills if s.id == skill_info['id']), None)
+				slug = self._get_skill_slug(skill_obj, skills) if skill_obj else skill_info['title']
+				title = skill_info['title']
+
+				lines.append(f'\n  • {slug} ("{title}")')
+				lines.append(f'    Description: {skill_info["description"]}')
+				lines.append('    Missing cookies:')
+				for cookie in skill_info['missing_cookies']:
+					lines.append(f'      - {cookie["name"]}: {cookie["description"]}')
+
+			return '\n'.join(lines)
+
+		except Exception as e:
+			self.logger.error(f'Error getting unavailable skills info: {type(e).__name__}: {e}')
+			return ''
 
 	def add_new_task(self, new_task: str) -> None:
 		"""Add a new task to the agent, keeping the same task_id as tasks are continuous"""
@@ -807,6 +1035,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Page-specific actions will be included directly in the browser_state message
 		self.logger.debug(f'💬 Step {self.state.n_steps}: Creating state messages for context...')
 
+		# Get unavailable skills info if skills service is enabled
+		unavailable_skills_info = None
+		if self.skill_service is not None:
+			unavailable_skills_info = await self._get_unavailable_skills_info()
+
 		self._message_manager.create_state_messages(
 			browser_state_summary=browser_state_summary,
 			model_output=self.state.last_model_output,
@@ -816,6 +1049,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			page_filtered_actions=page_filtered_actions if page_filtered_actions else None,
 			sensitive_data=self.sensitive_data,
 			available_file_paths=self.available_file_paths,  # Always pass current available_file_paths
+			unavailable_skills_info=unavailable_skills_info,
 		)
 
 		await self._force_done_after_last_step(step_info)
@@ -903,7 +1137,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Handle InterruptedError specially
 		if isinstance(error, InterruptedError):
 			error_msg = 'The agent was interrupted mid-step' + (f' - {str(error)}' if str(error) else '')
-			self.logger.error(f'{error_msg}')
+			# NOTE: This is not an error, it's a normal part of the execution when the user interrupts the agent
+			self.logger.warning(f'{error_msg}')
 			return
 
 		# Handle all other exceptions
@@ -924,6 +1159,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		else:
 			self.logger.log(log_level, f'{prefix}{error_msg}')
 
+		await self._demo_mode_log(f'Step error: {error_msg}', 'error', {'step': self.state.n_steps})
 		self.state.last_result = [ActionResult(error=error_msg)]
 		return None
 
@@ -934,10 +1170,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return
 
 		if browser_state_summary:
+			step_interval = None
+			if len(self.history.history) > 0:
+				last_history_item = self.history.history[-1]
+
+				if last_history_item.metadata:
+					previous_end_time = last_history_item.metadata.step_end_time
+					previous_start_time = last_history_item.metadata.step_start_time
+					step_interval = max(0, previous_end_time - previous_start_time)
 			metadata = StepMetadata(
 				step_number=self.state.n_steps,
 				step_start_time=self.step_start_time,
 				step_end_time=step_end_time,
+				step_interval=step_interval,
 			)
 
 			# Use _make_history_item like main branch
@@ -950,7 +1195,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			)
 
 		# Log step completion summary
-		self._log_step_completion_summary(self.step_start_time, self.state.last_result)
+		summary_message = self._log_step_completion_summary(self.step_start_time, self.state.last_result)
+		if summary_message:
+			await self._demo_mode_log(summary_message, 'info', {'step': self.state.n_steps})
 
 		# Save file system state after step completion
 		self.save_file_system_state()
@@ -1352,7 +1599,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Build kwargs for ainvoke
 		# Note: ChatBrowserUse will automatically generate action descriptions from output_format schema
-		kwargs: dict = {'output_format': self.AgentOutput}
+		kwargs: dict = {'output_format': self.AgentOutput, 'session_id': self.session_id}
 
 		try:
 			response = await self.llm.ainvoke(input_messages, **kwargs)
@@ -1368,12 +1615,75 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			if not (hasattr(self.state, 'paused') and (self.state.paused or self.state.stopped)):
 				log_response(parsed, self.tools.registry.registry, self.logger)
+				await self._broadcast_model_state(parsed)
 
 			self._log_next_action_summary(parsed)
 			return parsed
 		except ValidationError:
 			# Just re-raise - Pydantic's validation errors are already descriptive
 			raise
+		except (ModelRateLimitError, ModelProviderError) as e:
+			# Check if we can switch to a fallback LLM
+			if not self._try_switch_to_fallback_llm(e):
+				# No fallback available, re-raise the original error
+				raise
+			# Retry with the fallback LLM
+			return await self.get_model_output(input_messages)
+
+	def _try_switch_to_fallback_llm(self, error: ModelRateLimitError | ModelProviderError) -> bool:
+		"""
+		Attempt to switch to a fallback LLM after a rate limit or provider error.
+
+		Returns True if successfully switched to a fallback, False if no fallback available.
+		Once switched, the agent will use the fallback LLM for the rest of the run.
+		"""
+		# Already using fallback - can't switch again
+		if self._using_fallback_llm:
+			self.logger.warning(
+				f'⚠️ Fallback LLM also failed ({type(error).__name__}: {error.message}), no more fallbacks available'
+			)
+			return False
+
+		# Check if error is retryable (rate limit, auth errors, or server errors)
+		# 401: API key invalid/expired - fallback to different provider
+		# 402: Insufficient credits/payment required - fallback to different provider
+		# 429: Rate limit exceeded
+		# 500, 502, 503, 504: Server errors
+		retryable_status_codes = {401, 402, 429, 500, 502, 503, 504}
+		is_retryable = isinstance(error, ModelRateLimitError) or (
+			hasattr(error, 'status_code') and error.status_code in retryable_status_codes
+		)
+
+		if not is_retryable:
+			return False
+
+		# Check if we have a fallback LLM configured
+		if self._fallback_llm is None:
+			self.logger.warning(f'⚠️ LLM error ({type(error).__name__}: {error.message}) but no fallback_llm configured')
+			return False
+
+		self._log_fallback_switch(error, self._fallback_llm)
+
+		# Switch to the fallback LLM
+		self.llm = self._fallback_llm
+		self._using_fallback_llm = True
+
+		# Register the fallback LLM for token cost tracking
+		self.token_cost_service.register_llm(self._fallback_llm)
+
+		return True
+
+	def _log_fallback_switch(self, error: ModelRateLimitError | ModelProviderError, fallback: BaseChatModel) -> None:
+		"""Log when switching to a fallback LLM."""
+		original_model = self._original_llm.model if hasattr(self._original_llm, 'model') else 'unknown'
+		fallback_model = fallback.model if hasattr(fallback, 'model') else 'unknown'
+		error_type = type(error).__name__
+		status_code = getattr(error, 'status_code', 'N/A')
+
+		self.logger.warning(
+			f'⚠️ Primary LLM ({original_model}) failed with {error_type} (status={status_code}), '
+			f'switching to fallback LLM ({fallback_model})'
+		)
 
 	async def _log_agent_run(self) -> None:
 		"""Log the agent run"""
@@ -1383,11 +1693,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.debug(f'🤖 Browser-Use Library Version {self.version} ({self.source})')
 
 		# Check for latest version and log upgrade message if needed
-		latest_version = await check_latest_browser_use_version()
-		if latest_version and latest_version != self.version:
-			self.logger.info(
-				f'📦 Newer version available: {latest_version} (current: {self.version}). Upgrade with: uv add browser-use@{latest_version}'
-			)
+		if CONFIG.BROWSER_USE_VERSION_CHECK:
+			latest_version = await check_latest_browser_use_version()
+			if latest_version and latest_version != self.version:
+				self.logger.info(
+					f'📦 Newer version available: {latest_version} (current: {self.version}). Upgrade with: uv add browser-use=={latest_version}'
+				)
 
 	def _log_first_step_startup(self) -> None:
 		"""Log startup message only on the first step"""
@@ -1439,10 +1750,47 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			param_str = f'({", ".join(param_summary)})' if param_summary else ''
 			action_details.append(f'{action_name}{param_str}')
 
-	def _log_step_completion_summary(self, step_start_time: float, result: list[ActionResult]) -> None:
+	def _prepare_demo_message(self, message: str, limit: int = 600) -> str:
+		# Previously truncated long entries; keep full text for better context in demo panel
+		return message.strip()
+
+	async def _demo_mode_log(self, message: str, level: str = 'info', metadata: dict[str, Any] | None = None) -> None:
+		if not self._demo_mode_enabled or not message or self.browser_session is None:
+			return
+		try:
+			await self.browser_session.send_demo_mode_log(
+				message=self._prepare_demo_message(message),
+				level=level,
+				metadata=metadata or {},
+			)
+		except Exception as exc:
+			self.logger.debug(f'[DemoMode] Failed to send overlay log: {exc}')
+
+	async def _broadcast_model_state(self, parsed: 'AgentOutput') -> None:
+		if not self._demo_mode_enabled:
+			return
+
+		state = parsed.current_state
+		step_meta = {'step': self.state.n_steps}
+
+		if state.thinking:
+			await self._demo_mode_log(state.thinking, 'thought', step_meta)
+
+		if state.evaluation_previous_goal:
+			eval_text = state.evaluation_previous_goal
+			level = 'success' if 'success' in eval_text.lower() else 'warning' if 'failure' in eval_text.lower() else 'info'
+			await self._demo_mode_log(eval_text, level, step_meta)
+
+		if state.memory:
+			await self._demo_mode_log(f'Memory: {state.memory}', 'info', step_meta)
+
+		if state.next_goal:
+			await self._demo_mode_log(f'Next goal: {state.next_goal}', 'info', step_meta)
+
+	def _log_step_completion_summary(self, step_start_time: float, result: list[ActionResult]) -> str | None:
 		"""Log step completion summary with action count, timing, and success/failure stats"""
 		if not result:
-			return
+			return None
 
 		step_duration = time.time() - step_start_time
 		action_count = len(result)
@@ -1457,9 +1805,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		status_parts = [part for part in [success_indicator, failure_indicator] if part]
 		status_str = ' | '.join(status_parts) if status_parts else '✅ 0'
 
-		self.logger.debug(
-			f'📍 Step {self.state.n_steps}: Ran {action_count} action{"" if action_count == 1 else "s"} in {step_duration:.2f}s: {status_str}'
+		message = (
+			f'📍 Step {self.state.n_steps}: Ran {action_count} action{"" if action_count == 1 else "s"} '
+			f'in {step_duration:.2f}s: {status_str}'
 		)
+		self.logger.debug(message)
+		return message
 
 	def _log_final_outcome_messages(self) -> None:
 		"""Log helpful messages to user based on agent run outcome"""
@@ -1515,6 +1866,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		judge_verdict = judgement_data.get('verdict') if judgement_data else None
 		judge_reasoning = judgement_data.get('reasoning') if judgement_data else None
 		judge_failure_reason = judgement_data.get('failure_reason') if judgement_data else None
+		judge_reached_captcha = judgement_data.get('reached_captcha') if judgement_data else None
+		judge_impossible_task = judgement_data.get('impossible_task') if judgement_data else None
 
 		self.telemetry.capture(
 			AgentTelemetryEvent(
@@ -1545,6 +1898,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				judge_verdict=judge_verdict,
 				judge_reasoning=judge_reasoning,
 				judge_failure_reason=judge_failure_reason,
+				judge_reached_captcha=judge_reached_captcha,
+				judge_impossible_task=judge_impossible_task,
 			)
 		)
 
@@ -1569,6 +1924,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		if self.history.is_done():
 			await self.log_completion()
+
+			# Run judge before done callback if enabled
+			if self.settings.use_judge:
+				await self._judge_and_log()
+
 			if self.register_done_callback:
 				if inspect.iscoroutinefunction(self.register_done_callback):
 					await self.register_done_callback(self.history)
@@ -1738,18 +2098,25 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if on_step_start is not None:
 			await on_step_start(self)
 
+		await self._demo_mode_log(
+			f'Starting step {step + 1}/{max_steps}',
+			'info',
+			{'step': step + 1, 'total_steps': max_steps},
+		)
+
 		self.logger.debug(f'🚶 Starting step {step + 1}/{max_steps}...')
 
 		try:
 			await asyncio.wait_for(
 				self.step(step_info),
-				timeout=180,  # 3 minute timeout
+				timeout=self.settings.step_timeout,
 			)
 			self.logger.debug(f'✅ Completed step {step + 1}/{max_steps}')
 		except TimeoutError:
 			# Handle step timeout gracefully
-			error_msg = f'Step {step + 1} timed out after 180 seconds'
+			error_msg = f'Step {step + 1} timed out after {self.settings.step_timeout} seconds'
 			self.logger.error(f'⏰ {error_msg}')
+			await self._demo_mode_log(error_msg, 'error', {'step': step + 1})
 			self.state.consecutive_failures += 1
 			self.state.last_result = [ActionResult(error=error_msg)]
 
@@ -1758,6 +2125,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		if self.history.is_done():
 			await self.log_completion()
+
+			# Run judge before done callback if enabled
+			if self.settings.use_judge:
+				await self._judge_and_log()
 
 			if self.register_done_callback:
 				if inspect.iscoroutinefunction(self.register_done_callback):
@@ -1782,6 +2153,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		loop = asyncio.get_event_loop()
 		agent_run_error: str | None = None  # Initialize error tracking variable
 		self._force_exit_telemetry_logged = False  # ADDED: Flag for custom telemetry on force exit
+		should_delay_close = False
 
 		# Set up the  signal handler with callbacks specific to this agent
 		from browser_use.utils import SignalHandler
@@ -1830,6 +2202,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self._log_first_step_startup()
 			# Start browser session and attach watchdogs
 			await self.browser_session.start()
+			if self._demo_mode_enabled:
+				await self._demo_mode_log(f'Started task: {self.task}', 'info', {'tag': 'task'})
+				await self._demo_mode_log(
+					'Demo mode active - follow the side panel for live thoughts and actions.',
+					'info',
+					{'tag': 'status'},
+				)
+
+			# Register skills as actions if SkillService is configured
+			await self._register_skills_as_actions()
 
 			# Normally there was no try catch here but the callback can raise an InterruptedError
 			try:
@@ -1839,11 +2221,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			except Exception as e:
 				raise e
 
-			self.logger.debug(f'🔄 Starting main execution loop with max {max_steps} steps...')
-			for step in range(max_steps):
+			self.logger.debug(
+				f'🔄 Starting main execution loop with max {max_steps} steps (currently at step {self.state.n_steps})...'
+			)
+			while self.state.n_steps <= max_steps:
+				current_step = self.state.n_steps - 1  # Convert to 0-indexed for step_info
+
 				# Use the consolidated pause state management
 				if self.state.paused:
-					self.logger.debug(f'⏸️ Step {step}: Agent paused, waiting to resume...')
+					self.logger.debug(f'⏸️ Step {self.state.n_steps}: Agent paused, waiting to resume...')
 					await self._external_pause_event.wait()
 					signal_handler.reset()
 
@@ -1861,13 +2247,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					agent_run_error = 'Agent stopped programmatically'
 					break
 
-				step_info = AgentStepInfo(step_number=step, max_steps=max_steps)
-				is_done = await self._execute_step(step, max_steps, step_info, on_step_start, on_step_end)
+				step_info = AgentStepInfo(step_number=current_step, max_steps=max_steps)
+				is_done = await self._execute_step(current_step, max_steps, step_info, on_step_start, on_step_end)
 
 				if is_done:
 					# Agent has marked the task as done
-					if self.settings.use_judge:
-						await self._judge_and_log()
+					if self._demo_mode_enabled and self.history.history:
+						final_result_text = self.history.final_result() or 'Task completed'
+						await self._demo_mode_log(f'Final Result: {final_result_text}', 'success', {'tag': 'task'})
+
+					should_delay_close = True
 					break
 			else:
 				agent_run_error = 'Failed to complete task in maximum steps'
@@ -1912,6 +2301,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			raise e
 
 		finally:
+			if should_delay_close and self._demo_mode_enabled and agent_run_error is None:
+				await asyncio.sleep(30)
+			if agent_run_error:
+				await self._demo_mode_log(f'Agent stopped: {agent_run_error}', 'error', {'tag': 'run'})
 			# Log token usage summary
 			await self.token_cost_service.log_usage_summary()
 
@@ -2003,9 +2396,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				action_name = next(iter(action_data.keys())) if action_data else 'unknown'
 
 				# Log action before execution
-				self._log_action(action, action_name, i + 1, total_actions)
-
-				await self._capture_pre_action_screenshot(action, i)
+				await self._log_action(action, action_name, i + 1, total_actions)
 
 				time_start = time.time()
 
@@ -2021,6 +2412,21 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				time_end = time.time()
 				time_elapsed = time_end - time_start
 
+				if result.error:
+					await self._demo_mode_log(
+						f'Action "{action_name}" failed: {result.error}',
+						'error',
+						{'action': action_name, 'step': self.state.n_steps},
+					)
+				elif result.is_done:
+					completion_text = result.long_term_memory or result.extracted_content or 'Task marked as done.'
+					level = 'success' if result.success is not False else 'warning'
+					await self._demo_mode_log(
+						completion_text,
+						level,
+						{'action': action_name, 'step': self.state.n_steps},
+					)
+
 				results.append(result)
 
 				if results[-1].is_done or results[-1].error or i == total_actions - 1:
@@ -2029,11 +2435,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			except Exception as e:
 				# Handle any exceptions during action execution
 				self.logger.error(f'❌ Executing action {i + 1} failed -> {type(e).__name__}: {e}')
+				await self._demo_mode_log(
+					f'Action "{action_name}" raised {type(e).__name__}: {e}',
+					'error',
+					{'action': action_name, 'step': self.state.n_steps},
+				)
 				raise e
 
 		return results
 
-	def _log_action(self, action, action_name: str, action_num: int, total_actions: int) -> None:
+	async def _log_action(self, action, action_name: str, action_num: int, total_actions: int) -> None:
 		"""Log the action before execution with colored formatting"""
 		# Color definitions
 		blue = '\033[34m'  # Action name
@@ -2043,8 +2454,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Format action number and name
 		if total_actions > 1:
 			action_header = f'▶️  [{action_num}/{total_actions}] {blue}{action_name}{reset}:'
+			plain_header = f'▶️  [{action_num}/{total_actions}] {action_name}:'
 		else:
 			action_header = f'▶️   {blue}{action_name}{reset}:'
+			plain_header = f'▶️  {action_name}:'
 
 		# Get action parameters
 		action_data = action.model_dump(exclude_unset=True)
@@ -2052,6 +2465,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Build parameter parts with colored formatting
 		param_parts = []
+		plain_param_parts = []
 
 		if params and isinstance(params, dict):
 			for param_name, value in params.items():
@@ -2064,6 +2478,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					display_value = value
 
 				param_parts.append(f'{magenta}{param_name}{reset}: {display_value}')
+				plain_param_parts.append(f'{param_name}: {display_value}')
 
 		# Join all parts
 		if param_parts:
@@ -2072,31 +2487,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		else:
 			self.logger.info(f'  {action_header}')
 
-	async def _capture_pre_action_screenshot(self, action: ActionModel, action_index: int) -> None:
-		"""Optional screenshot before executing an action for auditing."""
-		if not self.action_screenshot_recorder or not self.browser_session:
-			return
-
-		try:
-			path = await self.action_screenshot_recorder.capture(
-				action=action,
-				step_number=self.state.n_steps,
-				run_step_id=self.state.n_steps,
-				action_index=action_index,
-				browser_session=self.browser_session,
-				browser_profile=self.browser_profile,
-			)
-			if (
-				path
-				and self.settings.action_screenshots.include_in_available_files
-				and self.available_file_paths is not None
-			):
-				if path not in self.available_file_paths:
-					self.available_file_paths.append(path)
-			elif path and self.settings.action_screenshots.include_in_available_files:
-				self.available_file_paths = [path]
-		except Exception as exc:
-			self.logger.debug(f'dY"? Pre-action screenshot capture skipped: {type(exc).__name__}: {exc}')
+		if self._demo_mode_enabled:
+			panel_message = plain_header
+			if plain_param_parts:
+				panel_message = f'{panel_message} {", ".join(plain_param_parts)}'
+			await self._demo_mode_log(panel_message.strip(), 'action', {'action': action_name, 'step': self.state.n_steps})
 
 	async def log_completion(self) -> None:
 		"""Log the completion of the task"""
@@ -2104,6 +2499,203 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# self._task_duration = self._task_end_time - self._task_start_time TODO: this is not working when using take_step
 		if self.history.is_successful():
 			self.logger.info('✅ Task completed successfully')
+			await self._demo_mode_log('Task completed successfully', 'success', {'tag': 'task'})
+
+	async def _generate_rerun_summary(
+		self, original_task: str, results: list[ActionResult], summary_llm: BaseChatModel | None = None
+	) -> ActionResult:
+		"""Generate AI summary of rerun completion using screenshot and last step info"""
+		from browser_use.agent.views import RerunSummaryAction
+
+		# Get current screenshot
+		screenshot_b64 = None
+		try:
+			screenshot = await self.browser_session.take_screenshot(full_page=False)
+			if screenshot:
+				import base64
+
+				screenshot_b64 = base64.b64encode(screenshot).decode('utf-8')
+		except Exception as e:
+			self.logger.warning(f'Failed to capture screenshot for rerun summary: {e}')
+
+		# Build summary prompt and message
+		error_count = sum(1 for r in results if r.error)
+		success_count = len(results) - error_count
+
+		from browser_use.agent.prompts import get_rerun_summary_message, get_rerun_summary_prompt
+
+		prompt = get_rerun_summary_prompt(
+			original_task=original_task,
+			total_steps=len(results),
+			success_count=success_count,
+			error_count=error_count,
+		)
+
+		# Use provided LLM, agent's LLM, or fall back to OpenAI with structured output
+		try:
+			# Determine which LLM to use
+			if summary_llm is None:
+				# Try to use the agent's LLM first
+				summary_llm = self.llm
+				self.logger.debug('Using agent LLM for rerun summary')
+			else:
+				self.logger.debug(f'Using provided LLM for rerun summary: {summary_llm.model}')
+
+			# Build message with prompt and optional screenshot
+			from browser_use.llm.messages import BaseMessage
+
+			message = get_rerun_summary_message(prompt, screenshot_b64)
+			messages: list[BaseMessage] = [message]  # type: ignore[list-item]
+
+			# Try calling with structured output first
+			self.logger.debug(f'Calling LLM for rerun summary with {len(messages)} message(s)')
+			try:
+				kwargs: dict = {'output_format': RerunSummaryAction}
+				response = await summary_llm.ainvoke(messages, **kwargs)
+				summary: RerunSummaryAction = response.completion  # type: ignore[assignment]
+				self.logger.debug(f'LLM response type: {type(summary)}')
+				self.logger.debug(f'LLM response: {summary}')
+			except Exception as structured_error:
+				# If structured output fails (e.g., Browser-Use LLM doesn't support it for this type),
+				# fall back to text response without parsing
+				self.logger.debug(f'Structured output failed: {structured_error}, falling back to text response')
+
+				response = await summary_llm.ainvoke(messages, None)
+				response_text = response.completion
+				self.logger.debug(f'LLM text response: {response_text}')
+
+				# Use the text response directly as the summary
+				summary = RerunSummaryAction(
+					summary=response_text if isinstance(response_text, str) else str(response_text),
+					success=error_count == 0,
+					completion_status='complete' if error_count == 0 else ('partial' if success_count > 0 else 'failed'),
+				)
+
+			self.logger.info(f'📊 Rerun Summary: {summary.summary}')
+			self.logger.info(f'📊 Status: {summary.completion_status} (success={summary.success})')
+
+			return ActionResult(
+				is_done=True,
+				success=summary.success,
+				extracted_content=summary.summary,
+				long_term_memory=f'Rerun completed with status: {summary.completion_status}. {summary.summary[:100]}',
+			)
+
+		except Exception as e:
+			self.logger.warning(f'Failed to generate AI summary: {e.__class__.__name__}: {e}')
+			self.logger.debug('Full error traceback:', exc_info=True)
+			# Fallback to simple summary
+			return ActionResult(
+				is_done=True,
+				success=error_count == 0,
+				extracted_content=f'Rerun completed: {success_count}/{len(results)} steps succeeded',
+				long_term_memory=f'Rerun completed: {success_count} steps succeeded, {error_count} errors',
+			)
+
+	async def _execute_ai_step(
+		self,
+		query: str,
+		include_screenshot: bool = False,
+		extract_links: bool = False,
+		ai_step_llm: BaseChatModel | None = None,
+	) -> ActionResult:
+		"""
+		Execute an AI step during rerun to re-evaluate extract actions.
+		Analyzes full page DOM/markdown + optional screenshot.
+
+		Args:
+			query: What to analyze or extract from the current page
+			include_screenshot: Whether to include screenshot in analysis
+			extract_links: Whether to include links in markdown extraction
+			ai_step_llm: Optional LLM to use. If not provided, uses agent's LLM
+
+		Returns:
+			ActionResult with extracted content
+		"""
+		from browser_use.agent.prompts import get_ai_step_system_prompt, get_ai_step_user_prompt, get_rerun_summary_message
+		from browser_use.llm.messages import SystemMessage, UserMessage
+		from browser_use.utils import sanitize_surrogates
+
+		# Use provided LLM or agent's LLM
+		llm = ai_step_llm or self.llm
+		self.logger.debug(f'Using LLM for AI step: {llm.model}')
+
+		# Extract clean markdown
+		try:
+			from browser_use.dom.markdown_extractor import extract_clean_markdown
+
+			content, content_stats = await extract_clean_markdown(
+				browser_session=self.browser_session, extract_links=extract_links
+			)
+		except Exception as e:
+			return ActionResult(error=f'Could not extract clean markdown: {type(e).__name__}: {e}')
+
+		# Get screenshot if requested
+		screenshot_b64 = None
+		if include_screenshot:
+			try:
+				screenshot = await self.browser_session.take_screenshot(full_page=False)
+				if screenshot:
+					import base64
+
+					screenshot_b64 = base64.b64encode(screenshot).decode('utf-8')
+			except Exception as e:
+				self.logger.warning(f'Failed to capture screenshot for ai_step: {e}')
+
+		# Build prompt with content stats
+		original_html_length = content_stats['original_html_chars']
+		initial_markdown_length = content_stats['initial_markdown_chars']
+		final_filtered_length = content_stats['final_filtered_chars']
+		chars_filtered = content_stats['filtered_chars_removed']
+
+		stats_summary = f"""Content processed: {original_html_length:,} HTML chars → {initial_markdown_length:,} initial markdown → {final_filtered_length:,} filtered markdown"""
+		if chars_filtered > 0:
+			stats_summary += f' (filtered {chars_filtered:,} chars of noise)'
+
+		# Sanitize content
+		content = sanitize_surrogates(content)
+		query = sanitize_surrogates(query)
+
+		# Get prompts from prompts.py
+		system_prompt = get_ai_step_system_prompt()
+		prompt_text = get_ai_step_user_prompt(query, stats_summary, content)
+
+		# Build user message with optional screenshot
+		if screenshot_b64:
+			user_message = get_rerun_summary_message(prompt_text, screenshot_b64)
+		else:
+			user_message = UserMessage(content=prompt_text)
+
+		try:
+			import asyncio
+
+			response = await asyncio.wait_for(llm.ainvoke([SystemMessage(content=system_prompt), user_message]), timeout=120.0)
+
+			current_url = await self.browser_session.get_current_page_url()
+			extracted_content = (
+				f'<url>\n{current_url}\n</url>\n<query>\n{query}\n</query>\n<result>\n{response.completion}\n</result>'
+			)
+
+			# Simple memory handling
+			MAX_MEMORY_LENGTH = 1000
+			if len(extracted_content) < MAX_MEMORY_LENGTH:
+				memory = extracted_content
+				include_extracted_content_only_once = False
+			else:
+				file_name = await self.file_system.save_extracted_content(extracted_content)
+				memory = f'Query: {query}\nContent in {file_name} and once in <read_state>.'
+				include_extracted_content_only_once = True
+
+			self.logger.info(f'🤖 AI Step: {memory}')
+			return ActionResult(
+				extracted_content=extracted_content,
+				include_extracted_content_only_once=include_extracted_content_only_once,
+				long_term_memory=memory,
+			)
+		except Exception as e:
+			self.logger.warning(f'Failed to execute AI step: {e.__class__.__name__}: {e}')
+			self.logger.debug('Full error traceback:', exc_info=True)
+			return ActionResult(error=f'AI step failed: {e}')
 
 	async def rerun_history(
 		self,
@@ -2111,6 +2703,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		max_retries: int = 3,
 		skip_failures: bool = True,
 		delay_between_actions: float = 2.0,
+		max_step_interval: float = 5.0,
+		summary_llm: BaseChatModel | None = None,
+		ai_step_llm: BaseChatModel | None = None,
 	) -> list[ActionResult]:
 		"""
 		Rerun a saved history of actions with error handling and retry logic.
@@ -2119,10 +2714,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		                history: The history to replay
 		                max_retries: Maximum number of retries per action
 		                skip_failures: Whether to skip failed actions or stop execution
-		                delay_between_actions: Delay between actions in seconds
+		                delay_between_actions: Delay between actions in seconds (used when no saved interval)
+		                max_step_interval: Maximum delay from saved step_interval (caps LLM time from original run)
+		                summary_llm: Optional LLM to use for generating the final summary. If not provided, uses the agent's LLM
+		                ai_step_llm: Optional LLM to use for AI steps (extract actions). If not provided, uses the agent's LLM
 
 		Returns:
-		                List of action results
+		                List of action results (including AI summary as the final result)
 		"""
 		# Skip cloud sync session events for rerunning (we're replaying, not starting new)
 		self.state.session_initialized = True
@@ -2136,7 +2734,29 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			goal = history_item.model_output.current_state.next_goal if history_item.model_output else ''
 			step_num = history_item.metadata.step_number if history_item.metadata else i
 			step_name = 'Initial actions' if step_num == 0 else f'Step {step_num}'
-			self.logger.info(f'Replaying {step_name} ({i + 1}/{len(history.history)}): {goal}')
+
+			# Determine step delay
+			if history_item.metadata and history_item.metadata.step_interval is not None:
+				# Cap the saved interval to max_step_interval (saved interval includes LLM time)
+				step_delay = min(history_item.metadata.step_interval, max_step_interval)
+				# Format delay nicely - show ms for values < 1s, otherwise show seconds
+				if step_delay < 1.0:
+					delay_str = f'{step_delay * 1000:.0f}ms'
+				else:
+					delay_str = f'{step_delay:.1f}s'
+				if history_item.metadata.step_interval > max_step_interval:
+					delay_source = f'capped to {delay_str} (saved was {history_item.metadata.step_interval:.1f}s)'
+				else:
+					delay_source = f'using saved step_interval={delay_str}'
+			else:
+				step_delay = delay_between_actions
+				if step_delay < 1.0:
+					delay_str = f'{step_delay * 1000:.0f}ms'
+				else:
+					delay_str = f'{step_delay:.1f}s'
+				delay_source = f'using default delay={delay_str}'
+
+			self.logger.info(f'Replaying {step_name} ({i + 1}/{len(history.history)}) [{delay_source}]: {goal}')
 
 			if (
 				not history_item.model_output
@@ -2150,7 +2770,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			retry_count = 0
 			while retry_count < max_retries:
 				try:
-					result = await self._execute_history_step(history_item, delay_between_actions)
+					result = await self._execute_history_step(history_item, step_delay, ai_step_llm)
 					results.extend(result)
 					break
 
@@ -2165,6 +2785,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					else:
 						self.logger.warning(f'{step_name} failed (attempt {retry_count}/{max_retries}), retrying...')
 						await asyncio.sleep(delay_between_actions)
+
+		# Generate AI summary of rerun completion
+		self.logger.info('🤖 Generating AI summary of rerun completion...')
+		summary_result = await self._generate_rerun_summary(self.task, results, summary_llm)
+		results.append(summary_result)
 
 		await self.close()
 		return results
@@ -2196,11 +2821,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					action=self.initial_actions,
 				)
 
-			metadata = StepMetadata(
-				step_number=0,
-				step_start_time=time.time(),
-				step_end_time=time.time(),
-			)
+			metadata = StepMetadata(step_number=0, step_start_time=time.time(), step_end_time=time.time(), step_interval=None)
 
 			# Create minimal browser state history for initial actions
 			state_history = BrowserStateHistory(
@@ -2222,28 +2843,66 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug('📝 Saved initial actions to history as step 0')
 			self.logger.debug('Initial actions completed')
 
-	async def _execute_history_step(self, history_item: AgentHistory, delay: float) -> list[ActionResult]:
-		"""Execute a single step from history with element validation"""
+	async def _execute_history_step(
+		self, history_item: AgentHistory, delay: float, ai_step_llm: BaseChatModel | None = None
+	) -> list[ActionResult]:
+		"""Execute a single step from history with element validation.
+
+		For extract actions, uses AI to re-evaluate the content since page content may have changed.
+		"""
 		assert self.browser_session is not None, 'BrowserSession is not set up'
+
+		await asyncio.sleep(delay)
 		state = await self.browser_session.get_browser_state_summary(include_screenshot=False)
 		if not state or not history_item.model_output:
 			raise ValueError('Invalid state or model output')
-		updated_actions = []
+
+		results = []
+		pending_actions = []
+
 		for i, action in enumerate(history_item.model_output.action):
-			updated_action = await self._update_action_indices(
-				history_item.state.interacted_element[i],
-				action,
-				state,
-			)
-			updated_actions.append(updated_action)
+			# Check if this is an extract action - use AI step instead
+			action_data = action.model_dump(exclude_unset=True)
+			action_name = next(iter(action_data.keys()), None)
 
-			if updated_action is None:
-				raise ValueError(f'Could not find matching element {i} in current page')
+			if action_name == 'extract':
+				# Execute any pending actions first to maintain correct order
+				# (e.g., if step is [click, extract], click must happen before extract)
+				if pending_actions:
+					batch_results = await self.multi_act(pending_actions)
+					results.extend(batch_results)
+					pending_actions = []
 
-		result = await self.multi_act(updated_actions)
+				# Now execute AI step for extract action
+				extract_params = action_data['extract']
+				query = extract_params.get('query', '')
+				extract_links = extract_params.get('extract_links', False)
 
-		await asyncio.sleep(delay)
-		return result
+				self.logger.info(f'🤖 Using AI step for extract action: {query[:50]}...')
+				ai_result = await self._execute_ai_step(
+					query=query,
+					include_screenshot=False,  # Match original extract behavior
+					extract_links=extract_links,
+					ai_step_llm=ai_step_llm,
+				)
+				results.append(ai_result)
+			else:
+				# For non-extract actions, update indices and collect for batch execution
+				updated_action = await self._update_action_indices(
+					history_item.state.interacted_element[i],
+					action,
+					state,
+				)
+				if updated_action is None:
+					raise ValueError(f'Could not find matching element {i} in current page')
+				pending_actions.append(updated_action)
+
+		# Execute any remaining pending actions
+		if pending_actions:
+			batch_results = await self.multi_act(pending_actions)
+			results.extend(batch_results)
+
+		return results
 
 	async def _update_action_indices(
 		self,
@@ -2279,17 +2938,34 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		return action
 
-	async def load_and_rerun(self, history_file: str | Path | None = None, **kwargs) -> list[ActionResult]:
+	async def load_and_rerun(
+		self,
+		history_file: str | Path | None = None,
+		variables: dict[str, str] | None = None,
+		**kwargs,
+	) -> list[ActionResult]:
 		"""
-		Load history from file and rerun it.
+		Load history from file and rerun it, optionally substituting variables.
 
 		Args:
-		                history_file: Path to the history file
-		                **kwargs: Additional arguments passed to rerun_history
+			history_file: Path to the history file
+			variables: Optional dict mapping variable names to new values (e.g. {'email': 'new@example.com'})
+			**kwargs: Additional arguments passed to rerun_history:
+				- max_retries: Maximum retries per action (default: 3)
+				- skip_failures: Continue on failure (default: True)
+				- delay_between_actions: Delay when no saved interval (default: 2.0s)
+				- max_step_interval: Cap on saved step_interval (default: 5.0s)
+				- summary_llm: Custom LLM for final summary
+				- ai_step_llm: Custom LLM for extract re-evaluation
 		"""
 		if not history_file:
 			history_file = 'AgentHistory.json'
 		history = AgentHistoryList.load_from_file(history_file, self.AgentOutput)
+
+		# Substitute variables if provided
+		if variables:
+			history = self._substitute_variables_in_history(history, variables)
+
 		return await self.rerun_history(history, **kwargs)
 
 	def save_history(self, file_path: str | Path | None = None) -> None:
@@ -2369,6 +3045,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					# stops the EventBus with clear=True, and recreates a fresh EventBus
 					await self.browser_session.kill()
 
+			# Close skill service if configured
+			if self.skill_service is not None:
+				await self.skill_service.close()
+
 			# Force garbage collection
 			gc.collect()
 
@@ -2437,3 +3117,93 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		import asyncio
 
 		return asyncio.run(self.run(max_steps=max_steps, on_step_start=on_step_start, on_step_end=on_step_end))
+
+	def detect_variables(self) -> dict[str, DetectedVariable]:
+		"""Detect reusable variables in agent history"""
+		from browser_use.agent.variable_detector import detect_variables_in_history
+
+		return detect_variables_in_history(self.history)
+
+	def _substitute_variables_in_history(self, history: AgentHistoryList, variables: dict[str, str]) -> AgentHistoryList:
+		"""Substitute variables in history with new values for rerunning with different data"""
+		from browser_use.agent.variable_detector import detect_variables_in_history
+
+		# Detect variables in the history
+		detected_vars = detect_variables_in_history(history)
+
+		# Build a mapping of original values to new values
+		value_replacements: dict[str, str] = {}
+		for var_name, new_value in variables.items():
+			if var_name in detected_vars:
+				old_value = detected_vars[var_name].original_value
+				value_replacements[old_value] = new_value
+			else:
+				self.logger.warning(f'Variable "{var_name}" not found in history, skipping substitution')
+
+		if not value_replacements:
+			self.logger.info('No variables to substitute')
+			return history
+
+		# Create a deep copy of history to avoid modifying the original
+		import copy
+
+		modified_history = copy.deepcopy(history)
+
+		# Substitute values in all actions
+		substitution_count = 0
+		for history_item in modified_history.history:
+			if not history_item.model_output or not history_item.model_output.action:
+				continue
+
+			for action in history_item.model_output.action:
+				# Handle both Pydantic models and dicts
+				if hasattr(action, 'model_dump'):
+					action_dict = action.model_dump()
+				elif isinstance(action, dict):
+					action_dict = action
+				else:
+					action_dict = vars(action) if hasattr(action, '__dict__') else {}
+
+				# Substitute in all string fields
+				substitution_count += self._substitute_in_dict(action_dict, value_replacements)
+
+				# Update the action with modified values
+				if hasattr(action, 'model_dump'):
+					# For Pydantic RootModel, we need to recreate from the modified dict
+					if hasattr(action, 'root'):
+						# This is a RootModel - recreate it from the modified dict
+						new_action = type(action).model_validate(action_dict)
+						# Replace the root field in-place using object.__setattr__ to bypass Pydantic's immutability
+						object.__setattr__(action, 'root', getattr(new_action, 'root'))
+					else:
+						# Regular Pydantic model - update fields in-place
+						for key, val in action_dict.items():
+							if hasattr(action, key):
+								setattr(action, key, val)
+				elif isinstance(action, dict):
+					action.update(action_dict)
+
+		self.logger.info(f'Substituted {substitution_count} value(s) in {len(value_replacements)} variable type(s) in history')
+		return modified_history
+
+	def _substitute_in_dict(self, data: dict, replacements: dict[str, str]) -> int:
+		"""Recursively substitute values in a dictionary, returns count of substitutions made"""
+		count = 0
+		for key, value in data.items():
+			if isinstance(value, str):
+				# Replace if exact match
+				if value in replacements:
+					data[key] = replacements[value]
+					count += 1
+			elif isinstance(value, dict):
+				# Recurse into nested dicts
+				count += self._substitute_in_dict(value, replacements)
+			elif isinstance(value, list):
+				# Handle lists
+				for i, item in enumerate(value):
+					if isinstance(item, str) and item in replacements:
+						value[i] = replacements[item]
+						count += 1
+					elif isinstance(item, dict):
+						count += self._substitute_in_dict(item, replacements)
+		return count
