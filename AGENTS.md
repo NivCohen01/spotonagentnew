@@ -624,7 +624,7 @@ async def main():
 
 ## Recording & Debugging
 
-* `record_video_dir`: Directory to save video recordings as `.mp4` files
+* `record_video_dir`: Directory to save video screenshots/run_id/recordings as `.mp4` files
 * `record_video_size` (default: `ViewportSize`): The frame size (width, height) of the video recording.
 * `record_video_framerate` (default: `30`): The framerate to use for the video recording.
 * `record_har_path`: Path to save network trace files as `.har` format

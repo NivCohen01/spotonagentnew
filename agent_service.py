@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import logging
+from pathlib import Path
 import uuid
 from typing import Optional
 
@@ -43,11 +44,14 @@ from agent_service_lib.service_config import (
     MAX_CONCURRENCY,
     OPENAI_MODEL,
     PORT,
+    RECORDINGS_BASE,
 )
 from agent_service_lib.service_db import (
     CREATE_TABLES_SQL,
     SessionLocal,
     db_fetch_action_trace,
+    db_fetch_video_info,
+    db_update_video_filename,
     derive_guide_family_key,
     ensure_family_and_variant_guide,
     run_migrations,
@@ -72,6 +76,7 @@ app.add_middleware(
 )
 
 queue_mgr = QueueManager(MAX_CONCURRENCY, run_session, lambda sid: sessions.get(sid))
+logger = logging.getLogger("service")
 
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)):
@@ -140,31 +145,6 @@ async def start_session(req: StartReq):
 
     family_key = req.guide_family_key or derive_guide_family_key(req.workspace_id, req.task, req.start_url)
     sess.guide_family_key = family_key
-    try:
-        ensured = await ensure_family_and_variant_guide(
-            workspace_id=req.workspace_id,
-            family_key=family_key,
-            device_type=req.device_type,
-            run_id=session_id,
-            title=req.task or "Generating guide",
-            visibility="private",
-            status="generating",
-            guide_family_id=req.guide_family_id,
-            existing_guide_id=req.guide_id,
-        )
-    except Exception as exc:
-        logging.getLogger("service").error("Failed to ensure guide family/variant at start | %r", exc)
-        raise HTTPException(status_code=500, detail="failed to create guide family/variant")
-    if ensured:
-        sess.guide_family_id, sess.guide_id, sess.guide_slug = ensured
-        sess.guide_family_key = family_key
-        logging.getLogger("service").info(
-            "Session %s linked to guide_family_id=%s guide_id=%s device=%s",
-            session_id,
-            sess.guide_family_id,
-            sess.guide_id,
-            req.device_type,
-        )
 
     sessions[session_id] = sess
     pos = await queue_mgr.enqueue(session_id)
@@ -220,21 +200,128 @@ async def generate_video(sid: str):
         trace_entries = await db_fetch_action_trace(sid)
 
     if not trace_entries:
-        raise HTTPException(status_code=404, detail="action_trace not found for session")
+        reason = "session not found" if sess is None else "action_trace not found for session"
+        with contextlib.suppress(Exception):
+            await db_update_video_filename(sid, "failed")
+        return GenerateVideoResponse(
+            session_id=sid,
+            accepted=False,
+            reason=reason,
+            actions_replayed=0,
+            skipped_actions=[],
+        )
 
-    video_path, applied, skipped = await replay_action_trace_to_video(
-        sid,
-        trace_entries,
-        device_type=sess.device_type if sess else "desktop",
-        viewport_width=sess.viewport_width if sess else None,
-        viewport_height=sess.viewport_height if sess else None,
-    )
+    try:
+        video_path, applied, skipped = await replay_action_trace_to_video(
+            sid,
+            trace_entries,
+            device_type=sess.device_type if sess else "desktop",
+            viewport_width=sess.viewport_width if sess else None,
+            viewport_height=sess.viewport_height if sess else None,
+        )
+    except Exception as exc:
+        logger.exception("Video generation failed | session_id=%s", sid)
+        with contextlib.suppress(Exception):
+            await db_update_video_filename(sid, "failed")
+        return GenerateVideoResponse(
+            session_id=sid,
+            accepted=True,
+            reason=f"video generation failed: {exc}",
+            video_filename="failed",
+            actions_replayed=0,
+            skipped_actions=[],
+        )
+
+    if not video_path:
+        with contextlib.suppress(Exception):
+            await db_update_video_filename(sid, "failed")
+        return GenerateVideoResponse(
+            session_id=sid,
+            accepted=True,
+            reason="video generation produced no file",
+            video_filename="failed",
+            actions_replayed=applied,
+            skipped_actions=skipped,
+        )
+
+    video_filename = Path(video_path).name
+    with contextlib.suppress(Exception):
+        await db_update_video_filename(sid, video_filename)
+
     return GenerateVideoResponse(
         session_id=sid,
-        video_path=str(video_path) if video_path else None,
+        accepted=True,
+        video_path=str(video_path),
+        video_filename=video_filename,
         actions_replayed=applied,
         skipped_actions=skipped,
     )
+
+
+@app.get("/sessions/{sid}/video-exists", dependencies=[Depends(require_api_key)])
+async def video_exists(sid: str):
+    video_filename, run_id = await db_fetch_video_info(run_id=sid)
+    resolved_run_id = run_id or sid
+
+    exists = False
+    reason = None
+    path_str = None
+
+    if not video_filename:
+        reason = "no video_filename recorded for run"
+    elif str(video_filename).lower() == "failed":
+        reason = "video generation marked as failed"
+    else:
+        video_path = RECORDINGS_BASE / resolved_run_id / "video" / video_filename
+        if video_path.exists():
+            exists = True
+            path_str = str(video_path)
+        else:
+            reason = "file not found on disk"
+
+    return {
+        "session_id": sid,
+        "run_id": resolved_run_id,
+        "video_filename": video_filename,
+        "exists": exists,
+        "path": path_str,
+        "reason": reason,
+    }
+
+
+@app.get("/guides/{guide_id}/has-video", dependencies=[Depends(require_api_key)])
+async def guide_has_video(guide_id: int):
+    video_filename, run_id = await db_fetch_video_info(guide_id=guide_id)
+
+    has_video_flag = bool(video_filename and str(video_filename).lower() != "failed")
+    exists = False
+    reason = None
+    path_str = None
+
+    if not video_filename:
+        reason = "no video_filename recorded for guide"
+    elif str(video_filename).lower() == "failed":
+        reason = "video generation marked as failed"
+    else:
+        if run_id:
+            video_path = RECORDINGS_BASE / run_id / "video" / video_filename
+            if video_path.exists():
+                exists = True
+                path_str = str(video_path)
+            else:
+                reason = "file not found on disk"
+        else:
+            reason = "run_id missing; cannot locate video file"
+
+    return {
+        "guide_id": guide_id,
+        "run_id": run_id,
+        "video_filename": video_filename,
+        "has_video": has_video_flag,
+        "exists_on_disk": exists,
+        "path": path_str,
+        "reason": reason,
+    }
 
 
 @app.get("/sessions/{sid}/screenshots", dependencies=[Depends(require_api_key)])

@@ -776,8 +776,22 @@ def _select_gap_fill_candidate(
     used: set[int],
     last_screenshot_id: int | None,
 ) -> EvidenceEvent | None:
+    # Prefer same-page evidence when a pageUrl is present; otherwise fall back to nearest unused evidence with a screenshot.
     if not step.pageUrl:
-        return None
+        anchor_ids = [last_screenshot_id] if last_screenshot_id is not None else None
+        candidate = _nearest_unused_evidence(
+            intent=_preferred_action_kind(step.description),
+            page_url=None,
+            used=used,
+            evidence_table=evidence_table,
+            anchor_ids=anchor_ids,
+        )
+        if candidate and candidate.best_image:
+            return candidate
+        # If the best nearby evidence lacks a dedicated screenshot, allow it as a last resort
+        # so we still attach something rather than leave the step empty.
+        return candidate
+
     candidates = [
         ev for ev in evidence_table if ev.evidence_id not in used and ev.best_image and _page_url_matches(step.pageUrl, ev.page_url)
     ]

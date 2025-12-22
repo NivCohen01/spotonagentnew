@@ -88,6 +88,7 @@ MIGRATIONS_SQL = [
     "ALTER TABLE runs ADD COLUMN error LONGTEXT NULL AFTER result",
     "CREATE INDEX idx_run_ts ON run_logs (run_id, ts)",
     "ALTER TABLE guides ADD COLUMN run_id VARCHAR(16) NULL AFTER workspace_id",
+    "ALTER TABLE guides ADD COLUMN video_filename VARCHAR(255) NULL AFTER description",
     "CREATE INDEX idx_guides_run_id ON guides (run_id)",
     "ALTER TABLE guides ADD CONSTRAINT fk_guides_runs FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL",
     "ALTER TABLE guides MODIFY COLUMN status ENUM('generating','draft','published','archived') NOT NULL DEFAULT 'draft'",
@@ -206,6 +207,8 @@ async def run_migrations(conn: AsyncConnection) -> None:
 
     if not await _column_exists(conn, "guides", "run_id"):
         await _execute_ignoring_exists(conn, "ALTER TABLE guides ADD COLUMN run_id VARCHAR(16) NULL AFTER workspace_id")
+    if not await _column_exists(conn, "guides", "video_filename"):
+        await _execute_ignoring_exists(conn, "ALTER TABLE guides ADD COLUMN video_filename VARCHAR(255) NULL AFTER description")
     if not await _index_exists(conn, "guides", "idx_guides_run_id"):
         await _execute_ignoring_exists(conn, "CREATE INDEX idx_guides_run_id ON guides (run_id)")
     if not await _constraint_exists(conn, "guides", "fk_guides_runs"):
@@ -681,3 +684,61 @@ async def db_update_guide_from_result(sess: "Session", enriched: dict):
             sess.guide_id = maybe_new_id
             sess.guide_slug = new_slug
         await db.commit()
+
+
+async def db_update_video_filename(run_id: str, filename: str) -> None:
+    """Persist the generated video filename (or 'failed') for a run's guide."""
+    if not SessionLocal:
+        return
+
+    now = dt.datetime.utcnow()
+    async with SessionLocal() as db:
+        res = await db.execute(
+            text(
+                """
+                UPDATE guides
+                SET video_filename=:filename,
+                    updated_at=:updated_at,
+                    updated_by=:updated_by
+                WHERE run_id=:run_id
+                """
+            ),
+            {
+                "filename": filename,
+                "updated_at": now,
+                "updated_by": DEFAULT_AUTHOR_ID,
+                "run_id": run_id,
+            },
+        )
+        await db.commit()
+        if not res.rowcount or res.rowcount <= 0:
+            logging.getLogger("service").info("Video filename update skipped; no guide linked to run_id=%s", run_id)
+
+
+async def db_fetch_video_info(*, run_id: Optional[str] = None, guide_id: Optional[int] = None) -> tuple[Optional[str], Optional[str]]:
+    """
+    Fetch video filename and run_id for a guide.
+    Prefers direct run_id lookup; falls back to guide_id when provided.
+    """
+    if not SessionLocal or (run_id is None and guide_id is None):
+        return None, run_id
+
+    query = ""
+    params: dict[str, Any] = {}
+    if run_id is not None:
+        query = "SELECT video_filename, run_id FROM guides WHERE run_id=:run_id ORDER BY id DESC LIMIT 1"
+        params["run_id"] = run_id
+    else:
+        query = "SELECT video_filename, run_id FROM guides WHERE id=:guide_id LIMIT 1"
+        params["guide_id"] = guide_id
+
+    async with SessionLocal() as db:
+        res = await db.execute(text(query), params)
+        row = res.first()
+
+    if not row:
+        return None, run_id
+
+    filename = row[0]
+    resolved_run_id = row[1] or run_id
+    return filename, resolved_run_id

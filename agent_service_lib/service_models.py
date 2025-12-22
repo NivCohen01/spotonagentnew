@@ -183,7 +183,10 @@ class ResultPayload(BaseModel):
 
 class GenerateVideoResponse(BaseModel):
     session_id: str
+    accepted: bool = False
+    reason: Optional[str] = None
     video_path: Optional[str] = None
+    video_filename: Optional[str] = None
     actions_replayed: int = 0
     skipped_actions: list[str] = Field(default_factory=list)
 

@@ -26,7 +26,7 @@ DB_URL = os.getenv("DB_URL", "").strip()
 SCREENSHOTS_BASE = Path(os.getenv("SCREENSHOTS_BASE", "./screenshots")).resolve()
 SCREENSHOTS_BASE.mkdir(parents=True, exist_ok=True)
 
-RECORDINGS_BASE = Path("./recordings").resolve()
+RECORDINGS_BASE = Path("./screenshots").resolve()
 RECORDINGS_BASE.mkdir(parents=True, exist_ok=True)
 
 
