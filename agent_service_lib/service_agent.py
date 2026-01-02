@@ -5,6 +5,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,7 +18,7 @@ from sqlalchemy import text
 
 from .service_browser import _safe_browser_stop, launch_chrome
 from .service_config import DEFAULT_AUTHOR_ID, OPENAI_MODEL, SCREENSHOTS_BASE
-from .service_db import SessionLocal, db_finish_run, db_insert_run, db_update_guide_from_result
+from .service_db import SessionLocal, db_finish_run, db_insert_llm_call, db_insert_run, db_update_guide_from_result
 from .service_logging import run_id_ctx
 from .service_models import (
     ActionScreenshotOptions,
@@ -40,6 +41,7 @@ from .service_trace import (
     _shape_steps_with_placeholders,
     _summarize_action_trace,
 )
+from browser_use.tokens.service import TokenCost
 
 
 def _draft_steps_to_text(draft_steps: list[Any]) -> str:
@@ -102,9 +104,8 @@ async def _generate_final_guide_with_evidence(
     task: str,
     draft: dict | None,
     evidence_table: list[EvidenceEvent],
-    model_name: str,
+    llm: ChatOpenAI,
 ) -> GuideOutputWithEvidence:
-    llm = ChatOpenAI(model=model_name)
     draft = draft or {}
     evidence_table = evidence_table or []
 
@@ -157,6 +158,95 @@ async def _generate_final_guide_with_evidence(
     except Exception as exc:  # pragma: no cover - safeguard
         logging.getLogger("service").warning("Guide generation with evidence failed, using fallback | %r", exc)
         return _fallback_guide_from_evidence(task, draft, evidence_table)
+
+
+def _messages_to_prompt_text(messages: list[Any]) -> str:
+    try:
+        parts: list[str] = []
+        for m in messages or []:
+            content = getattr(m, "content", None)
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        txt = c.get("text")
+                        if txt:
+                            parts.append(str(txt))
+                    elif hasattr(c, "text"):
+                        parts.append(str(getattr(c, "text")))
+            elif isinstance(content, str):
+                parts.append(content)
+        return "\n".join(parts)[:5000]
+    except Exception:
+        return ""
+
+
+def _response_to_text(response: Any) -> str:
+    if response is None:
+        return ""
+    with contextlib.suppress(Exception):
+        comp = getattr(response, "completion", None)
+        if comp is not None:
+            if hasattr(comp, "model_dump"):
+                return json.dumps(comp.model_dump(), ensure_ascii=False)[:5000]
+            return str(comp)[:5000]
+    return str(response)[:5000]
+
+
+def _wrap_llm_with_logging(
+    llm: ChatOpenAI,
+    sess: Session,
+    purpose: str,
+    token_cost: TokenCost,
+    guide_id: Optional[int],
+) -> ChatOpenAI:
+    original = llm.ainvoke
+
+    async def wrapped(messages, *args, **kwargs):
+        start = time.perf_counter()
+        usage = None
+        response = None
+        success = True
+        try:
+            response = await original(messages, *args, **kwargs)
+            usage = getattr(response, "usage", None)
+            return response
+        except Exception:
+            success = False
+            raise
+        finally:
+            try:
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                cost_cents = 0.0
+                if usage:
+                    with contextlib.suppress(Exception):
+                        cost = await token_cost.calculate_cost(llm.model, usage)
+                        if cost:
+                            cost_cents = float((cost.prompt_cost or 0) + (cost.completion_cost or 0)) * 100
+
+                prompt_text = _messages_to_prompt_text(messages)
+                response_text = _response_to_text(response)
+
+                await db_insert_llm_call(
+                    workspace_id=sess.workspace_id,
+                    guide_id=guide_id,
+                    purpose=purpose,
+                    model=getattr(llm, "model", ""),
+                    prompt_text=prompt_text,
+                    response_text=response_text,
+                    tokens_prompt=prompt_tokens,
+                    tokens_completion=completion_tokens,
+                    cost_cents=cost_cents,
+                    latency_ms=latency_ms,
+                    success=success,
+                )
+            except Exception:
+                # Keep LLM call path resilient
+                pass
+
+    llm.ainvoke = wrapped  # type: ignore
+    return llm
 
 
 class Session:
@@ -247,11 +337,15 @@ async def run_session(sess: Session):
     token = run_id_ctx.set(sess.id)
     log = logging.getLogger("service")
     browser: Optional[Browser] = None
+    token_cost = TokenCost(include_cost=True)
+    with contextlib.suppress(Exception):
+        await token_cost.initialize()
 
     sess.state = "starting"
 
     with contextlib.suppress(Exception):
         await db_insert_run(sess)
+    guide_id_for_run = sess.guide_id
 
     try:
         ws = await launch_chrome(sess)
@@ -265,7 +359,8 @@ async def run_session(sess: Session):
         optimized_task = f"{sess.task} Start url: {sess.start_url}" if sess.start_url else sess.task
         if sess.optimize_task:
             try:
-                optimizer = AgentTaskOptimizer(llm=ChatOpenAI(model=OPENAI_MODEL))
+                opt_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "planning", token_cost, guide_id_for_run)
+                optimizer = AgentTaskOptimizer(llm=opt_llm)
                 optimized_resp = await optimizer.optimize_async(TaskOptimizationRequest(task=optimized_task, mode="regular"))
                 if optimized_resp.optimized_task.strip():
                     optimized_task = optimized_resp.optimized_task.strip()
@@ -296,8 +391,9 @@ async def run_session(sess: Session):
                 session_subdirectories=sess.action_screenshots_session_dirs,
             )
 
+        agent_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "generation", token_cost, guide_id_for_run)
         agent = Agent(
-            llm=ChatOpenAI(model=OPENAI_MODEL),
+            llm=agent_llm,
             task=optimized_task,
             start_url=sess.start_url,
             headless=sess.headless,
@@ -326,10 +422,18 @@ async def run_session(sess: Session):
         log.info("agent running...")
 
         result = await agent.run()
+        usage_summary: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            usage_summary = result.usage.model_dump() if getattr(result, "usage", None) else None
+
+        history_payload = result.model_dump()
+        if usage_summary is not None:
+            history_payload["usage"] = usage_summary
+
         sess.action_trace = _build_action_trace(result)
         sess.action_trace_summary = _summarize_action_trace(sess.action_trace) if sess.action_trace else None
 
-        sess.final_response = _ensure_json_text(result)
+        sess.final_response = _ensure_json_text(history_payload)
 
         evidence_images = []
         evidence_table: list[EvidenceEvent] = []
@@ -355,8 +459,10 @@ async def run_session(sess: Session):
 
         draft = _shape_steps_with_placeholders(extracted) if extracted is not None else None
 
+        guide_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "summarization", token_cost, guide_id_for_run)
+
         final_guide = await _generate_final_guide_with_evidence(
-            task=sess.task, draft=draft, evidence_table=evidence_table, model_name=OPENAI_MODEL
+            task=sess.task, draft=draft, evidence_table=evidence_table, llm=guide_llm
         )
 
         final_with_images = _attach_images_by_evidence(final_guide, evidence_table)
@@ -370,6 +476,9 @@ async def run_session(sess: Session):
         if evidence_table:
             final_with_images = dict(final_with_images)
             final_with_images["evidence"] = [ev.model_dump() for ev in evidence_table]
+        if usage_summary is not None:
+            final_with_images = dict(final_with_images)
+            final_with_images["token_usage"] = usage_summary
 
         sess.result_only = _ensure_json_text(final_with_images)
 

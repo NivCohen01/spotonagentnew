@@ -742,3 +742,86 @@ async def db_fetch_video_info(*, run_id: Optional[str] = None, guide_id: Optiona
     filename = row[0]
     resolved_run_id = row[1] or run_id
     return filename, resolved_run_id
+
+
+async def _fetch_org_id_for_workspace(workspace_id: Optional[int]) -> Optional[int]:
+    if not SessionLocal or workspace_id is None:
+        return None
+
+    async with SessionLocal() as db:
+        res = await db.execute(text("SELECT organization_id FROM workspaces WHERE id=:ws_id LIMIT 1"), {"ws_id": workspace_id})
+        return res.scalar()
+
+
+async def db_insert_llm_call(
+    workspace_id: Optional[int],
+    guide_id: Optional[int],
+    purpose: str,
+    model: str,
+    prompt_text: str,
+    response_text: str,
+    tokens_prompt: int,
+    tokens_completion: int,
+    cost_cents: float,
+    latency_ms: int,
+    success: bool,
+) -> None:
+    if not SessionLocal:
+        return
+
+    now = dt.datetime.utcnow()
+    org_id = await _fetch_org_id_for_workspace(workspace_id)
+
+    async with SessionLocal() as db:
+        await db.execute(
+            text(
+                """
+                INSERT INTO llm_calls (
+                    organization_id,
+                    workspace_id,
+                    guide_id,
+                    purpose,
+                    model,
+                    prompt_text,
+                    response_text,
+                    tokens_prompt,
+                    tokens_completion,
+                    cost_cents,
+                    latency_ms,
+                    success,
+                    created_at
+                )
+                VALUES (
+                    :organization_id,
+                    :workspace_id,
+                    :guide_id,
+                    :purpose,
+                    :model,
+                    :prompt_text,
+                    :response_text,
+                    :tokens_prompt,
+                    :tokens_completion,
+                    :cost_cents,
+                    :latency_ms,
+                    :success,
+                    :created_at
+                )
+                """
+            ),
+            {
+                "organization_id": org_id,
+                "workspace_id": workspace_id,
+                "guide_id": guide_id,
+                "purpose": purpose,
+                "model": model,
+                "prompt_text": prompt_text,
+                "response_text": response_text,
+                "tokens_prompt": tokens_prompt,
+                "tokens_completion": tokens_completion,
+                "cost_cents": cost_cents,
+                "latency_ms": latency_ms,
+                "success": 1 if success else 0,
+                "created_at": now,
+            },
+        )
+        await db.commit()
