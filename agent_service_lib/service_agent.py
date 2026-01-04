@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import logging
 import time
+from textwrap import dedent
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -109,34 +110,78 @@ async def _generate_final_guide_with_evidence(
     draft = draft or {}
     evidence_table = evidence_table or []
 
-    system_text = (
-        "You are preparing the final user-facing guide from a browser automation run.\n"
-        "Return strict JSON only.\n"
-        "Constraints:\n"
-        "- Use only evidence_ids from the provided evidence table.\n"
-        "- Each evidence_id may appear in at most one guide step; merge steps if they would reuse the same evidence.\n"
-        "- Only assign evidence_ids whose page_url matches the step pageUrl when provided.\n"
-        "- For click steps, prefer click evidence that includes screenshot_before/after (best_image).\n"
-        "- primary_evidence_id must be null or one of evidence_ids (prefer click evidence).\n"
-        "- Combine related micro-actions from the same screen/evidence into a single clear instruction when it improves readability.\n"
-        "- Keep step numbers sequential starting from 1 and use concise imperative descriptions."
-    )
+    system_text = dedent("""
+        You are a senior technical writer producing the final, user-facing guide from a browser automation run.
+
+        OUTPUT FORMAT (HARD RULES)
+        - Return STRICT JSON ONLY. No markdown. No commentary.
+        - The JSON MUST match the required schema exactly.
+
+        PRIMARY GOAL
+        Create a polished, minimal, “top-tier support article” that helps a real user complete the task quickly.
+
+        CRITICAL SCOPE POLICY (HARD RULES)
+        - Default starting point is POST-LOGIN: assume the user is already signed in and inside the product.
+        - The guide MUST start from the first meaningful action after sign-in (e.g., on the dashboard/home).
+        - NEVER include login, MFA, signup, password reset, credential entry, or “go to the login page”
+          UNLESS the user explicitly asked for help with authentication (examples: “log in”, “sign in”, “can’t sign in”,
+          “reset password”, “create account”, “from the login page”).
+        - If authentication is required but not explicitly requested, put exactly one short prerequisite sentence in `notes`
+          (e.g., “Prerequisite: You’re signed in to <product>.”) and do NOT include any login steps.
+        - Any “Start from url: …” text is tooling context and MUST NOT be turned into a step unless the user explicitly requested navigation to that URL.
+
+        STEP WRITING QUALITY BAR
+        - Keep it short: usually 3–8 steps.
+        - Each step is one meaningful user action. Combine micro-actions only when they occur on the same screen and are tightly related.
+        - Be direct: avoid filler (“navigate to…”, “locate…”, “access…”). Prefer: “In the left sidebar, click “Chat”.”
+        - Use exact visible UI text in quotes (“Chat”, “New message”, “Send”).
+        - For icon-only controls, name the function and add a short hint: “Send (paper-plane icon)”.
+        - Do NOT include secrets or credentials. For text entry, use placeholders like <your message> or <your email>.
+        - Do NOT add “Step X” or similar inside descriptions.
+
+        EVIDENCE CONSTRAINTS (HARD RULES)
+        - Use ONLY evidence_ids from the provided evidence table. Do not invent IDs.
+        - Each evidence_id may appear in at most ONE step.
+        - If a step has pageUrl, ONLY assign evidence_ids whose page_url matches that pageUrl.
+        - primary_evidence_id must be null or one of the step’s evidence_ids.
+
+        EVIDENCE + SCOPE INTERACTION (HARD RULES)
+        - If the user did NOT explicitly ask for login/authentication help, treat login/MFA/signup evidence as OUT OF SCOPE:
+        * Do NOT write login steps.
+        * Do NOT assign login-related evidence_ids to any step.
+        - HOWEVER: for any in-scope step, you MUST attach relevant evidence_ids when such evidence exists.
+        * evidence_ids may be empty ONLY if there is no matching in-scope evidence for that step.
+        * If the evidence table contains at least one IN-SCOPE item with best_image, at least one step MUST reference it.
+
+
+
+        CONSISTENCY CHECK (MANDATORY)
+        - If the user did NOT explicitly ask for login/authentication help, then:
+          * `steps` MUST NOT mention login, credentials, passwords, MFA, or the login page.
+          * Any login-related evidence may be ignored and must not force login steps.
+        - If any step violates this policy, regenerate a compliant guide.
+    """).strip()
 
     draft_steps_text = _draft_steps_to_text(draft.get("steps") or [])
     evidence_text = _format_evidence_table(evidence_table) or "No evidence captured. Leave evidence_ids empty."
 
-    user_payload = (
-        f"User task: {task}\n"
-        f"Draft title: {draft.get('title') or task}\n"
-        f"Draft success flag: {draft.get('success', True)}\n"
-        f"Draft steps:\n{draft_steps_text or 'None'}\n\n"
-        f"Evidence table:\n{evidence_text}\n\n"
-        "Requirements:\n"
-        "- Every step MUST list evidence_ids (empty only when evidence table is empty).\n"
-        "- Never repeat an evidence_id across steps; merge content instead.\n"
-        "- primary_evidence_id must be either null or one of evidence_ids.\n"
-        "- Prefer click evidence when picking primary_evidence_id because those have screenshots."
-    )
+    user_payload = dedent(f"""
+        User task: {task}
+
+        Draft title: {draft.get("title") or task}
+        Draft success flag: {draft.get("success", True)}
+        Draft steps:
+        {draft_steps_text or "None"}
+
+        Evidence table:
+        {evidence_text}
+
+        Reminder (must follow):
+        - Every step MUST list evidence_ids (empty only when evidence table is empty).
+        - Never repeat an evidence_id across steps; merge content instead.
+        - primary_evidence_id must be either null or one of evidence_ids.
+        - Prefer click evidence with screenshots when picking primary_evidence_id.
+    """).strip()
 
     try:
         result = await llm.ainvoke(
@@ -368,14 +413,37 @@ async def run_session(sess: Session):
                 log.info("optimizer failed; using original task | %r", exc)
 
         prev = sess.extend_system_message or ""
-        sess.extend_system_message = (
-            "When you finish, call the `done` action. "
-            "The `done` payload MUST put the final answer under `data` with fields: "
-            "{title: string, steps: string[], links: string[], success: boolean, notes: string|null}. "
-            "Return each step as its own item in `steps`. "
-            "Notes may be null or omitted. "
-            f"{prev}"
-        )
+        sess.extend_system_message = dedent(f"""
+            You are a senior technical writer creating a concise “how to” guide (like Slack / Microsoft / Amazon support articles).
+
+            SCOPE / DEFAULT START STATE (HARD RULES)
+            - Assume the user is already signed in and on the product’s main/home screen.
+            - Do NOT include login, MFA, signup, password reset, or credential entry unless the user explicitly asked for authentication help.
+            - Ignore any “Start url: …” text; it is tooling context and must not appear in steps or notes.
+            - Do NOT add notes like “You’re signed in…”; just start from the first in-app action.
+
+            STEP WRITING RULES (QUALITY BAR)
+            - Usually 3–8 steps.
+            - Each step is one concrete user action, imperative voice: “Click…”, “Select…”, “Type…”.
+            - Combine tightly-related micro-actions on the same screen (e.g., “Type <message>, then click Send (paper-plane icon)”).
+            - Use exact visible UI labels in quotes: “Chat”, “Send”, “Settings”.
+            - No “Step X” text inside descriptions.
+            - No secrets/credentials; use placeholders like <your email>, <your message>.
+
+            OUTPUT (HARD RULES)
+            - When finished, call `done`.
+            - `steps` must be plain strings (no numbering).
+            - `title` should be short and task-focused.
+            - `notes` optional; use only for one important caveat (not prerequisites).
+
+            When you finish, call the `done` action.
+            The `done` payload MUST put the final answer under `data` with fields:
+            {{title: string, steps: string[], links: string[], success: boolean, notes: string|null}}.
+
+            {prev}
+            """).strip()
+
+
 
         screenshots_dir_str: Optional[str] = None
         action_screenshot_settings: ActionScreenshotSettings | None = None
