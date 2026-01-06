@@ -52,7 +52,6 @@ from agent_service_lib.service_db import (
     db_fetch_action_trace,
     db_fetch_video_info,
     db_update_video_filename,
-    derive_guide_family_key,
     ensure_family_and_variant_guide,
     run_migrations,
     engine,
@@ -143,7 +142,19 @@ async def start_session(req: StartReq):
     session_id = uuid.uuid4().hex[:12]
     sess = Session(session_id=session_id, req=req)
 
-    family_key = req.guide_family_key or derive_guide_family_key(req.workspace_id, req.task, req.start_url)
+    if req.guide_family_key:
+        family_key = req.guide_family_key
+        logger.info(
+            "Using client-provided guide family key %s for session %s workspace=%s", family_key, session_id, req.workspace_id
+        )
+    else:
+        family_key = f"ws:{req.workspace_id}:run:{session_id}"[:191]
+        logger.info(
+            "Generated new guide family key %s for session %s workspace=%s (no client key provided)",
+            family_key,
+            session_id,
+            req.workspace_id,
+        )
     sess.guide_family_key = family_key
 
     sessions[session_id] = sess

@@ -69,9 +69,10 @@ CREATE TABLE IF NOT EXISTS guide_family_variants (
   guide_family_id BIGINT NOT NULL,
   guide_id        BIGINT NOT NULL,
   device_type     ENUM('desktop','mobile') NOT NULL,
+  version         INT NOT NULL DEFAULT 1,
   created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (guide_family_id, device_type),
+  PRIMARY KEY (guide_family_id, device_type, version),
   UNIQUE KEY uq_guide_family_variants_guide_id (guide_id),
   CONSTRAINT fk_guide_family_variants_family
     FOREIGN KEY (guide_family_id) REFERENCES guide_families(id)
@@ -102,6 +103,9 @@ MIGRATIONS_SQL = [
     "ALTER TABLE guide_family_variants ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
     "ALTER TABLE guide_family_variants ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
     "ALTER TABLE guide_family_variants MODIFY COLUMN device_type ENUM('desktop','mobile') NOT NULL",
+    "ALTER TABLE guide_family_variants ADD COLUMN version INT NOT NULL DEFAULT 1",
+    "ALTER TABLE guide_family_variants DROP PRIMARY KEY",
+    "ALTER TABLE guide_family_variants ADD PRIMARY KEY (guide_family_id, device_type, version)",
     "CREATE UNIQUE INDEX uq_guide_family_variants_guide_id ON guide_family_variants (guide_id)",
     "ALTER TABLE guide_family_variants ADD CONSTRAINT fk_guide_family_variants_family FOREIGN KEY (guide_family_id) REFERENCES guide_families(id) ON DELETE CASCADE",
     "ALTER TABLE guide_family_variants ADD CONSTRAINT fk_guide_family_variants_guide FOREIGN KEY (guide_id) REFERENCES guides(id) ON DELETE CASCADE",
@@ -176,6 +180,38 @@ async def _constraint_exists(conn: AsyncConnection, table: str, constraint: str)
     return res.scalar() is not None
 
 
+async def _primary_key_columns(conn: AsyncConnection, table: str) -> list[str]:
+    res = await conn.execute(
+        text(
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table AND CONSTRAINT_NAME = 'PRIMARY'
+            ORDER BY ORDINAL_POSITION
+        """
+        ),
+        {"table": table},
+    )
+    return [row[0] for row in res.fetchall()]
+
+
+def _dialect_name() -> str:
+    try:
+        if engine and getattr(engine, "dialect", None):
+            return (engine.dialect.name or "").lower()
+    except Exception:
+        return ""
+    return ""
+
+
+def _for_update_clause() -> str:
+    return " FOR UPDATE" if _dialect_name() not in ("sqlite", "") else ""
+
+
+def _last_insert_id_sql() -> str:
+    return "SELECT last_insert_rowid()" if _dialect_name() == "sqlite" else "SELECT LAST_INSERT_ID()"
+
+
 def _is_already_exists_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(token in msg for token in ("already exists", "duplicate", "errno 1060", "errno 1061", "errno 1062"))
@@ -242,6 +278,24 @@ async def run_migrations(conn: AsyncConnection) -> None:
         )
     with contextlib.suppress(Exception):
         await conn.execute(text("ALTER TABLE guide_family_variants MODIFY COLUMN device_type ENUM('desktop','mobile') NOT NULL"))
+    if not await _column_exists(conn, "guide_family_variants", "version"):
+        await _execute_ignoring_exists(
+            conn, "ALTER TABLE guide_family_variants ADD COLUMN version INT NOT NULL DEFAULT 1 AFTER device_type"
+        )
+    try:
+        pk_cols = [col.lower() for col in await _primary_key_columns(conn, "guide_family_variants")]
+    except Exception:  # pragma: no cover - defensive for non-MySQL engines
+        pk_cols = []
+    expected_pk = ["guide_family_id", "device_type", "version"]
+    if pk_cols and pk_cols != expected_pk:
+        await _execute_ignoring_exists(conn, "ALTER TABLE guide_family_variants DROP PRIMARY KEY")
+        await _execute_ignoring_exists(
+            conn, "ALTER TABLE guide_family_variants ADD PRIMARY KEY (guide_family_id, device_type, version)"
+        )
+    elif not pk_cols:
+        await _execute_ignoring_exists(
+            conn, "ALTER TABLE guide_family_variants ADD PRIMARY KEY (guide_family_id, device_type, version)"
+        )
     if not await _index_exists(conn, "guide_family_variants", "uq_guide_family_variants_guide_id"):
         await _execute_ignoring_exists(conn, "CREATE UNIQUE INDEX uq_guide_family_variants_guide_id ON guide_family_variants (guide_id)")
     if not await _constraint_exists(conn, "guide_family_variants", "fk_guide_family_variants_family"):
@@ -270,7 +324,7 @@ async def ensure_family_and_variant_guide(
     existing_guide_id: Optional[int] = None,
 ) -> Optional[tuple[int, int, str]]:
     """
-    Ensure there is a guide_family row and a single variant per (family, device_type).
+    Ensure there is a guide_family row and create a new versioned variant per (family, device_type).
     Returns (family_id, guide_id, slug) when successful.
     """
     if not SessionLocal or workspace_id is None:
@@ -292,13 +346,15 @@ async def ensure_family_and_variant_guide(
         async with db.begin():
             fam_id = guide_family_id
             if fam_id:
-                fam_row = await db.execute(text("SELECT id FROM guide_families WHERE id=:fid FOR UPDATE"), {"fid": fam_id})
+                fam_row = await db.execute(
+                    text(f"SELECT id FROM guide_families WHERE id=:fid{_for_update_clause()}"), {"fid": fam_id}
+                )
                 fam_id = fam_row.scalar()
 
             if not fam_id:
                 fam_row = await db.execute(
                     text(
-                        "SELECT id FROM guide_families WHERE workspace_id=:ws_id AND family_key=:family_key LIMIT 1 FOR UPDATE"
+                        f"SELECT id FROM guide_families WHERE workspace_id=:ws_id AND family_key=:family_key LIMIT 1{_for_update_clause()}"
                     ),
                     {"ws_id": workspace_id, "family_key": family_key_val},
                 )
@@ -315,26 +371,47 @@ async def ensure_family_and_variant_guide(
                     ),
                     {"ws_id": workspace_id, "family_key": family_key_val, "created_at": now, "updated_at": now},
                 )
-                fam_row = await db.execute(text("SELECT LAST_INSERT_ID()"))
+                fam_row = await db.execute(text(_last_insert_id_sql()))
                 fam_id = fam_row.scalar()
                 created_family = True
 
             await db.execute(text("UPDATE guide_families SET updated_at=:updated_at WHERE id=:fid"), {"updated_at": now, "fid": fam_id})
 
-            variant_row = await db.execute(
+            latest_variant_row = await db.execute(
                 text(
-                    """
-                    SELECT guide_id FROM guide_family_variants
+                    f"""
+                    SELECT guide_id, version
+                    FROM guide_family_variants
                     WHERE guide_family_id=:family_id AND device_type=:device_type
-                    LIMIT 1 FOR UPDATE
+                    ORDER BY version DESC
+                    LIMIT 1{_for_update_clause()}
                 """
                 ),
                 {"family_id": fam_id, "device_type": normalized_device},
             )
-            linked_guide_id = variant_row.scalar()
-            guide_id = linked_guide_id or existing_guide_id
+            latest_variant = latest_variant_row.first()
+            previous_guide_id = latest_variant[0] if latest_variant else None
+            latest_version = int(latest_variant[1]) if latest_variant and latest_variant[1] is not None else 0
+            existing_variant_version = None
+            if existing_guide_id is not None:
+                existing_variant_row = await db.execute(
+                    text(
+                        f"""
+                        SELECT version
+                        FROM guide_family_variants
+                        WHERE guide_family_id=:family_id AND device_type=:device_type AND guide_id=:guide_id
+                        LIMIT 1{_for_update_clause()}
+                    """
+                    ),
+                    {"family_id": fam_id, "device_type": normalized_device, "guide_id": existing_guide_id},
+                )
+                existing_variant_version = existing_variant_row.scalar()
+            reuse_version = existing_variant_version
+            if reuse_version is None and latest_variant and existing_guide_id is not None and latest_variant[0] == existing_guide_id:
+                reuse_version = latest_version
+
+            guide_id = existing_guide_id
             created_variant = False
-            created_variant_link = linked_guide_id is None
 
             if guide_id:
                 update_params = {
@@ -383,46 +460,57 @@ async def ensure_family_and_variant_guide(
                 params = ", ".join(f":{k}" for k in data.keys())
                 insert_sql = f"INSERT INTO guides ({cols}) VALUES ({params})"
                 await db.execute(text(insert_sql), data)
-                gid_row = await db.execute(text("SELECT LAST_INSERT_ID()"))
+                gid_row = await db.execute(text(_last_insert_id_sql()))
                 guide_id = gid_row.scalar()
-                created_variant = True
                 slug_value = slug
             else:
                 slug_value_row = await db.execute(text("SELECT slug FROM guides WHERE id=:gid"), {"gid": guide_id})
                 slug_value = slug_value_row.scalar() or ""
 
-            try:
-                await db.execute(
-                    text(
-                        """
-                        INSERT INTO guide_family_variants (guide_family_id, guide_id, device_type, created_at, updated_at)
-                        VALUES (:family_id, :guide_id, :device_type, :created_at, :updated_at)
+            version_to_use = reuse_version
+            if guide_id is not None and version_to_use is None:
+                next_version = (latest_version or 0) + 1
+                insert_variant_sql = text(
                     """
-                    ),
-                    {
-                        "family_id": fam_id,
-                        "guide_id": guide_id,
-                        "device_type": normalized_device,
-                        "created_at": now,
-                        "updated_at": now,
-                    },
+                    INSERT INTO guide_family_variants (guide_family_id, guide_id, device_type, version, created_at, updated_at)
+                    VALUES (:family_id, :guide_id, :device_type, :version, :created_at, :updated_at)
+                """
                 )
-            except Exception:
-                # duplicate variant - reuse the existing link
-                variant_row = await db.execute(
-                    text(
-                        """
-                        SELECT guide_id FROM guide_family_variants
-                        WHERE guide_family_id=:family_id AND device_type=:device_type
-                        LIMIT 1
-                    """
-                    ),
-                    {"family_id": fam_id, "device_type": normalized_device},
-                )
-                linked = variant_row.scalar()
-                if linked:
-                    guide_id = linked
-                    created_variant_link = False
+                attempt_version = next_version
+                for _ in range(2):
+                    try:
+                        await db.execute(
+                            insert_variant_sql,
+                            {
+                                "family_id": fam_id,
+                                "guide_id": guide_id,
+                                "device_type": normalized_device,
+                                "version": attempt_version,
+                                "created_at": now,
+                                "updated_at": now,
+                            },
+                        )
+                        version_to_use = attempt_version
+                        created_variant = True
+                        break
+                    except Exception:
+                        retry_row = await db.execute(
+                            text(
+                                f"""
+                                SELECT guide_id, version
+                                FROM guide_family_variants
+                                WHERE guide_family_id=:family_id AND device_type=:device_type
+                                ORDER BY version DESC
+                                LIMIT 1{_for_update_clause()}
+                            """
+                            ),
+                            {"family_id": fam_id, "device_type": normalized_device},
+                        )
+                        retry_latest = retry_row.first()
+                        if not retry_latest:
+                            raise
+                        attempt_version = (int(retry_latest[1]) if retry_latest[1] is not None else 0) + 1
+                        previous_guide_id = previous_guide_id or retry_latest[0]
 
             if guide_id:
                 slug_row = await db.execute(text("SELECT slug FROM guides WHERE id=:gid"), {"gid": guide_id})
@@ -430,12 +518,23 @@ async def ensure_family_and_variant_guide(
 
             if created_family:
                 log.info("Created guide family %s (workspace=%s key=%s)", fam_id, workspace_id, family_key_val)
-            if created_variant:
-                log.info("Created guide variant %s for family %s device=%s", guide_id, fam_id, normalized_device)
-            elif guide_id and created_variant_link:
-                log.info("Linked existing guide %s to family %s device=%s", guide_id, fam_id, normalized_device)
-            elif guide_id:
-                log.info("Reused guide variant %s for family %s device=%s", guide_id, fam_id, normalized_device)
+            if created_variant and guide_id:
+                log.info(
+                    "Created guide variant %s v%s for family %s device=%s (previous latest was %s)",
+                    guide_id,
+                    version_to_use,
+                    fam_id,
+                    normalized_device,
+                    previous_guide_id or "none",
+                )
+            elif guide_id and version_to_use is not None and version_to_use == reuse_version:
+                log.info(
+                    "Using existing guide variant %s v%s for family %s device=%s",
+                    guide_id,
+                    version_to_use,
+                    fam_id,
+                    normalized_device,
+                )
 
     return (fam_id, guide_id, slug_value)
 
@@ -664,21 +763,37 @@ async def db_update_guide_from_result(sess: "Session", enriched: dict):
                 "updated_at": now,
             },
         )
-        gid_row = await db.execute(text("SELECT LAST_INSERT_ID()"))
+        gid_row = await db.execute(text(_last_insert_id_sql()))
         maybe_new_id = gid_row.scalar()
         if sess.guide_family_id and maybe_new_id:
             with contextlib.suppress(Exception):
+                normalized_device = _normalize_device_type(sess.device_type)
+                latest_variant_row = await db.execute(
+                    text(
+                        f"""
+                        SELECT version
+                        FROM guide_family_variants
+                        WHERE guide_family_id=:family_id AND device_type=:device_type
+                        ORDER BY version DESC
+                        LIMIT 1{_for_update_clause()}
+                    """
+                    ),
+                    {"family_id": sess.guide_family_id, "device_type": normalized_device},
+                )
+                latest_version = latest_variant_row.scalar()
+                next_version = (int(latest_version) if latest_version is not None else 0) + 1
                 await db.execute(
                     text(
                         """
-                        INSERT INTO guide_family_variants (guide_family_id, guide_id, device_type, created_at, updated_at)
-                        VALUES (:family_id, :guide_id, :device_type, :created_at, :updated_at)
+                        INSERT INTO guide_family_variants (guide_family_id, guide_id, device_type, version, created_at, updated_at)
+                        VALUES (:family_id, :guide_id, :device_type, :version, :created_at, :updated_at)
                     """
                     ),
                     {
                         "family_id": sess.guide_family_id,
                         "guide_id": maybe_new_id,
-                        "device_type": _normalize_device_type(sess.device_type),
+                        "device_type": normalized_device,
+                        "version": next_version,
                         "created_at": now,
                         "updated_at": now,
                     },
