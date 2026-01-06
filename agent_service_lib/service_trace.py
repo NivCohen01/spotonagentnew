@@ -161,15 +161,62 @@ def _coerce_guide_output_dict(obj: Any) -> Optional[dict]:
 def _shape_steps_with_placeholders(extracted: dict) -> dict:
     raw = list(extracted.get("steps") or [])
     shaped = []
+
+    def _normalize_evidence_ids(raw_ids: Any) -> list[int]:
+        evidence_ids = raw_ids or []
+        if isinstance(evidence_ids, int):
+            evidence_ids = [evidence_ids]
+        normalized: list[int] = []
+        for eid in evidence_ids:
+            try:
+                ival = int(eid)
+            except Exception:
+                continue
+            normalized.append(ival)
+        return normalized
+
+    def _shape_sub_steps(items: Any) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        shaped_sub: list[dict[str, Any]] = []
+        for j, sub in enumerate(items, 1):
+            if not isinstance(sub, dict):
+                shaped_sub.append(
+                    {
+                        "number": j,
+                        "description": str(sub),
+                        "pageUrl": None,
+                        "images": [],
+                        "evidence_ids": [],
+                        "primary_evidence_id": None,
+                    }
+                )
+                continue
+            page_url = sub.get("pageUrl") or sub.get("page_url") or None
+            evidence_ids = _normalize_evidence_ids(sub.get("evidence_ids") or sub.get("evidenceIds"))
+            primary_id = sub.get("primary_evidence_id") or sub.get("primaryEvidenceId")
+            try:
+                primary_id = int(primary_id) if primary_id is not None else None
+            except Exception:
+                primary_id = None
+            shaped_sub.append(
+                {
+                    "number": sub.get("number", j),
+                    "description": sub.get("description") or sub.get("text") or sub.get("title") or "",
+                    "pageUrl": page_url,
+                    "images": sub.get("images") if isinstance(sub.get("images"), list) else [],
+                    "evidence_ids": evidence_ids,
+                    "primary_evidence_id": primary_id,
+                }
+            )
+        return shaped_sub
+
     for i, step in enumerate(raw, 1):
         if isinstance(step, dict):
             description = step.get("description") or step.get("text") or step.get("title") or ""
             page_url = step.get("pageUrl") or step.get("page_url") or None
             images = step.get("images") if isinstance(step.get("images"), list) else []
-            evidence_ids = step.get("evidence_ids") or step.get("evidenceIds") or []
-            if isinstance(evidence_ids, int):
-                evidence_ids = [evidence_ids]
-            evidence_ids = [int(eid) for eid in evidence_ids if isinstance(eid, (int, str)) and str(eid).isdigit()]
+            evidence_ids = _normalize_evidence_ids(step.get("evidence_ids") or step.get("evidenceIds"))
             primary_id = step.get("primary_evidence_id") or step.get("primaryEvidenceId")
             try:
                 primary_id = int(primary_id) if primary_id is not None else None
@@ -183,10 +230,11 @@ def _shape_steps_with_placeholders(extracted: dict) -> dict:
                     "images": images,
                     "evidence_ids": evidence_ids,
                     "primary_evidence_id": primary_id,
+                    "sub_steps": _shape_sub_steps(step.get("sub_steps") or step.get("subSteps")),
                 }
             )
         else:
-            shaped.append({"number": i, "description": str(step), "pageUrl": None, "images": [], "evidence_ids": []})
+            shaped.append({"number": i, "description": str(step), "pageUrl": None, "images": [], "evidence_ids": [], "sub_steps": []})
     enriched = dict(extracted)
     enriched["steps"] = shaped
     return enriched
@@ -501,13 +549,37 @@ def _matches_run_step(path: str, run_step_id: int | None) -> bool:
 
 
 def _normalize_page_url(url: str | None) -> tuple[str | None, str | None]:
+    """
+    Normalize URLs for matching:
+    - add https:// if scheme missing (without affecting path)
+    - lowercase host
+    - strip leading www. only (keep other subdomains)
+    - normalize trailing slash on path
+    - ignore query/fragment
+    """
     if not url:
         return None, None
-    parsed = urlparse(url)
-    host = parsed.netloc or None
+    raw = str(url).strip()
+    if not raw:
+        return None, None
+
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = parsed.netloc or ""
     path = parsed.path or "/"
+
+    if not host and parsed.path:
+        parts = parsed.path.split("/", 1)
+        host = parts[0]
+        path = f"/{parts[1]}" if len(parts) > 1 else "/"
+
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    path = "/" + path.lstrip("/")
     path = path.rstrip("/") or "/"
-    return host, path
+
+    return (host or None), path
 
 
 def _page_url_matches(step_url: str | None, evidence_url: str | None) -> bool:
@@ -519,7 +591,21 @@ def _page_url_matches(step_url: str | None, evidence_url: str | None) -> bool:
         return False
     if step_host and ev_host and step_host != ev_host:
         return False
+    if step_host and ev_host is None:
+        return False
     return step_path == ev_path
+
+
+def _self_test_page_url_matches() -> None:
+    cases = [
+        ("https://bringoz.com", "www.bringoz.com/", True),
+        ("bringoz.com/book-a-demo", "https://www.bringoz.com/book-a-demo/", True),
+        ("https://app.bringoz.com", "https://www.bringoz.com", False),
+        ("https://example.com/a", "https://example.com/b", False),
+    ]
+    for step_url, ev_url, expected in cases:
+        result = _page_url_matches(step_url, ev_url)
+        assert result == expected, f"Mismatch for {step_url} vs {ev_url}: got {result}, expected {expected}"
 
 
 def _pick_primary_action(actions: list[str]) -> str | None:
@@ -836,6 +922,18 @@ def _post_process_guide_steps(steps: list[Any], evidence_table: list[EvidenceEve
             if eid in ev_lookup:
                 normalized_ids.append(eid)
         step_obj.evidence_ids = list(dict.fromkeys(normalized_ids))
+
+        for sub in step_obj.sub_steps:
+            normalized_sub_ids: list[int] = []
+            for raw_id in sub.evidence_ids or []:
+                try:
+                    eid = int(raw_id)
+                except Exception:
+                    continue
+                if eid in ev_lookup:
+                    normalized_sub_ids.append(eid)
+            sub.evidence_ids = list(dict.fromkeys(normalized_sub_ids))
+
         original_ids_by_idx[idx] = list(step_obj.evidence_ids)
         step_objs.append(step_obj)
 
@@ -854,9 +952,34 @@ def _post_process_guide_steps(steps: list[Any], evidence_table: list[EvidenceEve
                 removed.append(eid)
         if removed:
             logger.debug(
-                "Step %s pageUrl=%s removed evidence_ids due to mismatch: %s", step_obj.number, step_obj.pageUrl, removed
+                "Step %s pageUrl=%s removed evidence_ids due to mismatch: %s (ev_urls=%s)",
+                step_obj.number,
+                step_obj.pageUrl,
+                removed,
+                [ev_lookup.get(rid).page_url if ev_lookup.get(rid) else None for rid in removed],
             )
         step_obj.evidence_ids = filtered
+
+        for sub in step_obj.sub_steps:
+            if not sub.pageUrl:
+                continue
+            sub_filtered: list[int] = []
+            sub_removed: list[int] = []
+            for eid in sub.evidence_ids:
+                ev = ev_lookup.get(eid)
+                if ev and _page_url_matches(sub.pageUrl, ev.page_url):
+                    sub_filtered.append(eid)
+                else:
+                    sub_removed.append(eid)
+            if sub_removed:
+                logger.debug(
+                    "Sub-step %s.%s pageUrl=%s removed evidence_ids due to mismatch: %s",
+                    step_obj.number,
+                    sub.number,
+                    sub.pageUrl,
+                    sub_removed,
+                )
+            sub.evidence_ids = sub_filtered
 
     # B) Uniqueness constraint across steps
     evidence_to_steps: dict[int, list[int]] = {}
@@ -956,6 +1079,27 @@ def _post_process_guide_steps(steps: list[Any], evidence_table: list[EvidenceEve
             if step_obj.primary_evidence_id is None:
                 step_obj.primary_evidence_id = step_obj.evidence_ids[0]
             step_obj.images = []
+
+        for sub in step_obj.sub_steps:
+            sub.evidence_ids = list(dict.fromkeys(sub.evidence_ids))
+            if not sub.evidence_ids:
+                sub.primary_evidence_id = None
+                sub.images = []
+            else:
+                if sub.primary_evidence_id not in sub.evidence_ids:
+                    sub.primary_evidence_id = None
+                has_sub_primary_image = bool(
+                    sub.primary_evidence_id
+                    and sub.primary_evidence_id in ev_lookup
+                    and ev_lookup[sub.primary_evidence_id].best_image
+                )
+                if not has_sub_primary_image:
+                    sub_image_candidates = [eid for eid in sub.evidence_ids if ev_lookup.get(eid) and ev_lookup[eid].best_image]
+                    if sub_image_candidates:
+                        sub.primary_evidence_id = sub_image_candidates[0]
+                if sub.primary_evidence_id is None:
+                    sub.primary_evidence_id = sub.evidence_ids[0]
+                sub.images = []
         normalized_steps.append(step_obj.model_dump())
 
     for idx, st in enumerate(normalized_steps, 1):
@@ -983,15 +1127,15 @@ def _attach_images_by_evidence(
     processed_steps = _post_process_guide_steps(guide_dict.get("steps") or [], evidence_table)
     ev_lookup = {ev.evidence_id: ev for ev in evidence_table}
 
-    for step in processed_steps:
+    def _attach_for_step(step_dict: dict[str, Any], label: str = "step") -> None:
         candidate_ids: list[int] = []
-        primary_id = step.get("primary_evidence_id")
+        primary_id = step_dict.get("primary_evidence_id")
         if primary_id is not None:
             try:
                 candidate_ids.append(int(primary_id))
             except Exception:
                 pass
-        for eid in step.get("evidence_ids") or []:
+        for eid in step_dict.get("evidence_ids") or []:
             try:
                 ival = int(eid)
                 if ival not in candidate_ids:
@@ -1013,30 +1157,60 @@ def _attach_images_by_evidence(
             if chosen_path:
                 break
 
-        step["primary_screenshot_step_id"] = chosen_id if chosen_id is not None else primary_id
+        step_dict["primary_screenshot_step_id"] = chosen_id if chosen_id is not None else primary_id
         if chosen_path and chosen_id is not None:
-            step["images"] = [chosen_path]
+            step_dict["images"] = [chosen_path]
         else:
-            step["images"] = []
+            step_dict["images"] = []
 
-        if step.get("images"):
-            img_path = step["images"][0]
+        if step_dict.get("images"):
+            img_path = step_dict["images"][0]
             info = _parse_screenshot_name(Path(img_path).name)
-            if not info or info.get("run_step_id") != step.get("primary_screenshot_step_id"):
+            if not info or info.get("run_step_id") != step_dict.get("primary_screenshot_step_id"):
                 logger.warning(
-                    "Image mismatch for step %s: image step %s vs primary %s; clearing images",
-                    step.get("number"),
+                    "Image mismatch for %s %s: image step %s vs primary %s; clearing images",
+                    label,
+                    step_dict.get("number"),
                     info.get("run_step_id") if info else None,
-                    step.get("primary_screenshot_step_id"),
+                    step_dict.get("primary_screenshot_step_id"),
                 )
-                step["images"] = []
+                step_dict["images"] = []
             else:
                 logger.debug(
-                    "Step %s mapped image %s to run_step_id=%s",
-                    step.get("number"),
+                    "%s %s mapped image %s to run_step_id=%s",
+                    label,
+                    step_dict.get("number"),
                     img_path,
-                    step.get("primary_screenshot_step_id"),
+                    step_dict.get("primary_screenshot_step_id"),
                 )
+
+    for step in processed_steps:
+        _attach_for_step(step, label="step")
+        sub_steps = step.get("sub_steps") if isinstance(step, dict) else None
+        parent_fallback: list[int] = []
+        try:
+            if step.get("primary_evidence_id") is not None:
+                parent_fallback.append(int(step.get("primary_evidence_id")))
+        except Exception:
+            parent_fallback = []
+        if not parent_fallback:
+            for eid in step.get("evidence_ids") or []:
+                try:
+                    parent_fallback.append(int(eid))
+                    break
+                except Exception:
+                    continue
+
+        if isinstance(sub_steps, list) and sub_steps:
+            for sub in sub_steps:
+                if not isinstance(sub, dict):
+                    continue
+                if not sub.get("evidence_ids"):
+                    fallback_ids = [pid for pid in parent_fallback if pid is not None]
+                    sub["evidence_ids"] = fallback_ids
+                    if fallback_ids and sub.get("primary_evidence_id") is None:
+                        sub["primary_evidence_id"] = fallback_ids[0]
+                _attach_for_step(sub, label="sub-step")
 
     guide_dict["steps"] = processed_steps
     return guide_dict

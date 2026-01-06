@@ -17,17 +17,37 @@ class GuideOutput(BaseModel):
     success: bool
 
 
-class GuideStepWithEvidence(BaseModel):
-    """Guide step enriched with evidence identifiers and image slots."""
+class GuideSubStepWithEvidence(BaseModel):
+    """Nested sub-step with evidence identifiers and image slots."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     number: int
     description: str
-    pageUrl: Optional[str] = None
+    pageUrl: Optional[str] = Field(default=None, alias="page_url")
     evidence_ids: list[int] = Field(default_factory=list)
     primary_evidence_id: Optional[int] = None
     images: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _ensure_primary_is_listed(self) -> "GuideSubStepWithEvidence":
+        if self.primary_evidence_id is not None and self.primary_evidence_id not in self.evidence_ids:
+            self.evidence_ids.append(self.primary_evidence_id)
+        return self
+
+
+class GuideStepWithEvidence(BaseModel):
+    """Guide step enriched with evidence identifiers and image slots."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    number: int
+    description: str
+    pageUrl: Optional[str] = Field(default=None, alias="page_url")
+    evidence_ids: list[int] = Field(default_factory=list)
+    primary_evidence_id: Optional[int] = None
+    images: list[str] = Field(default_factory=list)
+    sub_steps: list[GuideSubStepWithEvidence] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _ensure_primary_is_listed(self) -> "GuideStepWithEvidence":

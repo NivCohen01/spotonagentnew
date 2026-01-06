@@ -19,6 +19,8 @@ from .service_trace import _flatten_action_trace_summary, slugify_title_for_guid
 if TYPE_CHECKING:
     from .service_agent import Session
 
+GUIDE_SCHEMA_VERSION = "v2"
+
 engine = create_async_engine(DB_URL, pool_pre_ping=True) if DB_URL else None
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False) if engine else None
 
@@ -114,7 +116,7 @@ def _normalize_device_type(device_type: str | None) -> str:
 
 
 def derive_guide_family_key(workspace_id: Optional[int], task: Optional[str], start_url: Optional[str]) -> str:
-    base_parts: list[str] = []
+    base_parts: list[str] = [f"schema:{GUIDE_SCHEMA_VERSION}"]
     if workspace_id is not None:
         base_parts.append(str(workspace_id))
     if start_url:

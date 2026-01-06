@@ -9,6 +9,7 @@ import time
 from textwrap import dedent
 from pathlib import Path
 from typing import Any, Dict, Optional
+import re
 
 from browser_use import Agent, Browser
 from browser_use.agent.task_optimizer import AgentTaskOptimizer, TaskOptimizationRequest
@@ -27,6 +28,7 @@ from .service_models import (
     GuideOutput,
     GuideOutputWithEvidence,
     GuideStepWithEvidence,
+    GuideSubStepWithEvidence,
     EvidenceEvent,
     SessionState,
     StartReq,
@@ -43,6 +45,101 @@ from .service_trace import (
     _summarize_action_trace,
 )
 from browser_use.tokens.service import TokenCost
+
+
+_MICRO_VERBS = ("enter", "type", "fill", "input", "add", "select", "choose", "pick", "set", "check", "uncheck", "toggle")
+_SUBMIT_TERMS = ("submit", "save", "send", "apply", "request", "confirm", "finish", "complete")
+
+
+def _is_micro_action(desc: str) -> bool:
+    text = (desc or "").strip().lower()
+    if not text:
+        return False
+    if re.match(rf"^({'|'.join(_MICRO_VERBS)})\\b", text):
+        return True
+    if re.match(r"^click\\b", text) and any(term in text for term in _SUBMIT_TERMS):
+        return True
+    return False
+
+
+def _regroup_micro_steps(guide: GuideOutputWithEvidence) -> GuideOutputWithEvidence:
+    """
+    Fallback regrouping to collapse 3+ consecutive micro-actions on the same page into one parent with sub_steps.
+    Example: Enter First Name / Enter Last Name / Enter Email / Click Submit -> one parent "Complete the form and submit it" with sub_steps.
+    """
+    steps = list(guide.steps or [])
+    if len(steps) < 3:
+        return guide
+
+    def same_page(a: GuideStepWithEvidence, b: GuideStepWithEvidence) -> bool:
+        return (a.pageUrl or None) == (b.pageUrl or None)
+
+    new_steps: list[GuideStepWithEvidence] = []
+    idx = 0
+    while idx < len(steps):
+        step = steps[idx]
+        if not _is_micro_action(step.description):
+            new_steps.append(step)
+            idx += 1
+            continue
+
+        run = [step]
+        j = idx + 1
+        while j < len(steps) and _is_micro_action(steps[j].description) and same_page(step, steps[j]):
+            run.append(steps[j])
+            j += 1
+
+        if len(run) < 3:
+            new_steps.extend(run)
+            idx = j
+            continue
+
+        run_page = step.pageUrl
+        sub_steps: list[GuideSubStepWithEvidence] = []
+        all_evidence: list[int] = []
+        primary_candidate: Optional[int] = None
+        has_submit = any(any(term in (s.description or "").lower() for term in _SUBMIT_TERMS) for s in run)
+
+        for k, s in enumerate(run, 1):
+            sub = GuideSubStepWithEvidence(
+                number=k,
+                description=s.description,
+                pageUrl=s.pageUrl,
+                evidence_ids=list(s.evidence_ids or []),
+                primary_evidence_id=s.primary_evidence_id,
+                images=[],
+            )
+            sub_steps.append(sub)
+            all_evidence.extend(list(s.evidence_ids or []))
+            if primary_candidate is None and s.primary_evidence_id is not None:
+                primary_candidate = s.primary_evidence_id
+
+        # Preserve submit action inside the grouped sub_steps
+        summary = "Complete the form and submit it." if has_submit else "Fill in the required details."
+        parent = GuideStepWithEvidence(
+            number=0,
+            description=summary,
+            pageUrl=run_page,
+            evidence_ids=list(dict.fromkeys(all_evidence)),
+            primary_evidence_id=primary_candidate,
+            images=[],
+            sub_steps=sub_steps,
+        )
+        new_steps.append(parent)
+        idx = j
+
+    for n, st in enumerate(new_steps, 1):
+        st.number = n
+        if st.sub_steps:
+            for m, sub in enumerate(st.sub_steps, 1):
+                sub.number = m
+    return GuideOutputWithEvidence(
+        title=guide.title,
+        steps=new_steps,
+        links=guide.links,
+        notes=guide.notes,
+        success=guide.success,
+    )
 
 
 def _draft_steps_to_text(draft_steps: list[Any]) -> str:
@@ -116,34 +213,39 @@ async def _generate_final_guide_with_evidence(
         OUTPUT FORMAT (HARD RULES)
         - Return STRICT JSON ONLY. No markdown. No commentary.
         - The JSON MUST match the required schema exactly.
+        - `steps` is an array of step objects. Each step can include `sub_steps` (one level only). Each sub_step uses the same fields as a step but does not nest further.
+        - Always set `images: []` for every step and sub_step. Images are attached server-side via evidence_ids.
 
         PRIMARY GOAL
-        Create a polished, minimal, “top-tier support article” that helps a real user complete the task quickly.
+        Create a polished, minimal, top-tier support article that helps a real user complete the task quickly.
 
         CRITICAL SCOPE POLICY (HARD RULES)
         - Default starting point is POST-LOGIN: assume the user is already signed in and inside the product.
         - The guide MUST start from the first meaningful action after sign-in (e.g., on the dashboard/home).
-        - NEVER include login, MFA, signup, password reset, credential entry, or “go to the login page”
-          UNLESS the user explicitly asked for help with authentication (examples: “log in”, “sign in”, “can’t sign in”,
-          “reset password”, “create account”, “from the login page”).
+        - NEVER include login, MFA, signup, password reset, credential entry, or "go to the login page"
+          UNLESS the user explicitly asked for help with authentication (examples: "log in", "sign in", "can't sign in",
+          "reset password", "create account", "from the login page").
         - If authentication is required but not explicitly requested, put exactly one short prerequisite sentence in `notes`
-          (e.g., “Prerequisite: You’re signed in to <product>.”) and do NOT include any login steps.
-        - Any “Start from url: …” text is tooling context and MUST NOT be turned into a step unless the user explicitly requested navigation to that URL.
+          (e.g., "Prerequisite: You're signed in to <product>.") and do NOT include any login steps.
+        - Any "Start from url: ..." text is tooling context and MUST NOT be turned into a step unless the user explicitly requested navigation to that URL.
 
         STEP WRITING QUALITY BAR
-        - Keep it short: usually 3–8 steps.
-        - Each step is one meaningful user action. Combine micro-actions only when they occur on the same screen and are tightly related.
-        - Be direct: avoid filler (“navigate to…”, “locate…”, “access…”). Prefer: “In the left sidebar, click “Chat”.”
-        - Use exact visible UI text in quotes (“Chat”, “New message”, “Send”).
-        - For icon-only controls, name the function and add a short hint: “Send (paper-plane icon)”.
+        - Keep it short: usually 3-8 top-level steps.
+        - Form fields and multiple inputs MUST NOT be separate parent steps; they MUST be sub_steps under one parent summary (e.g., "Fill in the form and submit it").
+        - Use sub_steps when 3+ micro-actions happen on the same screen (form fills, multiple toggles, multi-click sequences). The parent step description should summarize the cluster; each sub_step is one concrete action.
+        - Be direct: avoid filler ("navigate to", "access"). Prefer: "In the left sidebar, click 'Chat'."
+        - Use exact visible UI text in quotes ("Chat", "New message", "Send").
+        - For icon-only controls, name the function and add a short hint: "Send (paper-plane icon)".
         - Do NOT include secrets or credentials. For text entry, use placeholders like <your message> or <your email>.
-        - Do NOT add “Step X” or similar inside descriptions.
+        - Do NOT add "Step X" or similar inside descriptions.
+        - sub_steps is OPTIONAL and may be empty.
 
         EVIDENCE CONSTRAINTS (HARD RULES)
         - Use ONLY evidence_ids from the provided evidence table. Do not invent IDs.
-        - Each evidence_id may appear in at most ONE step.
         - If a step has pageUrl, ONLY assign evidence_ids whose page_url matches that pageUrl.
-        - primary_evidence_id must be null or one of the step’s evidence_ids.
+        - primary_evidence_id must be null or one of the step's evidence_ids.
+        - Top-level steps should prefer unique evidence_ids across different parent steps to preserve screenshot alignment.
+        - Sub-steps may reuse evidence_ids (including the parent's primary_evidence_id) when needed; reuse is expected for forms on the same screen.
 
         EVIDENCE + SCOPE INTERACTION (HARD RULES)
         - If the user did NOT explicitly ask for login/authentication help, treat login/MFA/signup evidence as OUT OF SCOPE:
@@ -153,13 +255,15 @@ async def _generate_final_guide_with_evidence(
         * evidence_ids may be empty ONLY if there is no matching in-scope evidence for that step.
         * If the evidence table contains at least one IN-SCOPE item with best_image, at least one step MUST reference it.
 
-
-
         CONSISTENCY CHECK (MANDATORY)
         - If the user did NOT explicitly ask for login/authentication help, then:
           * `steps` MUST NOT mention login, credentials, passwords, MFA, or the login page.
           * Any login-related evidence may be ignored and must not force login steps.
         - If any step violates this policy, regenerate a compliant guide.
+
+        EXAMPLES (STRUCTURE ONLY)
+        - Parent: "Fill in the profile form and submit it."; sub_steps: Enter "First name", Enter "Last name", Enter "Email", Click "Submit".
+        - Parent: "Configure the notification settings."; sub_steps: Toggle "Email alerts", Toggle "SMS alerts", Click "Save".
     """).strip()
 
     draft_steps_text = _draft_steps_to_text(draft.get("steps") or [])
@@ -177,10 +281,12 @@ async def _generate_final_guide_with_evidence(
         {evidence_text}
 
         Reminder (must follow):
-        - Every step MUST list evidence_ids (empty only when evidence table is empty).
-        - Never repeat an evidence_id across steps; merge content instead.
+        - Only use evidence_ids from the evidence table.
+        - 3+ micro-actions (enter/type/select/check/toggle/click submit/save/send) on the SAME pageUrl => one parent summary with sub_steps; do NOT leave them as separate parent steps.
+        - Each PARENT step should include at least one evidence_id when evidence exists; avoid reusing the same evidence_id across different parent steps when possible.
+        - sub_steps may reuse evidence_ids (including the parent's primary_evidence_id). Set them when you know the mapping; they may be empty if no specific sub-step evidence.
         - primary_evidence_id must be either null or one of evidence_ids.
-        - Prefer click evidence with screenshots when picking primary_evidence_id.
+        - Always set images: [] for steps and sub_steps.
     """).strip()
 
     try:
@@ -193,13 +299,16 @@ async def _generate_final_guide_with_evidence(
         )
 
         completion = result.completion
-        return GuideOutputWithEvidence(
-            title=completion.title,
-            steps=list(completion.steps),
-            links=completion.links,
-            notes=completion.notes,
-            success=completion.success,
+        regrouped = _regroup_micro_steps(
+            GuideOutputWithEvidence(
+                title=completion.title,
+                steps=list(completion.steps),
+                links=completion.links,
+                notes=completion.notes,
+                success=completion.success,
+            )
         )
+        return regrouped
     except Exception as exc:  # pragma: no cover - safeguard
         logging.getLogger("service").warning("Guide generation with evidence failed, using fallback | %r", exc)
         return _fallback_guide_from_evidence(task, draft, evidence_table)
