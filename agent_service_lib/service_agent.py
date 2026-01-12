@@ -13,11 +13,24 @@ import re
 
 from browser_use import Agent, Browser
 from browser_use.agent.task_optimizer import AgentTaskOptimizer, TaskOptimizationRequest
+from browser_use.agent.views import ActionResult
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.llm.messages import ContentPartTextParam, SystemMessage, UserMessage
 from browser_use.screenshots.models import ActionScreenshotSettings
+from browser_use.tools.service import Tools
+from pydantic import BaseModel, Field
 from sqlalchemy import text
+from browser_use.tokens.service import TokenCost
 
+from .mailbox_service import DEFAULT_DOMAIN
+from .service_agent_auth_utils import (
+    TaskIntent,
+    TaskCredentials,
+    _sanitize_credentials_payload,
+    _register_mailbox_actions,
+    _is_micro_action,
+)
+from .service_agent_guardrails import install_auth_guardrails
 from .service_browser import _safe_browser_stop, launch_chrome
 from .service_config import DEFAULT_AUTHOR_ID, OPENAI_MODEL, SCREENSHOTS_BASE
 from .service_db import SessionLocal, db_finish_run, db_insert_llm_call, db_insert_run, db_update_guide_from_result
@@ -44,22 +57,9 @@ from .service_trace import (
     _shape_steps_with_placeholders,
     _summarize_action_trace,
 )
-from browser_use.tokens.service import TokenCost
 
 
-_MICRO_VERBS = ("enter", "type", "fill", "input", "add", "select", "choose", "pick", "set", "check", "uncheck", "toggle")
-_SUBMIT_TERMS = ("submit", "save", "send", "apply", "request", "confirm", "finish", "complete")
-
-
-def _is_micro_action(desc: str) -> bool:
-    text = (desc or "").strip().lower()
-    if not text:
-        return False
-    if re.match(rf"^({'|'.join(_MICRO_VERBS)})\\b", text):
-        return True
-    if re.match(r"^click\\b", text) and any(term in text for term in _SUBMIT_TERMS):
-        return True
-    return False
+_SUBMIT_TERMS: tuple[str, ...] = ()
 
 
 def _regroup_micro_steps(guide: GuideOutputWithEvidence) -> GuideOutputWithEvidence:
@@ -203,11 +203,12 @@ async def _generate_final_guide_with_evidence(
     draft: dict | None,
     evidence_table: list[EvidenceEvent],
     llm: ChatOpenAI,
+    include_auth: bool = False,
 ) -> GuideOutputWithEvidence:
     draft = draft or {}
     evidence_table = evidence_table or []
 
-    system_text = dedent("""
+    base_scope = dedent("""
         You are a senior technical writer producing the final, user-facing guide from a browser automation run.
 
         OUTPUT FORMAT (HARD RULES)
@@ -220,14 +221,16 @@ async def _generate_final_guide_with_evidence(
         Create a polished, minimal, top-tier support article that helps a real user complete the task quickly.
 
         CRITICAL SCOPE POLICY (HARD RULES)
-        - Default starting point is POST-LOGIN: assume the user is already signed in and inside the product.
-        - The guide MUST start from the first meaningful action after sign-in (e.g., on the dashboard/home).
-        - NEVER include login, MFA, signup, password reset, credential entry, or "go to the login page"
-          UNLESS the user explicitly asked for help with authentication (examples: "log in", "sign in", "can't sign in",
-          "reset password", "create account", "from the login page").
-        - If authentication is required but not explicitly requested, put exactly one short prerequisite sentence in `notes`
-          (e.g., "Prerequisite: You're signed in to <product>.") and do NOT include any login steps.
-        - Any "Start from url: ..." text is tooling context and MUST NOT be turned into a step unless the user explicitly requested navigation to that URL.
+        - If authentication steps are out of scope, do NOT include login/MFA/signup/password reset/credential entry steps. Treat any "Start url: ..." text as tooling context, not a user step.
+        - If authentication steps are in scope, you may include them when relevant but never reveal secrets (use placeholders).
+        - Default starting point is post-authenticated only when auth steps are out of scope; otherwise follow the run flow.
+        - Credentials included in the task (username/password/OTP hints) are EXECUTION CONTEXT ONLY.
+        They do NOT mean the user asked to document login.
+        Only include authentication steps if the user explicitly asked "how to log in/sign up/reset password/verify OTP".
+        - If authentication is out of scope, assume the user is already signed in and start from the first in-app page
+        (e.g., /dashboard), even if the run started at /auth and the draft includes login/OTP steps.
+        - When auth is out of scope, you MUST ignore any draft steps and any evidence items whose pageUrl is an auth page
+        (/auth, /login, /signin, /signup, /mfa, /otp, /verify, /password-reset).
 
         STEP WRITING QUALITY BAR
         - Keep it short: usually 3-8 top-level steps.
@@ -246,25 +249,27 @@ async def _generate_final_guide_with_evidence(
         - primary_evidence_id must be null or one of the step's evidence_ids.
         - Top-level steps should prefer unique evidence_ids across different parent steps to preserve screenshot alignment.
         - Sub-steps may reuse evidence_ids (including the parent's primary_evidence_id) when needed; reuse is expected for forms on the same screen.
+    """).strip()
+
+    if include_auth:
+        system_text = base_scope
+    else:
+        system_text = base_scope + dedent("""
 
         EVIDENCE + SCOPE INTERACTION (HARD RULES)
-        - If the user did NOT explicitly ask for login/authentication help, treat login/MFA/signup evidence as OUT OF SCOPE:
-        * Do NOT write login steps.
-        * Do NOT assign login-related evidence_ids to any step.
+        - Treat authentication evidence as OUT OF SCOPE unless the task explicitly asked for it.
+        * Do NOT write login/signup/password reset/MFA steps.
+        * Do NOT assign authentication-related evidence_ids to any step.
         - HOWEVER: for any in-scope step, you MUST attach relevant evidence_ids when such evidence exists.
         * evidence_ids may be empty ONLY if there is no matching in-scope evidence for that step.
         * If the evidence table contains at least one IN-SCOPE item with best_image, at least one step MUST reference it.
 
         CONSISTENCY CHECK (MANDATORY)
-        - If the user did NOT explicitly ask for login/authentication help, then:
+        - When authentication is out of scope:
           * `steps` MUST NOT mention login, credentials, passwords, MFA, or the login page.
-          * Any login-related evidence may be ignored and must not force login steps.
+          * Any authentication-related evidence may be ignored and must not force login steps.
         - If any step violates this policy, regenerate a compliant guide.
-
-        EXAMPLES (STRUCTURE ONLY)
-        - Parent: "Fill in the profile form and submit it."; sub_steps: Enter "First name", Enter "Last name", Enter "Email", Click "Submit".
-        - Parent: "Configure the notification settings."; sub_steps: Toggle "Email alerts", Toggle "SMS alerts", Click "Save".
-    """).strip()
+        """).strip()
 
     draft_steps_text = _draft_steps_to_text(draft.get("steps") or [])
     evidence_text = _format_evidence_table(evidence_table) or "No evidence captured. Leave evidence_ids empty."
@@ -329,7 +334,7 @@ def _messages_to_prompt_text(messages: list[Any]) -> str:
                         parts.append(str(getattr(c, "text")))
             elif isinstance(content, str):
                 parts.append(content)
-        return "\n".join(parts)[:5000]
+        return "\n".join(parts)[:500000]
     except Exception:
         return ""
 
@@ -348,7 +353,7 @@ def _response_to_text(response: Any) -> str:
 
 def _wrap_llm_with_logging(
     llm: ChatOpenAI,
-    sess: Session,
+    sess: "Session",
     purpose: str,
     token_cost: TokenCost,
     guide_id: Optional[int],
@@ -396,7 +401,6 @@ def _wrap_llm_with_logging(
                     success=success,
                 )
             except Exception:
-                # Keep LLM call path resilient
                 pass
 
     llm.ainvoke = wrapped  # type: ignore
@@ -438,6 +442,13 @@ class Session:
         self.device_type = req.device_type
         self.viewport_width = req.viewport_width
         self.viewport_height = req.viewport_height
+
+        self.generated_credentials: Optional[dict[str, str]] = None
+        self.generated_credentials_created_at: Optional[dt.datetime] = None
+        self.signup_intent: bool = False
+        self.user_credentials: Optional[dict[str, str]] = None
+        self.intent: Optional[TaskIntent] = None
+        self.otp_attempted_urls: set[str] = set()
 
         self.state: SessionState = "queued"
         self.final_response: Optional[str] = None
@@ -521,23 +532,124 @@ async def run_session(sess: Session):
             except Exception as exc:
                 log.info("optimizer failed; using original task | %r", exc)
 
+        # Intent classification (language-agnostic, no keyword heuristics)
+        try:
+            intent_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "intent", token_cost, guide_id_for_run)
+            intent_system = SystemMessage(
+                content=[
+                    ContentPartTextParam(
+                        text=dedent("""
+                            You classify a task for authentication needs.
+
+                            Return STRICT JSON for TaskIntent:
+                            - needs_auth: boolean (will the agent likely need to be signed in to complete the task?)
+                            - needs_account_creation: boolean (does the task require creating a new account?)
+                            - include_auth_in_final_guide: boolean
+
+                            IMPORTANT POLICY:
+                            - include_auth_in_final_guide MUST be false by default.
+                            - include_auth_in_final_guide can be true ONLY if the user explicitly asked for login/signup/password reset/MFA/verification
+                            (in any language), e.g.:
+                            - "how do I log in", "sign in", "create an account", "verify my email", "enter OTP", "reset password",
+                            - "from the login page", "I can't sign in", "my OTP doesn't arrive"
+                            - If the task is about an in-app workflow (e.g., create article, send message, create user),
+                            include_auth_in_final_guide MUST be false even if authentication is required to perform the task.
+                            - Do NOT treat 'Start url: ...' as a user request. It's tooling context.
+
+                            Output JSON only.
+                            """).strip()
+                    )
+                ]
+            )
+
+            intent_user = UserMessage(content=[ContentPartTextParam(text=f"Task: {optimized_task}")])
+            intent_resp = await intent_llm.ainvoke([intent_system, intent_user], output_format=TaskIntent)
+            sess.intent = intent_resp.completion
+            sess.signup_intent = bool(sess.intent.needs_account_creation)
+        except Exception as exc:
+            log.info("Intent classification failed, defaulting to no-auth | %r", exc)
+            sess.intent = TaskIntent(needs_auth=False, needs_account_creation=False, include_auth_in_final_guide=False)
+            sess.signup_intent = False
+
+        # Credential extraction (language-agnostic, LLM-based; email may be inferred directly if obvious)
+        try:
+            cred_system = SystemMessage(
+                content=[
+                    ContentPartTextParam(
+                        text=dedent(
+                            """
+                            Extract credentials from the task text only if they are explicitly present (any language).
+                            Return STRICT JSON matching TaskCredentials with fields:
+                            - email: string or null
+                            - password: string or null
+                            Do NOT invent values; use null when absent.
+                            """
+                        ).strip()
+                    )
+                ]
+            )
+            cred_user = UserMessage(content=[ContentPartTextParam(text=f"Task: {optimized_task}")])
+            cred_resp = await intent_llm.ainvoke([cred_system, cred_user], output_format=TaskCredentials)
+            creds = cred_resp.completion
+            sess.user_credentials = {"email": creds.email, "password": creds.password} if (creds.email and creds.password) else None
+        except Exception as exc:
+            log.info("Credential extraction failed; none captured | %r", exc)
+            sess.user_credentials = None
+
         prev = sess.extend_system_message or ""
+        signup_execution_block = ""
+        if sess.user_credentials and sess.user_credentials.get("email"):
+            log.info("User credentials detected for session %s (email=%s)", sess.id, sess.user_credentials.get("email"))
+
+        if sess.signup_intent:
+            creds_block = ""
+            if sess.generated_credentials:
+                email_hint = sess.generated_credentials.get("email", "")
+                password_hint = sess.generated_credentials.get("password", "")
+                creds_block = f"""
+            Generated signup credentials (for browser actions only; never show in final guide):
+            EMAIL={email_hint}
+            PASSWORD={password_hint}
+            Use placeholders like <your email> / <your password> in outputs."""
+            signup_execution_block = f"""
+
+            EXECUTION BEFORE DONE (SIGNUP MODE - HARD RULES)
+            - You MUST create an account and end in an authenticated state before calling `done`.
+            - Do NOT stop at the signup page; fill the form, submit it, and only call done when no password/otp fields are visible.
+            - After signup, sign in with the same credentials if not clearly signed in (log out/in if needed).
+            - If OTP is requested and the email is not @{DEFAULT_DOMAIN}, stop with "OTP required; cannot continue automatically."
+            - If OTP is requested and the email is @{DEFAULT_DOMAIN}, call `fetch_mailbox_otp` (polls up to ~2 minutes). If none arrives, stop with "OTP not received."
+            - Never expose real credentials in the guide output; always use placeholders.
+            {creds_block}
+            """
+
         sess.extend_system_message = dedent(f"""
-            You are a senior technical writer creating a concise “how to” guide (like Slack / Microsoft / Amazon support articles).
+            You are a senior technical writer creating a concise "how to" guide (like Slack / Microsoft / Amazon support articles).
+
+            EXECUTION RULES (HARD)
+            - Follow page state: credential fields (email/password) or OTP fields mean you are not authenticated; complete them before proceeding.
+            - NEVER type dummy/placeholder credentials. Only use user-provided credentials or generated pathix.io credentials.
+            - If credential fields appear and no usable credentials exist but account creation is appropriate, call `create_signup_mailbox` to get a pathix.io email/password and use them. Otherwise, stop with an error.
+            - OTP/verification: When page state shows OTP fields (numeric short inputs, autocomplete one-time-code, etc.), call `fetch_mailbox_otp` for @pathix.io accounts you can access, enter the code, and continue. If the email is not @pathix.io or no mailbox creds exist, stop and say "OTP required; cannot continue automatically."
 
             SCOPE / DEFAULT START STATE (HARD RULES)
-            - Assume the user is already signed in and on the product’s main/home screen.
-            - Do NOT include login, MFA, signup, password reset, or credential entry unless the user explicitly asked for authentication help.
-            - Ignore any “Start url: …” text; it is tooling context and must not appear in steps or notes.
-            - Do NOT add notes like “You’re signed in…”; just start from the first in-app action.
+            - Include authentication steps in the final guide only if the classified intent says to include them; otherwise omit them (you may still perform them during execution).
+            - Ignore any "Start url: ..." text; it is tooling context and must not appear in steps or notes.
+            - Do NOT add notes like "You're signed in..."; just start from the first in-app action.
 
             STEP WRITING RULES (QUALITY BAR)
-            - Usually 3–8 steps.
-            - Each step is one concrete user action, imperative voice: “Click…”, “Select…”, “Type…”.
-            - Combine tightly-related micro-actions on the same screen (e.g., “Type <message>, then click Send (paper-plane icon)”).
-            - Use exact visible UI labels in quotes: “Chat”, “Send”, “Settings”.
-            - No “Step X” text inside descriptions.
+            - Usually 3-8 steps.
+            - Each step is one concrete user action, imperative voice: "Click...", "Select...", "Type...".
+            - Combine tightly-related micro-actions on the same screen (e.g., "Type <message>, then click Send (paper-plane icon)").
+            - Use exact visible UI labels in quotes: "Chat", "Send", "Settings".
+            - No "Step X" text inside descriptions.
             - No secrets/credentials; use placeholders like <your email>, <your message>.
+
+            AUTH / MAILBOX RULES (HARD GUARDRAILS)
+            - If you cannot proceed because a page requires credentials and none are available, and account creation is appropriate, call `create_signup_mailbox` to get a pathix.io email/password.
+            - If no credentials are available and account creation is not appropriate, stop and say credentials are required.
+            - When an OTP/verification code is requested for a pathix.io email, call `fetch_mailbox_otp` (it polls for ~2 minutes). If the email is not @pathix.io, stop and say: "OTP required; cannot continue automatically."
+            {signup_execution_block}
 
             OUTPUT (HARD RULES)
             - When finished, call `done`.
@@ -552,7 +664,14 @@ async def run_session(sess: Session):
             {prev}
             """).strip()
 
+        exclude_actions = ["screenshot"] if sess.use_vision != "auto" else []
+        tools = Tools(exclude_actions=exclude_actions)
 
+        # Register tool actions (create_signup_mailbox / fetch_mailbox_otp)
+        _register_mailbox_actions(tools, sess)
+
+        # Install runtime guardrails (OTP autofill + credential enforcement + done-blocking)
+        install_auth_guardrails(tools, sess)
 
         screenshots_dir_str: Optional[str] = None
         action_screenshot_settings: ActionScreenshotSettings | None = None
@@ -571,6 +690,7 @@ async def run_session(sess: Session):
         agent_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "generation", token_cost, guide_id_for_run)
         agent = Agent(
             llm=agent_llm,
+            tools=tools,
             task=optimized_task,
             start_url=sess.start_url,
             headless=sess.headless,
@@ -636,10 +756,14 @@ async def run_session(sess: Session):
 
         draft = _shape_steps_with_placeholders(extracted) if extracted is not None else None
 
-        guide_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "summarization", token_cost, guide_id_for_run)
+        guide_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL, temperature=0), sess, "summarization", token_cost, guide_id_for_run)
 
         final_guide = await _generate_final_guide_with_evidence(
-            task=sess.task, draft=draft, evidence_table=evidence_table, llm=guide_llm
+            task=sess.task,
+            draft=draft,
+            evidence_table=evidence_table,
+            llm=guide_llm,
+            include_auth=bool(sess.intent.include_auth_in_final_guide) if sess.intent else False,
         )
 
         final_with_images = _attach_images_by_evidence(final_guide, evidence_table)
@@ -656,6 +780,14 @@ async def run_session(sess: Session):
         if usage_summary is not None:
             final_with_images = dict(final_with_images)
             final_with_images["token_usage"] = usage_summary
+
+        if sess.generated_credentials:
+            final_with_images = _sanitize_credentials_payload(final_with_images, sess.generated_credentials)
+
+        if sess.user_credentials:
+            final_with_images = _sanitize_credentials_payload(final_with_images, sess.user_credentials)
+        if sess.generated_credentials:
+            final_with_images = _sanitize_credentials_payload(final_with_images, sess.generated_credentials)
 
         sess.result_only = _ensure_json_text(final_with_images)
 
