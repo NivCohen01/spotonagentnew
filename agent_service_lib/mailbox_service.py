@@ -3,16 +3,20 @@ import asyncio
 import contextlib
 import datetime as dt
 import email
+import html
+import quopri
 import imaplib
 import inspect
 import logging
 import re
 import crypt
 from dataclasses import dataclass
+from email.header import decode_header
 from email.message import Message
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 
 from .service_db import SessionLocal
@@ -25,6 +29,18 @@ DEFAULT_IMAP_PORT = 993
 
 # 4–8 digit OTP anywhere in subject/body
 _OTP_PATTERN = re.compile(r"\b(\d{4,8})\b")
+_URL_PATTERN = re.compile(r"(https?://[^\s\"'<>]+)", re.IGNORECASE)
+
+
+class MessageInfo(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    received_at: Optional[dt.datetime] = None
+    subject: str = ""
+    from_: str = Field(default="", alias="from")
+    body_text: str = ""
+    body_html: str = ""
+    extracted_urls: list[str] = Field(default_factory=list)
 
 
 # -----------------------------
@@ -32,6 +48,37 @@ _OTP_PATTERN = re.compile(r"\b(\d{4,8})\b")
 # -----------------------------
 def _utc_now() -> dt.datetime:
     return dt.datetime.utcnow()
+
+
+def extract_urls_from_email(text_or_html: str) -> list[str]:
+    """Extract URLs from text or HTML without language heuristics."""
+    if not text_or_html:
+        return []
+    try:
+        cleaned = html.unescape(text_or_html)
+    except Exception:
+        cleaned = text_or_html or ""
+
+    normalized = cleaned
+    if "=\n" in normalized or "=\r\n" in normalized or "=3D" in normalized or "=3d" in normalized:
+        with contextlib.suppress(Exception):
+            normalized = quopri.decodestring(normalized.encode("utf-8", errors="ignore")).decode("utf-8", errors="ignore")
+
+    raw_urls = _URL_PATTERN.findall(normalized)
+    cleaned_urls: list[str] = []
+    for url in raw_urls:
+        candidate = url.strip().strip("<>\"'()[]")
+        candidate = candidate.rstrip(".,;:")
+        if candidate:
+            cleaned_urls.append(candidate)
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for url in cleaned_urls:
+        if url not in seen:
+            seen.add(url)
+            ordered.append(url)
+    return ordered
 
 
 def _clean_local_base(base: str) -> str:
@@ -459,6 +506,69 @@ def _message_text(msg: Message) -> str:
     return "\n".join(parts)
 
 
+def _decode_header_value(value: str) -> str:
+    if not value:
+        return ""
+    parts: list[str] = []
+    for chunk, encoding in decode_header(value):
+        if isinstance(chunk, bytes):
+            parts.append(chunk.decode(encoding or "utf-8", errors="ignore"))
+        else:
+            parts.append(str(chunk))
+    return "".join(parts)
+
+
+def _extract_message_bodies(msg: Message) -> tuple[str, str]:
+    text_parts: list[str] = []
+    html_parts: list[str] = []
+
+    def _add_payload(payload: bytes | None, charset: str, is_html: bool) -> None:
+        if not payload:
+            return
+        text_val = payload.decode(charset or "utf-8", errors="ignore")
+        if is_html:
+            html_parts.append(text_val)
+        else:
+            text_parts.append(text_val)
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if part.get_content_disposition() == "attachment":
+                continue
+            with contextlib.suppress(Exception):
+                payload = part.get_payload(decode=True)
+                charset = part.get_content_charset() or "utf-8"
+                _add_payload(payload, charset, part.get_content_subtype() == "html")
+    else:
+        with contextlib.suppress(Exception):
+            payload = msg.get_payload(decode=True)
+            charset = msg.get_content_charset() or "utf-8"
+            _add_payload(payload, charset, msg.get_content_subtype() == "html")
+
+    return "\n".join(text_parts).strip(), "\n".join(html_parts).strip()
+
+
+def _coerce_message_datetime(msg: Message, since_ts: Optional[dt.datetime]) -> Optional[dt.datetime]:
+    with contextlib.suppress(Exception):
+        from email.utils import parsedate_to_datetime
+
+        date_hdr = msg.get("Date")
+        if date_hdr:
+            msg_dt = parsedate_to_datetime(date_hdr)
+            if msg_dt:
+                if since_ts:
+                    if msg_dt.tzinfo is not None and since_ts.tzinfo is None:
+                        since_ts = since_ts.replace(tzinfo=dt.timezone.utc)
+                    if msg_dt.tzinfo is None and since_ts.tzinfo is not None:
+                        msg_dt = msg_dt.replace(tzinfo=dt.timezone.utc)
+                    if msg_dt < since_ts:
+                        return None
+                return msg_dt
+    return None
+
+
 def _extract_otp_from_message(msg: Message, since_ts: Optional[dt.datetime]) -> Optional[str]:
     # Date filter (best-effort)
     if since_ts:
@@ -514,6 +624,54 @@ def _imap_fetch_latest_otp_sync(
     return None
 
 
+def _imap_fetch_recent_messages_sync(
+    email_addr: str,
+    password: str,
+    since_ts: Optional[dt.datetime],
+    host: str,
+    port: int,
+) -> list[MessageInfo]:
+    messages: list[MessageInfo] = []
+    with imaplib.IMAP4_SSL(host, port) as imap_conn:
+        imap_conn.login(email_addr, password)
+        imap_conn.select("INBOX")
+        typ, data = imap_conn.search(None, "ALL")
+        if typ != "OK":
+            return messages
+
+        ids = data[0].split() if data and data[0] else []
+        for msg_id in reversed(ids[-50:]):
+            typ2, msg_data = imap_conn.fetch(msg_id, "(RFC822)")
+            if typ2 != "OK" or not msg_data:
+                continue
+            raw = msg_data[0][1]
+            msg = email.message_from_bytes(raw)
+
+            received_at = _coerce_message_datetime(msg, since_ts)
+            if since_ts and received_at is None:
+                continue
+
+            body_text, body_html = _extract_message_bodies(msg)
+            urls = extract_urls_from_email(body_text)
+            urls.extend(extract_urls_from_email(body_html))
+
+            subject = _decode_header_value(msg.get("subject") or "")
+            from_val = _decode_header_value(msg.get("from") or "")
+
+            messages.append(
+                MessageInfo(
+                    received_at=received_at,
+                    subject=subject,
+                    **{"from": from_val},
+                    body_text=body_text,
+                    body_html=body_html,
+                    extracted_urls=list(dict.fromkeys(urls)),
+                )
+            )
+
+    return messages
+
+
 async def fetch_latest_otp_imap(
     email_addr: str,
     password: str,
@@ -553,6 +711,47 @@ async def fetch_latest_otp_imap(
 
     LOGGER.info("OTP not received for %s after %s attempts", email_addr, attempts)
     return None
+
+
+async def fetch_recent_messages_imap(
+    email_addr: str,
+    password: str,
+    since_ts: Optional[dt.datetime],
+    attempts: int = 12,
+    interval: int = 10,
+    host: str = DEFAULT_IMAP_HOST,
+    port: int = DEFAULT_IMAP_PORT,
+) -> list[MessageInfo]:
+    """
+    Poll IMAP for recent messages and return parsed metadata.
+    Only messages newer than since_ts are returned.
+    """
+    email_addr = (email_addr or "").strip().lower()
+    if not email_addr or not password:
+        return []
+
+    for attempt in range(attempts):
+        LOGGER.info("IMAP message check attempt %s/%s for %s", attempt + 1, attempts, email_addr)
+        try:
+            messages = await asyncio.to_thread(
+                _imap_fetch_recent_messages_sync,
+                email_addr,
+                password,
+                since_ts,
+                host,
+                port,
+            )
+            if messages:
+                LOGGER.info("IMAP messages found for %s (%s)", email_addr, len(messages))
+                return messages
+        except Exception as exc:
+            LOGGER.warning("IMAP message fetch failed for %s: %r", email_addr, exc)
+
+        if attempt < attempts - 1:
+            await asyncio.sleep(interval)
+
+    LOGGER.info("No recent messages for %s after %s attempts", email_addr, attempts)
+    return []
 
 
 # -----------------------------

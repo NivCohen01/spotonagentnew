@@ -23,6 +23,10 @@ from .service_agent_auth_utils import (
     _detect_otp_indices,
     _page_has_password_or_otp,
     _save_workspace_domain_if_applicable,
+    _redact_url,
+    detect_email_link_verification_required,
+    detect_otp_verification_required,
+    FetchVerifyLinkParams,
 )
 
 _COMMON_DUMMY = {
@@ -92,8 +96,13 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
         allowed_email = allowed_creds_holder.get("email") or (getattr(sess, "generated_credentials", None) or {}).get("email")
         allowed_password = allowed_creds_holder.get("password") or (getattr(sess, "generated_credentials", None) or {}).get("password")
         action_data = action.model_dump(exclude_unset=True)
+        requires_auth = bool(
+            getattr(sess, "signup_intent", False)
+            or (getattr(sess, "intent", None) and getattr(sess.intent, "needs_auth", False))
+        )
 
         # OTP auto-fill before executing any action
+        otp_indices: list[int] = []
         if browser_session:
             otp_indices = await _detect_otp_indices(browser_session)
             if otp_indices:
@@ -151,11 +160,164 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
 
                     log.info("OTP auto-fill completed for %s on %s", allowed_email, current_url or "<unknown>")
 
+        if "fetch_mailbox_verification_link" in action_data and browser_session:
+            current_url = ""
+            with contextlib.suppress(Exception):
+                current_url = await browser_session.get_current_page_url()
+            redacted_url = _redact_url(current_url)
+
+            attempted = getattr(sess, "verification_attempted_urls", None)
+            if attempted is None:
+                sess.verification_attempted_urls = set()
+                attempted = sess.verification_attempted_urls
+            if redacted_url and redacted_url in attempted:
+                return ActionResult(error="Verification link not received")
+
+            result = await orig_act(
+                action=action,
+                browser_session=browser_session,
+                page_extraction_llm=page_extraction_llm,
+                sensitive_data=sensitive_data,
+                available_file_paths=available_file_paths,
+                file_system=file_system,
+            )
+            if getattr(result, "error", None):
+                return result
+
+            pending_url = getattr(sess, "pending_verification_url", None)
+            if not pending_url:
+                return ActionResult(error="Verification link not received")
+
+            attempted.add(redacted_url or "")
+            try:
+                await browser_session.navigate_to(pending_url, new_tab=False)
+            except Exception as exc:
+                log.info("Verification link navigation failed for %s | %r", allowed_email or "<unknown>", exc)
+                return ActionResult(error="Verification link not received")
+            finally:
+                with contextlib.suppress(Exception):
+                    setattr(sess, "pending_verification_url", None)
+
+            redacted_link = _redact_url(pending_url)
+            log.info("Opened verification link: %s", redacted_link)
+            return ActionResult(
+                extracted_content="Opened verification link.",
+                long_term_memory="Opened verification link from mailbox.",
+                metadata={"url": redacted_link},
+            )
+
         # Block done if still unauthenticated (signup/auth flows)
-        if "done" in action_data and (getattr(sess, "signup_intent", False) or (getattr(sess, "intent", None) and getattr(sess.intent, "needs_auth", False))) and browser_session:
-            otp_indices = await _detect_otp_indices(browser_session)
+        if "done" in action_data and requires_auth and browser_session:
             if otp_indices or await _page_has_password_or_otp(browser_session):
                 return ActionResult(error="Not authenticated yet; continue.")
+            current_url = ""
+            with contextlib.suppress(Exception):
+                current_url = await browser_session.get_current_page_url()
+            redacted_url = _redact_url(current_url)
+            verification_state = await detect_email_link_verification_required(
+                browser_session,
+                page_extraction_llm,
+                current_url=redacted_url,
+            )
+            if verification_state.needs_email_link_verification:
+                return ActionResult(error="Not authenticated yet; continue.")
+            otp_state = await detect_otp_verification_required(
+                browser_session,
+                page_extraction_llm,
+                current_url=redacted_url,
+            )
+            if otp_state.needs_otp_verification:
+                return ActionResult(error="Not authenticated yet; continue.")
+
+        # Auto-handle email link verification when required (non-OTP flows only).
+        if browser_session and requires_auth and not otp_indices and "done" not in action_data:
+            current_url = ""
+            with contextlib.suppress(Exception):
+                current_url = await browser_session.get_current_page_url()
+            redacted_url = _redact_url(current_url)
+
+            attempted = getattr(sess, "verification_attempted_urls", None)
+            if attempted is None:
+                sess.verification_attempted_urls = set()
+                attempted = sess.verification_attempted_urls
+
+            if redacted_url and redacted_url in attempted:
+                pass
+            else:
+                verification_state = await detect_email_link_verification_required(
+                    browser_session,
+                    page_extraction_llm,
+                    current_url=redacted_url,
+                )
+                if verification_state.needs_email_link_verification:
+                    target_email = None
+                    if allowed_email and allowed_email.lower().endswith(f"@{DEFAULT_DOMAIN}"):
+                        target_email = allowed_email.lower()
+                    elif (getattr(sess, "user_credentials", None) or {}).get("email", "").lower().endswith(f"@{DEFAULT_DOMAIN}"):
+                        target_email = (getattr(sess, "user_credentials", None) or {}).get("email", "").lower()
+
+                    if not target_email:
+                        return ActionResult(error="Verification email required; cannot continue automatically.")
+
+                    attempted.add(redacted_url or "")
+                    fetch_link = getattr(sess, "fetch_mailbox_verification_link", None)
+                    if not fetch_link:
+                        return ActionResult(error="Verification link not received")
+
+                    params = FetchVerifyLinkParams(email=target_email)
+                    result = await fetch_link(
+                        params=params,
+                        browser_session=browser_session,
+                        page_extraction_llm=page_extraction_llm,
+                    )
+                    if getattr(result, "error", None):
+                        return result
+
+                    pending_url = getattr(sess, "pending_verification_url", None)
+                    if not pending_url:
+                        return ActionResult(error="Verification link not received")
+
+                    try:
+                        await browser_session.navigate_to(pending_url, new_tab=False)
+                    except Exception as exc:
+                        log.info("Verification link navigation failed for %s | %r", target_email, exc)
+                        return ActionResult(error="Verification link not received")
+                    finally:
+                        with contextlib.suppress(Exception):
+                            setattr(sess, "pending_verification_url", None)
+
+                    redacted_link = _redact_url(pending_url)
+                    log.info("Opened verification link for %s: %s", target_email, redacted_link)
+                    return ActionResult(
+                        extracted_content="Opened verification link.",
+                        long_term_memory="Opened verification link from mailbox.",
+                        metadata={"url": redacted_link},
+                    )
+
+        # If a pending verification URL exists, prefer it over placeholder navigation.
+        if "navigate" in action_data and browser_session:
+            pending_url = getattr(sess, "pending_verification_url", None)
+            if pending_url:
+                nav_params = action_data.get("navigate") or {}
+                requested_url = nav_params.get("url") if isinstance(nav_params, dict) else None
+                if requested_url and _redact_url(requested_url) == _redact_url(pending_url):
+
+                    def _rebuild_action_with_url(new_url: str):
+                        action_dict = action.model_dump(exclude_unset=True)
+                        nav_data = action_dict.get("navigate")
+                        if isinstance(nav_data, dict):
+                            nav_data = dict(nav_data)
+                        elif hasattr(nav_data, "model_dump"):
+                            nav_data = nav_data.model_dump()
+                        else:
+                            nav_data = {}
+                        nav_data["url"] = new_url
+                        action_dict["navigate"] = nav_data
+                        return action.__class__(**action_dict)
+
+                    action = _rebuild_action_with_url(pending_url)
+                    with contextlib.suppress(Exception):
+                        setattr(sess, "pending_verification_url", None)
 
         # Auto-handle OTP if we detect OTP fields and have a pathix.io mailbox we can read.
         if "click" in action_data and browser_session:
@@ -226,6 +388,20 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
 
                 dummy_pw_terms = {"examplepassword", "examplepassword123!", "dummypassword", "password123"}
                 dummy_password = text_val in _COMMON_DUMMY or text_val.lower() in dummy_pw_terms
+                placeholder_text = str(text_val).strip()
+                placeholder_lower = placeholder_text.lower()
+                looks_like_email_value = (
+                    "@" in placeholder_text
+                    and "." in placeholder_text
+                    and " " not in placeholder_text
+                    and not placeholder_text.startswith("@")
+                )
+                looks_like_email_placeholder = bool(
+                    ("<" in placeholder_text and ">" in placeholder_text and "email" in placeholder_lower)
+                    or placeholder_lower in {"<generated_email>", "<your email>", "<email>", "generated_email"}
+                )
+                if field_kind != "email" and (looks_like_email_value or looks_like_email_placeholder):
+                    field_kind = "email"
 
                 def _rebuild_action_with_text(new_text: str):
                     action_dict = action.model_dump(exclude_unset=True)
@@ -240,16 +416,22 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                     action_dict["input"] = input_data
                     return action.__class__(**action_dict)
 
-                if field_kind == "email":
-                    if (
-                        "<" in text_val
-                        or ">" in text_val
-                        or text_val.endswith(("example.com", "test.com"))
-                        or "@@" in text_val
-                        or "email@" in text_val.lower()
-                    ):
-                        return ActionResult(error="Credentials required; cannot proceed.")
+                agent_profile = getattr(sess, "agent_profile", None) or {}
+                placeholder_is_tagged = "<" in placeholder_text and ">" in placeholder_text
+                profile_value: Optional[str] = None
+                if placeholder_is_tagged and field_kind not in {"email", "password"}:
+                    if "first name" in placeholder_lower:
+                        profile_value = agent_profile.get("first_name")
+                    elif "last name" in placeholder_lower:
+                        profile_value = agent_profile.get("last_name")
+                    elif "full name" in placeholder_lower or placeholder_lower in {"<your name>", "<name>"}:
+                        profile_value = agent_profile.get("full_name") or agent_profile.get("display_name")
+                    elif "username" in placeholder_lower or "user name" in placeholder_lower:
+                        profile_value = agent_profile.get("username")
 
+                if profile_value:
+                    action = _rebuild_action_with_text(profile_value)
+                elif field_kind == "email":
                     if allowed_email:
                         action = _rebuild_action_with_text(allowed_email)
                     else:

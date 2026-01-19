@@ -60,6 +60,13 @@ from .service_trace import (
 
 
 _SUBMIT_TERMS: tuple[str, ...] = ()
+DEFAULT_AGENT_PROFILE = {
+    "first_name": "Pathix",
+    "last_name": "Agent",
+    "full_name": "Pathix Agent",
+    "username": "pathix-agent",
+    "display_name": "Pathix Agent",
+}
 
 
 def _regroup_micro_steps(guide: GuideOutputWithEvidence) -> GuideOutputWithEvidence:
@@ -449,6 +456,9 @@ class Session:
         self.user_credentials: Optional[dict[str, str]] = None
         self.intent: Optional[TaskIntent] = None
         self.otp_attempted_urls: set[str] = set()
+        self.verification_attempted_urls: set[str] = set()
+        self.pending_verification_url: Optional[str] = None
+        self.agent_profile: dict[str, str] = dict(DEFAULT_AGENT_PROFILE)
 
         self.state: SessionState = "queued"
         self.final_response: Optional[str] = None
@@ -597,6 +607,16 @@ async def run_session(sess: Session):
             sess.user_credentials = None
 
         prev = sess.extend_system_message or ""
+        agent_profile = getattr(sess, "agent_profile", None) or DEFAULT_AGENT_PROFILE
+        agent_profile_block = f"""
+
+            PROFILE IDENTITY (EXECUTION ONLY)
+            - When a form asks for first name, last name, or username, use:
+              first name "{agent_profile.get("first_name", "Pathix")}",
+              last name "{agent_profile.get("last_name", "Agent")}",
+              username "{agent_profile.get("username", "pathix-agent")}".
+            - Do not include these values in the final guide; keep placeholders there.
+            """
         signup_execution_block = ""
         if sess.user_credentials and sess.user_credentials.get("email"):
             log.info("User credentials detected for session %s (email=%s)", sess.id, sess.user_credentials.get("email"))
@@ -650,6 +670,7 @@ async def run_session(sess: Session):
             - If no credentials are available and account creation is not appropriate, stop and say credentials are required.
             - When an OTP/verification code is requested for a pathix.io email, call `fetch_mailbox_otp` (it polls for ~2 minutes). If the email is not @pathix.io, stop and say: "OTP required; cannot continue automatically."
             {signup_execution_block}
+            {agent_profile_block}
 
             OUTPUT (HARD RULES)
             - When finished, call `done`.
