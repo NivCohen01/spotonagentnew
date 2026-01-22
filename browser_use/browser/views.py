@@ -41,6 +41,19 @@ class TabInfo(BaseModel):
 		return parent_target_id[-4:] if parent_target_id else None
 
 
+class ElementFingerprint(BaseModel):
+	"""Stable fingerprint for re-acquiring DOM elements across DOM refreshes."""
+
+	model_config = ConfigDict(extra='forbid', validate_assignment=True)
+
+	tag: str | None = None
+	role: str | None = None
+	name: str | None = None
+	text: str | None = None
+	href: str | None = None
+	type: str | None = None
+
+
 class PageInfo(BaseModel):
 	"""Comprehensive page size and scroll information"""
 

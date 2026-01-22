@@ -1783,6 +1783,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 		"""Handle navigate back request with CDP."""
 		cdp_session = await self.browser_session.get_or_create_cdp_session()
 		try:
+			self.browser_session.bump_nav_gen(reason='go_back', target_id=self.browser_session.agent_focus_target_id)
 			# Get CDP client and session
 
 			# Get navigation history
@@ -1813,6 +1814,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 		"""Handle navigate forward request with CDP."""
 		cdp_session = await self.browser_session.get_or_create_cdp_session()
 		try:
+			self.browser_session.bump_nav_gen(reason='go_forward', target_id=self.browser_session.agent_focus_target_id)
 			# Get navigation history
 			history = await cdp_session.cdp_client.send.Page.getNavigationHistory(session_id=cdp_session.session_id)
 			current_index = history['currentIndex']
@@ -1841,6 +1843,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 		"""Handle target refresh request with CDP."""
 		cdp_session = await self.browser_session.get_or_create_cdp_session()
 		try:
+			self.browser_session.bump_nav_gen(reason='refresh', target_id=self.browser_session.agent_focus_target_id)
 			# Reload the target
 			await cdp_session.cdp_client.send.Page.reload(session_id=cdp_session.session_id)
 

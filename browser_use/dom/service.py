@@ -31,6 +31,15 @@ if TYPE_CHECKING:
 # Note: iframe limits are now configurable via BrowserProfile.max_iframes and BrowserProfile.max_iframe_depth
 
 
+class DomBuildStaleError(RuntimeError):
+	"""Raised when a DOM build becomes stale due to navigation changes."""
+
+	def __init__(self, local_gen: int, current_gen: int):
+		super().__init__(f'DOM build stale (nav_gen {local_gen} -> {current_gen})')
+		self.local_gen = local_gen
+		self.current_gen = current_gen
+
+
 class DomService:
 	"""
 	Service for getting the DOM tree and other DOM-related information.
@@ -64,6 +73,10 @@ class DomService:
 	async def __aexit__(self, exc_type, exc_value, traceback):
 		pass  # no need to cleanup anything, browser_session auto handles cleaning up session cache
 
+	def _raise_if_stale(self, nav_gen: int | None) -> None:
+		if nav_gen is not None and self.browser_session.nav_gen != nav_gen:
+			raise DomBuildStaleError(nav_gen, self.browser_session.nav_gen)
+
 	def _build_enhanced_ax_node(self, ax_node: AXNode) -> EnhancedAXNode:
 		properties: list[EnhancedAXProperty] | None = None
 		if 'properties' in ax_node and ax_node['properties']:
@@ -91,6 +104,19 @@ class DomService:
 			child_ids=ax_node.get('childIds', []) if ax_node.get('childIds') else None,
 		)
 		return enhanced_ax_node
+
+	@staticmethod
+	def _is_frame_gone_error(error: Exception) -> bool:
+		error_str = str(error).lower()
+		if '-32602' in error_str and 'frame' in error_str:
+			return True
+		if 'frameid' in error_str and 'not found' in error_str:
+			return True
+		if 'frame with the given frameid' in error_str and 'not found' in error_str:
+			return True
+		if 'frame' in error_str and 'no frame' in error_str:
+			return True
+		return False
 
 	async def _get_viewport_ratio(self, target_id: TargetID) -> float:
 		"""Get viewport dimensions, device pixel ratio, and scroll position using CDP."""
@@ -213,6 +239,7 @@ class DomService:
 
 		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
 		frame_tree = await cdp_session.cdp_client.send.Page.getFrameTree(session_id=cdp_session.session_id)
+		main_frame_id = frame_tree['frameTree']['frame']['id']
 
 		def collect_all_frame_ids(frame_tree_node) -> list[str]:
 			"""Recursively collect all frame IDs from the frame tree."""
@@ -227,26 +254,59 @@ class DomService:
 		# Collect all frame IDs recursively
 		all_frame_ids = collect_all_frame_ids(frame_tree['frameTree'])
 
-		# Get accessibility tree for each frame
-		ax_tree_requests = []
-		for frame_id in all_frame_ids:
-			ax_tree_request = cdp_session.cdp_client.send.Accessibility.getFullAXTree(
+		async def _fetch_ax_tree(frame_id: str) -> GetFullAXTreeReturns:
+			return await cdp_session.cdp_client.send.Accessibility.getFullAXTree(
 				params={'frameId': frame_id}, session_id=cdp_session.session_id
 			)
-			ax_tree_requests.append(ax_tree_request)
+
+		main_ax_tree: GetFullAXTreeReturns | None = None
+		main_failures = 0
+		main_error: Exception | None = None
+		while main_ax_tree is None and main_failures < 2:
+			try:
+				main_ax_tree = await _fetch_ax_tree(main_frame_id)
+			except Exception as e:
+				main_failures += 1
+				main_error = e
+				if main_failures < 2:
+					await asyncio.sleep(0.05)
+					continue
+
+		if main_ax_tree is None:
+			raise RuntimeError('AX tree fetch failed for main frame') from main_error
+
+		other_frame_ids = [frame_id for frame_id in all_frame_ids if frame_id != main_frame_id]
+		ax_tree_requests = [_fetch_ax_tree(frame_id) for frame_id in other_frame_ids]
 
 		# Wait for all requests to complete
-		ax_trees = await asyncio.gather(*ax_tree_requests)
+		ax_trees = await asyncio.gather(*ax_tree_requests, return_exceptions=True)
 
 		# Merge all AX nodes into a single array
 		merged_nodes: list[AXNode] = []
-		for ax_tree in ax_trees:
+		successful_frames = 0
+
+		if main_ax_tree is not None:
+			merged_nodes.extend(main_ax_tree['nodes'])
+			successful_frames += 1
+
+		for frame_id, ax_tree in zip(other_frame_ids, ax_trees):
+			if isinstance(ax_tree, Exception):
+				if self._is_frame_gone_error(ax_tree):
+					continue
+				self.logger.debug(f'AX tree fetch failed for frame {frame_id}: {ax_tree}')
+				continue
 			merged_nodes.extend(ax_tree['nodes'])
+			successful_frames += 1
+
+		if successful_frames == 0:
+			raise RuntimeError('AX tree fetch failed for all frames')
 
 		return {'nodes': merged_nodes}
 
-	async def _get_all_trees(self, target_id: TargetID) -> TargetAllTrees:
+	async def _get_all_trees(self, target_id: TargetID, nav_gen: int | None = None) -> TargetAllTrees:
+		self._raise_if_stale(nav_gen)
 		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
+		self._raise_if_stale(nav_gen)
 
 		# Wait for the page to be ready first
 		try:
@@ -255,6 +315,7 @@ class DomService:
 			)
 		except Exception as e:
 			pass  # Page might not be ready yet
+		self._raise_if_stale(nav_gen)
 		# DEBUG: Log before capturing snapshot
 		self.logger.debug(f'🔍 DEBUG: Capturing DOM snapshot for target {target_id}')
 
@@ -372,6 +433,8 @@ class DomService:
 				self.logger.warning(f'CDP request {key} timed out')
 				failed.append(key)
 
+		self._raise_if_stale(nav_gen)
+
 		# If any required tasks failed, raise an exception
 		if failed:
 			raise TimeoutError(f'CDP requests failed or timed out: {", ".join(failed)}')
@@ -380,6 +443,7 @@ class DomService:
 		dom_tree = results['dom_tree']
 		ax_tree = results['ax_tree']
 		device_pixel_ratio = results['device_pixel_ratio']
+		self._raise_if_stale(nav_gen)
 		end_cdp_calls = time.time()
 		cdp_calls_ms = (end_cdp_calls - start_cdp_calls) * 1000
 
@@ -428,6 +492,7 @@ class DomService:
 		initial_html_frames: list[EnhancedDOMTreeNode] | None = None,
 		initial_total_frame_offset: DOMRect | None = None,
 		iframe_depth: int = 0,
+		nav_gen: int | None = None,
 	) -> tuple[EnhancedDOMTreeNode, dict[str, float]]:
 		"""Get the DOM tree for a specific target.
 
@@ -446,7 +511,9 @@ class DomService:
 
 		# Get all trees from CDP (snapshot, DOM, AX, viewport ratio)
 		start_get_trees = time.time()
-		trees = await self._get_all_trees(target_id)
+		self._raise_if_stale(nav_gen)
+		trees = await self._get_all_trees(target_id, nav_gen=nav_gen)
+		self._raise_if_stale(nav_gen)
 		get_trees_ms = (time.time() - start_get_trees) * 1000
 		timing_info.update(trees.cdp_timing)
 		timing_info['get_all_trees_total_ms'] = get_trees_ms
@@ -540,6 +607,7 @@ class DomService:
 			except ValueError:
 				# Target may have detached during DOM construction
 				session_id = None
+			self._raise_if_stale(nav_gen)
 
 			dom_tree_node = EnhancedDOMTreeNode(
 				node_id=node['nodeId'],
@@ -721,6 +789,7 @@ class DomService:
 								# initial_html_frames=updated_html_frames,
 								initial_total_frame_offset=total_frame_offset,
 								iframe_depth=iframe_depth + 1,
+								nav_gen=nav_gen,
 							)
 
 							dom_tree_node.content_document = content_document
@@ -735,6 +804,7 @@ class DomService:
 		enhanced_dom_tree_node = await _construct_enhanced_node(
 			dom_tree['root'], initial_html_frames, initial_total_frame_offset, all_frames
 		)
+		self._raise_if_stale(nav_gen)
 		timing_info['construct_enhanced_tree_ms'] = (time.time() - start_construct) * 1000
 
 		# Calculate total time for get_dom_tree
@@ -756,7 +826,9 @@ class DomService:
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='get_serialized_dom_tree')
 	async def get_serialized_dom_tree(
-		self, previous_cached_state: SerializedDOMState | None = None
+		self,
+		previous_cached_state: SerializedDOMState | None = None,
+		nav_gen: int | None = None,
 	) -> tuple[SerializedDOMState, EnhancedDOMTreeNode, dict[str, float]]:
 		"""Get the serialized DOM tree representation for LLM consumption.
 
@@ -771,10 +843,13 @@ class DomService:
 
 		# Build DOM tree (includes CDP calls for snapshot, DOM, AX tree)
 		# Note: all_frames is fetched lazily inside get_dom_tree only if cross-origin iframes need it
+		self._raise_if_stale(nav_gen)
 		enhanced_dom_tree, dom_tree_timing = await self.get_dom_tree(
 			target_id=self.browser_session.agent_focus_target_id,
 			all_frames=None,  # Lazy - will fetch if needed
+			nav_gen=nav_gen,
 		)
+		self._raise_if_stale(nav_gen)
 
 		# Add sub-timings from DOM tree construction
 		timing_info.update(dom_tree_timing)

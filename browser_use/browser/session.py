@@ -2,9 +2,12 @@
 
 import asyncio
 import logging
+import time
+from collections import deque
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Self, Union, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, Union, cast, overload
 from uuid import UUID
 
 import httpx
@@ -41,8 +44,8 @@ from browser_use.browser.events import (
 	TabCreatedEvent,
 )
 from browser_use.browser.profile import BrowserProfile, ProxySettings
-from browser_use.browser.views import BrowserStateSummary, TabInfo
-from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, TargetInfo
+from browser_use.browser.views import BrowserStateSummary, ElementFingerprint, TabInfo
+from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, NodeType, SerializedDOMState, TargetInfo
 from browser_use.observability import observe_debug
 from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
 
@@ -87,6 +90,20 @@ class CDPSession(BaseModel):
 	# Lifecycle monitoring (populated by SessionManager)
 	_lifecycle_events: Any = PrivateAttr(default=None)
 	_lifecycle_lock: Any = PrivateAttr(default=None)
+
+
+@dataclass(slots=True)
+class UiMetrics:
+	ready_state: str
+	quiet_for_ms: int
+	text_len: int
+	interactables: int
+
+
+@dataclass(slots=True)
+class UiStabilityResult:
+	is_stable: bool
+	metrics: UiMetrics | None
 
 
 class BrowserSession(BaseModel):
@@ -390,6 +407,21 @@ class BrowserSession(BaseModel):
 		"""Whether to use cloud browser service from browser profile."""
 		return self.browser_profile.use_cloud
 
+	@property
+	def nav_gen(self) -> int:
+		"""Navigation generation counter for invalidating stale background tasks."""
+		return self._nav_gen
+
+	def bump_nav_gen(self, reason: str | None = None, target_id: TargetID | None = None) -> int:
+		"""Increment navigation generation when navigation or frame changes occur."""
+		if target_id and self.agent_focus_target_id and target_id != self.agent_focus_target_id:
+			return self._nav_gen
+		self._nav_gen += 1
+		self._stale_index_retries.clear()
+		if reason:
+			self.logger.debug(f'[nav_gen] bump to {self._nav_gen} ({reason})')
+		return self._nav_gen
+
 	# Main shared event bus for all browser session + all watchdogs
 	event_bus: EventBus = Field(default_factory=EventBus)
 
@@ -404,6 +436,11 @@ class BrowserSession(BaseModel):
 
 	_cached_browser_state_summary: Any = PrivateAttr(default=None)
 	_cached_selector_map: dict[int, EnhancedDOMTreeNode] = PrivateAttr(default_factory=dict)
+	_previous_selector_map: dict[int, EnhancedDOMTreeNode] = PrivateAttr(default_factory=dict)
+	_nav_gen: int = PrivateAttr(default=0)
+	_stale_index_retries: dict[int, int] = PrivateAttr(default_factory=dict)
+	_console_errors: deque[dict[str, Any]] = PrivateAttr(default_factory=lambda: deque(maxlen=200))
+	_failure_bundle_nav_gen: int | None = PrivateAttr(default=None)
 	_downloaded_files: list[str] = PrivateAttr(default_factory=list)  # Track files downloaded during this session
 	_closed_popup_messages: list[str] = PrivateAttr(default_factory=list)  # Store messages from auto-closed JavaScript dialogs
 
@@ -470,6 +507,11 @@ class BrowserSession(BaseModel):
 		self._cdp_client_root = None  # type: ignore
 		self._cached_browser_state_summary = None
 		self._cached_selector_map.clear()
+		self._previous_selector_map.clear()
+		self._stale_index_retries.clear()
+		self._console_errors.clear()
+		self._nav_gen = 0
+		self._failure_bundle_nav_gen = None
 		self._downloaded_files.clear()
 
 		self.agent_focus_target_id = None
@@ -634,6 +676,7 @@ class BrowserSession(BaseModel):
 	async def on_NavigateToUrlEvent(self, event: NavigateToUrlEvent) -> None:
 		"""Handle navigation requests - core browser functionality."""
 		self.logger.debug(f'[on_NavigateToUrlEvent] Received NavigateToUrlEvent: url={event.url}, new_tab={event.new_tab}')
+		self.bump_nav_gen(reason='navigate_to_url')
 		if not self.agent_focus_target_id:
 			self.logger.warning('Cannot navigate - browser not connected')
 			return
@@ -735,6 +778,75 @@ class BrowserSession(BaseModel):
 				await self.event_bus.dispatch(AgentFocusChangedEvent(target_id=target_id, url=event.url))
 			raise
 
+	async def wait_for_stable_ui(
+		self,
+		timeout: float = 4.0,
+		quiet_ms: int = 400,
+		min_text_len: int = 40,
+		min_interactables: int = 2,
+	) -> UiStabilityResult:
+		"""Wait for DOM quiet period and basic UI signal before declaring stability."""
+		cdp_session = await self.get_or_create_cdp_session(focus=True)
+		start_time = time.monotonic()
+		last_metrics: UiMetrics | None = None
+
+		js_code = """
+(() => {
+  const now = performance.now();
+  if (!window.__browserUseMutationTracker) {
+    const tracker = { lastMutation: now };
+    const target = document.documentElement || document;
+    const observer = new MutationObserver(() => {
+      tracker.lastMutation = performance.now();
+    });
+    if (target) {
+      observer.observe(target, { subtree: true, childList: true, attributes: true, characterData: true });
+    }
+    tracker.observer = observer;
+    window.__browserUseMutationTracker = tracker;
+  }
+  const tracker = window.__browserUseMutationTracker;
+  const readyState = document.readyState || 'unknown';
+  const quietForMs = Math.floor(now - (tracker.lastMutation || now));
+  let textLen = 0;
+  try {
+    const text = (document.body && document.body.innerText) ? document.body.innerText : '';
+    textLen = text.replace(/\\s+/g, ' ').trim().length;
+  } catch (e) {}
+  let interactables = 0;
+  try {
+    const selector = 'a[href],button,input,select,textarea,[role="button"],[role="link"],[tabindex]';
+    interactables = document.querySelectorAll(selector).length;
+  } catch (e) {}
+  return { readyState, quietForMs, textLen, interactables };
+})()
+"""
+
+		while (time.monotonic() - start_time) < timeout:
+			try:
+				result = await cdp_session.cdp_client.send.Runtime.evaluate(
+					params={'expression': js_code, 'returnByValue': True}, session_id=cdp_session.session_id
+				)
+				value = result.get('result', {}).get('value', {}) if result else {}
+				last_metrics = UiMetrics(
+					ready_state=str(value.get('readyState', 'unknown')),
+					quiet_for_ms=int(value.get('quietForMs', 0)),
+					text_len=int(value.get('textLen', 0)),
+					interactables=int(value.get('interactables', 0)),
+				)
+			except Exception:
+				last_metrics = UiMetrics(ready_state='unknown', quiet_for_ms=0, text_len=0, interactables=0)
+
+			if last_metrics.ready_state in ('interactive', 'complete'):
+				is_quiet = last_metrics.quiet_for_ms >= quiet_ms
+				has_ui_signal = last_metrics.interactables >= min_interactables or last_metrics.text_len >= min_text_len
+				if is_quiet and has_ui_signal:
+					return UiStabilityResult(is_stable=True, metrics=last_metrics)
+
+			await asyncio.sleep(0.05)
+
+		return UiStabilityResult(is_stable=False, metrics=last_metrics)
+
 	async def _navigate_and_wait(self, url: str, target_id: str, timeout: float | None = None) -> None:
 		"""Navigate to URL and wait for page readiness using CDP lifecycle events.
 
@@ -823,13 +935,28 @@ class BrowserSession(BaseModel):
 
 		# Timeout - continue anyway with detailed diagnostics
 		duration_ms = (asyncio.get_event_loop().time() - nav_start_time) * 1000
+		stability = await self.wait_for_stable_ui(timeout=2.0, quiet_ms=400)
+		metrics = stability.metrics
+		metrics_str = ''
+		if metrics:
+			metrics_str = (
+				f'ready_state={metrics.ready_state}, quiet_for_ms={metrics.quiet_for_ms}, '
+				f'text_len={metrics.text_len}, interactables={metrics.interactables}'
+			)
+
+		if stability.is_stable:
+			self.logger.debug(f'UI stable after lifecycle timeout for {url} ({metrics_str})')
+			return
+
 		if not seen_events:
 			self.logger.error(
-				f'❌ No lifecycle events received for {url} after {duration_ms:.0f}ms! '
-				f'Monitoring may have failed. Target: {cdp_session.target_id[:8]}'
+				f'No lifecycle events received for {url} after {duration_ms:.0f}ms. '
+				f'UI stability timeout ({metrics_str}). Target: {cdp_session.target_id[:8]}'
 			)
 		else:
-			self.logger.warning(f'⚠️ Page readiness timeout ({timeout}s, {duration_ms:.0f}ms) for {url}')
+			self.logger.warning(
+				f'UI stability timeout after navigation ({timeout}s, {duration_ms:.0f}ms) for {url} ({metrics_str})'
+			)
 
 	async def on_SwitchTabEvent(self, event: SwitchTabEvent) -> TargetID:
 		"""Handle tab switching - core browser functionality."""
@@ -930,6 +1057,7 @@ class BrowserSession(BaseModel):
 	async def on_AgentFocusChangedEvent(self, event: AgentFocusChangedEvent) -> None:
 		"""Handle agent focus change - update focus and clear cache."""
 		self.logger.debug(f'🔄 AgentFocusChangedEvent received: target_id=...{event.target_id[-4:]} url={event.url}')
+		self.bump_nav_gen(reason='agent_focus_changed', target_id=event.target_id)
 
 		# Clear cached DOM state since focus changed
 		if self._dom_watchdog:
@@ -1823,6 +1951,12 @@ class BrowserSession(BaseModel):
 
 		return None
 
+	def get_previous_element_by_index(self, index: int) -> EnhancedDOMTreeNode | None:
+		"""Get element by index from the previous selector map."""
+		if self._previous_selector_map and index in self._previous_selector_map:
+			return self._previous_selector_map[index]
+		return None
+
 	def update_cached_selector_map(self, selector_map: dict[int, EnhancedDOMTreeNode]) -> None:
 		"""Update the cached selector map with new DOM state.
 
@@ -1831,7 +1965,260 @@ class BrowserSession(BaseModel):
 		Args:
 			selector_map: The new selector map from DOM serialization
 		"""
+		if self._cached_selector_map:
+			self._previous_selector_map = dict(self._cached_selector_map)
 		self._cached_selector_map = selector_map
+		self._stale_index_retries.clear()
+
+	def should_retry_stale_index(self, index: int) -> bool:
+		"""Check if a stale index should be retried for the current nav_gen."""
+		return self._stale_index_retries.get(index) != self._nav_gen
+
+	def mark_stale_index_retry(self, index: int) -> None:
+		"""Mark a stale index as retried for the current nav_gen."""
+		self._stale_index_retries[index] = self._nav_gen
+
+	def clear_stale_index_retries(self) -> None:
+		"""Clear stale index retry tracking."""
+		self._stale_index_retries.clear()
+
+	def _normalize_fingerprint_value(self, value: str | None) -> str | None:
+		if not value:
+			return None
+		normalized = value.strip().lower()
+		return normalized or None
+
+	def build_element_fingerprint(self, node: EnhancedDOMTreeNode) -> ElementFingerprint:
+		"""Build a stable fingerprint for a DOM node."""
+		role = None
+		if node.ax_node and node.ax_node.role:
+			role = node.ax_node.role
+		elif node.attributes:
+			role = node.attributes.get('role')
+
+		name = None
+		if node.ax_node and node.ax_node.name:
+			name = node.ax_node.name
+		elif node.attributes:
+			name = (
+				node.attributes.get('aria-label')
+				or node.attributes.get('name')
+				or node.attributes.get('title')
+			)
+
+		text = node.node_value or ''
+		if not text and node.node_type == NodeType.ELEMENT_NODE:
+			text = node.get_all_children_text(max_depth=2)
+		text = text.strip()
+		if len(text) > 120:
+			text = text[:120]
+
+		href = node.attributes.get('href') if node.attributes else None
+		input_type = node.attributes.get('type') if node.attributes else None
+
+		return ElementFingerprint(
+			tag=self._normalize_fingerprint_value(node.tag_name),
+			role=self._normalize_fingerprint_value(role),
+			name=self._normalize_fingerprint_value(name),
+			text=self._normalize_fingerprint_value(text),
+			href=self._normalize_fingerprint_value(href),
+			type=self._normalize_fingerprint_value(input_type),
+		)
+
+	def find_element_by_fingerprint(
+		self, fingerprint: ElementFingerprint, selector_map: dict[int, EnhancedDOMTreeNode]
+	) -> EnhancedDOMTreeNode | None:
+		"""Find the closest matching element by fingerprint."""
+		def get_role(node: EnhancedDOMTreeNode) -> str | None:
+			if node.ax_node and node.ax_node.role:
+				return self._normalize_fingerprint_value(node.ax_node.role)
+			if node.attributes:
+				return self._normalize_fingerprint_value(node.attributes.get('role'))
+			return None
+
+		def get_name(node: EnhancedDOMTreeNode) -> str | None:
+			if node.ax_node and node.ax_node.name:
+				return self._normalize_fingerprint_value(node.ax_node.name)
+			if node.attributes:
+				return self._normalize_fingerprint_value(
+					node.attributes.get('aria-label') or node.attributes.get('name') or node.attributes.get('title')
+				)
+			return None
+
+		def get_text(node: EnhancedDOMTreeNode) -> str | None:
+			text = node.node_value or ''
+			if not text and node.node_type == NodeType.ELEMENT_NODE:
+				text = node.get_all_children_text(max_depth=2)
+			text = text.strip()
+			if len(text) > 120:
+				text = text[:120]
+			return self._normalize_fingerprint_value(text)
+
+		def get_href(node: EnhancedDOMTreeNode) -> str | None:
+			if node.attributes:
+				return self._normalize_fingerprint_value(node.attributes.get('href'))
+			return None
+
+		def get_input_type(node: EnhancedDOMTreeNode) -> str | None:
+			if node.attributes:
+				return self._normalize_fingerprint_value(node.attributes.get('type'))
+			return None
+
+		def score_candidate(node: EnhancedDOMTreeNode) -> int:
+			score = 0
+			if fingerprint.tag and self._normalize_fingerprint_value(node.tag_name) == fingerprint.tag:
+				score += 2
+			if fingerprint.role and get_role(node) == fingerprint.role:
+				score += 2
+			if fingerprint.name:
+				candidate_name = get_name(node)
+				if candidate_name == fingerprint.name:
+					score += 3
+				elif candidate_name and fingerprint.name in candidate_name:
+					score += 1
+			if fingerprint.text:
+				candidate_text = get_text(node)
+				if candidate_text == fingerprint.text:
+					score += 3
+				elif candidate_text and fingerprint.text in candidate_text:
+					score += 1
+			if fingerprint.href:
+				candidate_href = get_href(node)
+				if candidate_href == fingerprint.href:
+					score += 2
+				elif candidate_href and fingerprint.href in candidate_href:
+					score += 1
+			if fingerprint.type:
+				if get_input_type(node) == fingerprint.type:
+					score += 1
+			return score
+
+		best_score = 0
+		best_node: EnhancedDOMTreeNode | None = None
+		for node in selector_map.values():
+			score = score_candidate(node)
+			if score > best_score:
+				best_score = score
+				best_node = node
+
+		if best_score < 3:
+			return None
+		return best_node
+
+	async def reacquire_element_by_fingerprint(self, index: int) -> EnhancedDOMTreeNode | None:
+		"""Re-acquire a DOM element by fingerprint after stale index failures."""
+		if not self.should_retry_stale_index(index):
+			return None
+		previous = self.get_previous_element_by_index(index)
+		if not previous:
+			return None
+
+		fingerprint = self.build_element_fingerprint(previous)
+		self.mark_stale_index_retry(index)
+
+		try:
+			state = await self.get_browser_state_summary(include_screenshot=False, cached=False)
+		except Exception:
+			return None
+
+		selector_map = state.dom_state.selector_map if state and state.dom_state else {}
+		return self.find_element_by_fingerprint(fingerprint, selector_map)
+
+	def record_console_error(self, message: str, target_id: TargetID | None = None, level: str | None = None) -> None:
+		"""Record console errors for debugging bundles."""
+		self._console_errors.append(
+			{
+				'timestamp': time.time(),
+				'target_id': target_id,
+				'level': level or 'error',
+				'message': message,
+			}
+		)
+
+	def get_console_errors(self, target_id: TargetID | None = None) -> list[dict[str, Any]]:
+		"""Return recent console errors, optionally filtered by target."""
+		if target_id is None:
+			return list(self._console_errors)
+		return [entry for entry in self._console_errors if entry.get('target_id') == target_id]
+
+	async def persist_failure_snapshot_bundle(
+		self,
+		reason: str,
+		dom_state: SerializedDOMState | None = None,
+		screenshot_b64: str | None = None,
+	) -> Path | None:
+		"""Persist a failure snapshot bundle with screenshot, HTML, and console errors."""
+		if self._failure_bundle_nav_gen == self._nav_gen:
+			return None
+
+		self._failure_bundle_nav_gen = self._nav_gen
+		timestamp = time.strftime('%Y%m%d_%H%M%S')
+		base_dir = Path('screenshots') / 'failure_bundles' / self.id
+		base_dir.mkdir(parents=True, exist_ok=True)
+		base_name = f'failure_{timestamp}'
+
+		# Save screenshot
+		try:
+			if screenshot_b64:
+				import base64
+
+				screenshot_bytes = base64.b64decode(screenshot_b64)
+				(base_dir / f'{base_name}.png').write_bytes(screenshot_bytes)
+			else:
+				screenshot_path = base_dir / f'{base_name}.png'
+				await self.take_screenshot(path=str(screenshot_path))
+		except Exception as e:
+			self.logger.debug(f'Failed to capture failure screenshot: {type(e).__name__}: {e}')
+
+		# Save HTML or DOM representation
+		html_path = base_dir / f'{base_name}.html'
+		try:
+			cdp_session = await self.get_or_create_cdp_session(focus=True)
+			result = await cdp_session.cdp_client.send.Runtime.evaluate(
+				params={'expression': 'document.documentElement ? document.documentElement.outerHTML : ""', 'returnByValue': True},
+				session_id=cdp_session.session_id,
+			)
+			html_value = result.get('result', {}).get('value', '') if result else ''
+			if html_value:
+				html_path.write_text(str(html_value), encoding='utf-8')
+			elif dom_state:
+				html_path.write_text(dom_state.llm_representation(), encoding='utf-8')
+		except Exception as e:
+			self.logger.debug(f'Failed to capture failure HTML: {type(e).__name__}: {e}')
+			if dom_state:
+				try:
+					html_path.write_text(dom_state.llm_representation(), encoding='utf-8')
+				except Exception:
+					pass
+
+		# Save console errors
+		try:
+			console_path = base_dir / f'{base_name}_console.json'
+			console_entries = self.get_console_errors(target_id=self.agent_focus_target_id)
+			if console_entries:
+				import json
+
+				console_path.write_text(json.dumps(console_entries, indent=2), encoding='utf-8')
+		except Exception as e:
+			self.logger.debug(f'Failed to persist console errors: {type(e).__name__}: {e}')
+
+		# Write metadata
+		try:
+			meta_path = base_dir / f'{base_name}_meta.json'
+			meta = {
+				'reason': reason,
+				'nav_gen': self._nav_gen,
+				'timestamp': timestamp,
+				'url': await self.get_current_page_url(),
+				'target_id': self.agent_focus_target_id,
+			}
+			import json
+
+			meta_path.write_text(json.dumps(meta, indent=2), encoding='utf-8')
+		except Exception as e:
+			self.logger.debug(f'Failed to persist failure metadata: {type(e).__name__}: {e}')
+
+		return base_dir
 
 	# Alias for backwards compatibility
 	async def get_element_by_index(self, index: int) -> EnhancedDOMTreeNode | None:

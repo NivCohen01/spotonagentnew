@@ -49,6 +49,11 @@ class Page:
 
 		self._llm = llm
 
+	@property
+	def nav_gen(self) -> int:
+		"""Navigation generation counter from the owning browser session."""
+		return self._browser_session.nav_gen
+
 	async def _ensure_session(self) -> str:
 		"""Ensure we have a session ID for this target."""
 		if not self._session_id:
@@ -89,6 +94,7 @@ class Page:
 	async def reload(self) -> None:
 		"""Reload the target."""
 		session_id = await self._ensure_session()
+		self._browser_session.bump_nav_gen(reason='page_reload', target_id=self._target_id)
 		await self._client.send.Page.reload(session_id=session_id)
 
 	async def get_element(self, backend_node_id: int) -> 'Element':
@@ -310,6 +316,7 @@ class Page:
 	async def goto(self, url: str) -> None:
 		"""Navigate this target to a URL."""
 		session_id = await self._ensure_session()
+		self._browser_session.bump_nav_gen(reason='page_goto', target_id=self._target_id)
 
 		params: 'NavigateParameters' = {'url': url}
 		await self._client.send.Page.navigate(params, session_id=session_id)
@@ -323,6 +330,7 @@ class Page:
 		session_id = await self._ensure_session()
 
 		try:
+			self._browser_session.bump_nav_gen(reason='page_go_back', target_id=self._target_id)
 			# Get navigation history
 			history = await self._client.send.Page.getNavigationHistory(session_id=session_id)
 			current_index = history['currentIndex']
@@ -345,6 +353,7 @@ class Page:
 		session_id = await self._ensure_session()
 
 		try:
+			self._browser_session.bump_nav_gen(reason='page_go_forward', target_id=self._target_id)
 			# Get navigation history
 			history = await self._client.send.Page.getNavigationHistory(session_id=session_id)
 			current_index = history['currentIndex']

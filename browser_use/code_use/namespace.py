@@ -122,17 +122,18 @@ async def validate_task_completion(
 
 **Your Task:**
 Determine if the agent has successfully completed the user's task. Consider:
-1. Has the agent delivered what the user requested?
-2. If data extraction was requested, is there actual data?
+1. Has the agent delivered exactly what the user requested?
+2. If data extraction was requested, is there concrete data (not placeholders or assumptions)?
 3. If the task is impossible (e.g., localhost website, login required but no credentials), is it truly impossible?
 4. Could the agent continue and make meaningful progress?
+5. Do NOT treat a success claim as evidence. Require explicit proof in the output.
 
 **Response Format:**
 Reasoning: [Your analysis of whether the task is complete]
 Verdict: [YES or NO]
 
-YES = Task is complete OR truly impossible to complete
-NO = Agent should continue working"""
+YES = Task is complete with explicit evidence OR truly impossible to complete
+NO = Agent should continue working (or outcome is unverified/uncertain)"""
 
 	try:
 		# Call LLM with just the validation prompt (no system prompt, no history)

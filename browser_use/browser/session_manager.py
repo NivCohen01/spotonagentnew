@@ -464,13 +464,19 @@ class SessionManager:
 		if not target_id:
 			return
 
+		url_changed = False
 		async with self._lock:
 			# Update target if it exists (source of truth for url/title)
 			if target_id in self._targets:
 				target = self._targets[target_id]
+				new_title = target_info.get('title', target.title)
+				new_url = target_info.get('url', target.url)
+				url_changed = new_url != target.url
+				target.title = new_title
+				target.url = new_url
 
-				target.title = target_info.get('title', target.title)
-				target.url = target_info.get('url', target.url)
+		if url_changed and target_id == self.browser_session.agent_focus_target_id:
+			self.browser_session.bump_nav_gen(reason='target_info_changed', target_id=target_id)
 
 	async def _handle_target_detached(self, event: DetachedFromTargetEvent) -> None:
 		"""Handle Target.detachedFromTarget event.
@@ -838,6 +844,9 @@ class SessionManager:
 			# Enable network monitoring for networkIdle detection
 			await cdp_session.cdp_client.send.Network.enable(session_id=cdp_session.session_id)
 
+			# Enable Runtime domain for console and evaluation helpers
+			await cdp_session.cdp_client.send.Runtime.enable(session_id=cdp_session.session_id)
+
 			# Initialize lifecycle event storage for this session (thread-safe)
 			from collections import deque
 
@@ -871,6 +880,34 @@ class SessionManager:
 
 			# Register the handler ONCE (this is the only place we register)
 			cdp_session.cdp_client.register.Page.lifecycleEvent(on_lifecycle_event)
+
+			def on_frame_event(event, session_id=None):
+				if session_id and self.get_target_id_from_session_id(session_id) != cdp_session.target_id:
+					return
+				self.browser_session.bump_nav_gen(reason='frame_tree_changed', target_id=cdp_session.target_id)
+
+			cdp_session.cdp_client.register.Page.frameNavigated(on_frame_event)
+			cdp_session.cdp_client.register.Page.frameDetached(on_frame_event)
+			cdp_session.cdp_client.register.Page.frameAttached(on_frame_event)
+
+			def on_console_event(event, session_id=None):
+				if session_id and self.get_target_id_from_session_id(session_id) != cdp_session.target_id:
+					return
+				event_type = str(event.get('type', 'log'))
+				if event_type not in ('error', 'assert'):
+					return
+				parts = []
+				for arg in event.get('args', []) or []:
+					if 'value' in arg:
+						parts.append(str(arg['value']))
+					elif 'description' in arg:
+						parts.append(str(arg['description']))
+					elif 'type' in arg:
+						parts.append(str(arg['type']))
+				message = ' '.join(parts).strip() if parts else event_type
+				self.browser_session.record_console_error(message, target_id=cdp_session.target_id, level=event_type)
+
+			cdp_session.cdp_client.register.Runtime.consoleAPICalled(on_console_event)
 
 		except Exception as e:
 			# Don't fail - target might be short-lived or already detached

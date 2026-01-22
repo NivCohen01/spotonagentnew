@@ -243,12 +243,20 @@ async def _generate_final_guide_with_evidence(
         - Keep it short: usually 3-8 top-level steps.
         - Form fields and multiple inputs MUST NOT be separate parent steps; they MUST be sub_steps under one parent summary (e.g., "Fill in the form and submit it").
         - Use sub_steps when 3+ micro-actions happen on the same screen (form fills, multiple toggles, multi-click sequences). The parent step description should summarize the cluster; each sub_step is one concrete action.
+        - One action per step or sub_step. Do not combine independent actions in a single step.
         - Be direct: avoid filler ("navigate to", "access"). Prefer: "In the left sidebar, click 'Chat'."
         - Use exact visible UI text in quotes ("Chat", "New message", "Send").
         - For icon-only controls, name the function and add a short hint: "Send (paper-plane icon)".
         - Do NOT include secrets or credentials. For text entry, use placeholders like <your message> or <your email>.
         - Do NOT add "Step X" or similar inside descriptions.
         - sub_steps is OPTIONAL and may be empty.
+
+        GROUNDING REQUIREMENTS (HARD RULES)
+        - Steps must be supported by the evidence table or draft. Do not invent UI labels or controls.
+        - Banned hedging words/phrases in user-facing text: "usually", "typically", "might", "may", "often", "likely",
+          "around", "approximately", "roughly", "or a similar option", "or equivalent", "if needed".
+        - Do not use vague placeholders like "appropriate button", "checkmark", "save icon", or "some menu".
+        - If a required control or label is not identifiable from evidence, set success=false and add a short note explaining what could not be verified.
 
         EVIDENCE CONSTRAINTS (HARD RULES)
         - Use ONLY evidence_ids from the provided evidence table. Do not invent IDs.
@@ -299,6 +307,8 @@ async def _generate_final_guide_with_evidence(
         - sub_steps may reuse evidence_ids (including the parent's primary_evidence_id). Set them when you know the mapping; they may be empty if no specific sub-step evidence.
         - primary_evidence_id must be either null or one of evidence_ids.
         - Always set images: [] for steps and sub_steps.
+        - Do not invent UI labels or controls; avoid vague placeholders like "appropriate button" or "checkmark".
+        - Do not use hedging words like "usually", "typically", "might", or "may".
     """).strip()
 
     try:
@@ -652,6 +662,16 @@ async def run_session(sess: Session):
             - If credential fields appear and no usable credentials exist but account creation is appropriate, call `create_signup_mailbox` to get a pathix.io email/password and use them. Otherwise, stop with an error.
             - OTP/verification: When page state shows OTP fields (numeric short inputs, autocomplete one-time-code, etc.), call `fetch_mailbox_otp` for @pathix.io accounts you can access, enter the code, and continue. If the email is not @pathix.io or no mailbox creds exist, stop and say "OTP required; cannot continue automatically."
 
+            DECISION LOOP (HARD)
+            - Observe -> Plan -> Act -> Verify each step.
+            - Observe: summarize only current, visible facts from browser_state/browser_vision.
+            - Plan: propose up to 2-3 candidate actions with rationale tied to the next goal.
+            - Act: choose ONE action that best matches the next goal.
+            - Verify: confirm progress using concrete signals (URL change, modal opened/closed, new fields visible, confirmation text). If no clear progress or any error occurred, do not mark success.
+            - If the same action type fails twice, change strategy (open menu, search if present, scroll, or go back).
+            - Prefer elements with clear semantic purpose (roles/aria/labels). Avoid clicking large containers unless they clearly match the goal.
+            - Close unrelated modals/overlays before continuing.
+
             SCOPE / DEFAULT START STATE (HARD RULES)
             - Include authentication steps in the final guide only if the classified intent says to include them; otherwise omit them (you may still perform them during execution).
             - Ignore any "Start url: ..." text; it is tooling context and must not appear in steps or notes.
@@ -660,10 +680,12 @@ async def run_session(sess: Session):
             STEP WRITING RULES (QUALITY BAR)
             - Usually 3-8 steps.
             - Each step is one concrete user action, imperative voice: "Click...", "Select...", "Type...".
-            - Combine tightly-related micro-actions on the same screen (e.g., "Type <message>, then click Send (paper-plane icon)").
+            - One action per step. Do not combine independent actions in a single step.
             - Use exact visible UI labels in quotes: "Chat", "Send", "Settings".
             - No "Step X" text inside descriptions.
             - No secrets/credentials; use placeholders like <your email>, <your message>.
+            - Do not invent UI labels or use vague placeholders like "appropriate button" or "checkmark".
+            - Avoid hedging words like "usually", "typically", "might", or "may".
 
             AUTH / MAILBOX RULES (HARD GUARDRAILS)
             - If you cannot proceed because a page requires credentials and none are available, and account creation is appropriate, call `create_signup_mailbox` to get a pathix.io email/password.
@@ -677,6 +699,9 @@ async def run_session(sess: Session):
             - `steps` must be plain strings (no numbering).
             - `title` should be short and task-focused.
             - `notes` optional; use only for one important caveat (not prerequisites).
+            - Only call `done` when the goal is verified from the CURRENT page state. If you cannot verify the outcome, keep working or return failure with a concrete reason.
+            - Login success must be verified by absence of login form AND presence of authenticated UI signals (account/avatar/menu/dashboard).
+            - Navigation success must be verified by a relevant URL/content change.
 
             When you finish, call the `done` action.
             The `done` payload MUST put the final answer under `data` with fields:

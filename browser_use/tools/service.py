@@ -337,11 +337,18 @@ class Tools(Generic[Context]):
 				)
 
 				# Look up the node from the selector map
+				original_index = params.index
 				node = await browser_session.get_element_by_index(params.index)
 				if node is None:
-					msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
-					logger.warning(f'⚠️ {msg}')
-					return ActionResult(extracted_content=msg)
+					reacquired = await browser_session.reacquire_element_by_fingerprint(params.index)
+					if reacquired:
+						node = reacquired
+						params = params.model_copy(update={'index': node.backend_node_id})
+						logger.info(f'Re-acquired stale element index {original_index} -> {params.index}')
+					else:
+						msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
+						logger.warning(f'⚠️ {msg}')
+						return ActionResult(extracted_content=msg)
 
 				# Get description of clicked element
 				element_desc = get_click_description(node)
@@ -413,11 +420,21 @@ class Tools(Generic[Context]):
 			sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		):
 			# Look up the node from the selector map
+			original_index = params.index
 			node = await browser_session.get_element_by_index(params.index)
 			if node is None:
-				msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
-				logger.warning(f'⚠️ {msg}')
-				return ActionResult(extracted_content=msg)
+				reacquired = await browser_session.reacquire_element_by_fingerprint(params.index)
+				if reacquired:
+					node = reacquired
+					params = params.model_copy(update={'index': node.backend_node_id})
+					logger.info(f'Re-acquired stale element index {original_index} -> {params.index}')
+				else:
+					msg = (
+						f'Element index {params.index} not available - page may have changed. '
+						'Try refreshing browser state.'
+					)
+					logger.warning(f'⚠️ {msg}')
+					return ActionResult(extracted_content=msg)
 
 			# Highlight the element being typed into (truly non-blocking)
 			create_task_with_error_handling(
@@ -990,9 +1007,18 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			# Look up the node from the selector map
 			node = await browser_session.get_element_by_index(params.index)
 			if node is None:
-				msg = f'Element index {params.index} not available - page may have changed. Try refreshing browser state.'
-				logger.warning(f'⚠️ {msg}')
-				return ActionResult(extracted_content=msg)
+				reacquired = await browser_session.reacquire_element_by_fingerprint(params.index)
+				if reacquired:
+					node = reacquired
+					params = params.model_copy(update={'index': node.backend_node_id})
+					logger.info(f'Re-acquired stale element index: {params.index}')
+				else:
+					msg = (
+						f'Element index {params.index} not available - page may have changed. '
+						'Try refreshing browser state.'
+					)
+					logger.warning(f'⚠️ {msg}')
+					return ActionResult(extracted_content=msg)
 
 			# Dispatch GetDropdownOptionsEvent to the event handler
 

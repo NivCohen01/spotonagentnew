@@ -4,16 +4,20 @@ import asyncio
 import time
 from typing import TYPE_CHECKING
 
+from pydantic import PrivateAttr
+
 from browser_use.browser.events import (
 	BrowserErrorEvent,
 	BrowserStateRequestEvent,
+	CloseTabEvent,
 	ScreenshotEvent,
 	TabCreatedEvent,
 )
 from browser_use.browser.watchdog_base import BaseWatchdog
-from browser_use.dom.service import DomService
+from browser_use.dom.service import DomBuildStaleError, DomService
 from browser_use.dom.views import (
 	EnhancedDOMTreeNode,
+	NodeType,
 	SerializedDOMState,
 )
 from browser_use.observability import observe_debug
@@ -44,6 +48,10 @@ class DOMWatchdog(BaseWatchdog):
 
 	# Network tracking - maps request_id to (url, start_time, method, resource_type)
 	_pending_requests: dict[str, tuple[str, float, str, str | None]] = {}
+
+	_low_info_counter: int = PrivateAttr(default=0)
+	_low_info_recovery_step: int = PrivateAttr(default=0)
+	_low_info_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 
 	async def on_TabCreatedEvent(self, event: TabCreatedEvent) -> None:
 		# self.logger.debug('Setting up init scripts in browser')
@@ -273,17 +281,27 @@ class DOMWatchdog(BaseWatchdog):
 			except Exception as e:
 				self.logger.debug(f'Failed to get pending requests before wait: {e}')
 		pending_requests = pending_requests_before_wait
-		# Wait for page stability using browser profile settings (main branch pattern)
+		# Wait for UI stability before building DOM
 		if not not_a_meaningful_website:
-			self.logger.debug('🔍 DOMWatchdog.on_BrowserStateRequestEvent: ⏳ Waiting for page stability...')
+			self.logger.debug('🔍 DOMWatchdog.on_BrowserStateRequestEvent: ⏳ Waiting for UI stability...')
 			try:
-				if pending_requests_before_wait:
-					# Reduced from 1s to 0.3s for faster DOM builds while still allowing critical resources to load
-					await asyncio.sleep(0.3)
-				self.logger.debug('🔍 DOMWatchdog.on_BrowserStateRequestEvent: ✅ Page stability complete')
+				stability = await self.browser_session.wait_for_stable_ui(timeout=2.0, quiet_ms=400)
+				metrics = stability.metrics
+				metrics_str = ''
+				if metrics:
+					metrics_str = (
+						f'ready_state={metrics.ready_state}, quiet_for_ms={metrics.quiet_for_ms}, '
+						f'text_len={metrics.text_len}, interactables={metrics.interactables}'
+					)
+				if stability.is_stable:
+					self.logger.debug(f'🔍 DOMWatchdog.on_BrowserStateRequestEvent: ✅ UI stable ({metrics_str})')
+				else:
+					self.logger.warning(
+						f'🔍 DOMWatchdog.on_BrowserStateRequestEvent: UI stability timeout ({metrics_str})'
+					)
 			except Exception as e:
 				self.logger.warning(
-					f'🔍 DOMWatchdog.on_BrowserStateRequestEvent: Network waiting failed: {e}, continuing anyway...'
+					f'🔍 DOMWatchdog.on_BrowserStateRequestEvent: UI stability wait failed: {e}, continuing anyway...'
 				)
 
 		# Get tabs info once at the beginning for all paths
@@ -383,16 +401,34 @@ class DOMWatchdog(BaseWatchdog):
 			# Wait for both tasks to complete
 			content = None
 			screenshot_b64 = None
+			dom_error: Exception | None = None
 
 			if dom_task:
 				try:
 					content = await dom_task
 					self.logger.debug('🔍 DOMWatchdog.on_BrowserStateRequestEvent: ✅ DOM tree build completed')
 				except Exception as e:
-					self.logger.warning(f'🔍 DOMWatchdog.on_BrowserStateRequestEvent: DOM build failed: {e}, using minimal state')
-					content = SerializedDOMState(_root=None, selector_map={})
+					dom_error = e
 			else:
 				content = SerializedDOMState(_root=None, selector_map={})
+
+			if dom_error:
+				if isinstance(dom_error, DomBuildStaleError):
+					self.logger.debug('🔍 DOMWatchdog.on_BrowserStateRequestEvent: DOM build stale, using previous state')
+					content = previous_state or self.current_dom_state or SerializedDOMState(_root=None, selector_map={})
+				else:
+					frame_count = 0
+					try:
+						all_frames, _ = await self.browser_session.get_all_frames()
+						frame_count = len(all_frames)
+					except Exception:
+						pass
+					self.logger.warning(
+						f'🔍 DOMWatchdog.on_BrowserStateRequestEvent: DOM build failed, '
+						f'nav_gen={self.browser_session.nav_gen}, frames={frame_count}, '
+						f'error={type(dom_error).__name__}: {dom_error}; using minimal state'
+					)
+					content = SerializedDOMState(_root=None, selector_map={})
 
 			if screenshot_task:
 				try:
@@ -401,6 +437,17 @@ class DOMWatchdog(BaseWatchdog):
 				except Exception as e:
 					self.logger.warning(f'🔍 DOMWatchdog.on_BrowserStateRequestEvent: Clean screenshot failed: {e}')
 					screenshot_b64 = None
+
+			if dom_error and not isinstance(dom_error, DomBuildStaleError):
+				await self.browser_session.persist_failure_snapshot_bundle(
+					reason=f'DOM build failed: {type(dom_error).__name__}: {dom_error}',
+					dom_state=content,
+					screenshot_b64=screenshot_b64,
+				)
+
+			# Attempt low-information recovery if needed
+			if event.include_dom and content:
+				content, screenshot_b64 = await self._maybe_recover_low_info(content, screenshot_b64, event)
 
 			# Add browser-side highlights for user visibility
 			if content and content.selector_map and self.browser_session.browser_profile.dom_highlight_elements:
@@ -537,6 +584,7 @@ class DOMWatchdog(BaseWatchdog):
 		"""Build DOM tree without injecting JavaScript highlights (for parallel execution)."""
 		try:
 			self.logger.debug('🔍 DOMWatchdog._build_dom_tree_without_highlights: STARTING DOM tree build')
+			local_gen = self.browser_session.nav_gen
 
 			# Create or reuse DOM service
 			if self._dom_service is None:
@@ -554,6 +602,7 @@ class DOMWatchdog(BaseWatchdog):
 			start = time.time()
 			self.current_dom_state, self.enhanced_dom_tree, timing_info = await self._dom_service.get_serialized_dom_tree(
 				previous_cached_state=previous_state,
+				nav_gen=local_gen,
 			)
 			end = time.time()
 			total_time_ms = (end - start) * 1000
@@ -661,6 +710,16 @@ class DOMWatchdog(BaseWatchdog):
 			# Skip JavaScript highlighting injection - Python highlighting will be applied later
 			self.logger.debug('🔍 DOMWatchdog._build_dom_tree_without_highlights: ✅ COMPLETED DOM tree build (no JS highlights)')
 			return self.current_dom_state
+
+		except DomBuildStaleError as e:
+			self.logger.debug(
+				f'DOM build stale (nav_gen {e.local_gen}->{e.current_gen}); returning previous state without update'
+			)
+			if previous_state:
+				return previous_state
+			if self.current_dom_state:
+				return self.current_dom_state
+			return SerializedDOMState(_root=None, selector_map={})
 
 		except Exception as e:
 			self.logger.error(f'Failed to build DOM tree without highlights: {e}')
@@ -812,6 +871,124 @@ class DOMWatchdog(BaseWatchdog):
 		)
 
 		return page_info
+
+	def _get_visible_text_length(self, root: EnhancedDOMTreeNode | None, max_chars: int = 5000) -> int:
+		if root is None:
+			return 0
+		total = 0
+		stack = [root]
+		while stack:
+			node = stack.pop()
+			if node.node_type == NodeType.TEXT_NODE:
+				if node.is_visible:
+					text = (node.node_value or '').strip()
+					if text:
+						total += len(text)
+						if total >= max_chars:
+							return total
+			else:
+				if node.children_nodes:
+					stack.extend(node.children_nodes)
+				if node.shadow_roots:
+					stack.extend(node.shadow_roots)
+				if node.content_document:
+					stack.append(node.content_document)
+		return total
+
+	def _is_low_info_snapshot(self, content: SerializedDOMState) -> tuple[bool, int, int]:
+		text_len = self._get_visible_text_length(self.enhanced_dom_tree)
+		interactables = len(content.selector_map) if content and content.selector_map else 0
+		min_text_len = 40
+		min_interactables = 2
+		return text_len < min_text_len and interactables < min_interactables, text_len, interactables
+
+	async def _run_low_info_recovery(self, step: int) -> bool:
+		if step == 0:
+			self.logger.warning('Low-info snapshot: waiting longer for UI stability')
+			stability = await self.browser_session.wait_for_stable_ui(timeout=5.0, quiet_ms=800)
+			return stability.is_stable
+		if step == 1:
+			self.logger.warning('Low-info snapshot: hard reload (ignore cache)')
+			try:
+				cdp_session = await self.browser_session.get_or_create_cdp_session(focus=True)
+				self.browser_session.bump_nav_gen(reason='low_info_reload', target_id=self.browser_session.agent_focus_target_id)
+				await cdp_session.cdp_client.send.Page.reload(
+					params={'ignoreCache': True}, session_id=cdp_session.session_id
+				)
+			except Exception as e:
+				self.logger.warning(f'Low-info reload failed: {type(e).__name__}: {e}')
+				return False
+			stability = await self.browser_session.wait_for_stable_ui(timeout=6.0, quiet_ms=800)
+			return stability.is_stable
+		if step == 2:
+			self.logger.warning('Low-info snapshot: reopening in new tab')
+			try:
+				current_url = await self.browser_session.get_current_page_url()
+				await self.browser_session.navigate_to(current_url, new_tab=True)
+			except Exception as e:
+				self.logger.warning(f'Low-info new tab failed: {type(e).__name__}: {e}')
+				return False
+			stability = await self.browser_session.wait_for_stable_ui(timeout=6.0, quiet_ms=800)
+			return stability.is_stable
+		if step == 3:
+			self.logger.warning('Low-info snapshot: restarting page context')
+			try:
+				current_url = await self.browser_session.get_current_page_url()
+				current_target = self.browser_session.agent_focus_target_id
+				if current_target:
+					await self.browser_session.event_bus.dispatch(CloseTabEvent(target_id=current_target))
+				await self.browser_session.navigate_to(current_url or 'about:blank', new_tab=True)
+			except Exception as e:
+				self.logger.warning(f'Low-info context restart failed: {type(e).__name__}: {e}')
+				return False
+			stability = await self.browser_session.wait_for_stable_ui(timeout=6.0, quiet_ms=800)
+			return stability.is_stable
+		return False
+
+	async def _maybe_recover_low_info(
+		self,
+		content: SerializedDOMState,
+		screenshot_b64: str | None,
+		event: BrowserStateRequestEvent,
+	) -> tuple[SerializedDOMState, str | None]:
+		is_low_info, text_len, interactables = self._is_low_info_snapshot(content)
+		if not is_low_info:
+			self._low_info_counter = 0
+			self._low_info_recovery_step = 0
+			return content, screenshot_b64
+
+		self._low_info_counter += 1
+		self.logger.debug(
+			f'Low-info snapshot detected (count={self._low_info_counter}, text_len={text_len}, interactables={interactables})'
+		)
+		if self._low_info_counter < 3:
+			return content, screenshot_b64
+
+		async with self._low_info_lock:
+			if self._low_info_counter < 3:
+				return content, screenshot_b64
+
+			recovered = await self._run_low_info_recovery(self._low_info_recovery_step)
+			if recovered:
+				self.logger.info('Low-info recovery succeeded, rebuilding state')
+				self._low_info_counter = 0
+				self._low_info_recovery_step = 0
+				previous_state = (
+					self.browser_session._cached_browser_state_summary.dom_state
+					if self.browser_session._cached_browser_state_summary
+					else None
+				)
+				if event.include_dom:
+					content = await self._build_dom_tree_without_highlights(previous_state)
+				if event.include_screenshot:
+					try:
+						screenshot_b64 = await self._capture_clean_screenshot()
+					except Exception:
+						pass
+				return content, screenshot_b64
+
+			self._low_info_recovery_step = min(self._low_info_recovery_step + 1, 3)
+			return content, screenshot_b64
 
 	# ========== Public Helper Methods ==========
 
