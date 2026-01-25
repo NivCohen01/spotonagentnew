@@ -891,6 +891,10 @@ class DOMInteractedElement:
 
 	@classmethod
 	def load_from_enhanced_dom_tree(cls, enhanced_dom_tree: EnhancedDOMTreeNode) -> 'DOMInteractedElement':
+		attributes = dict(enhanced_dom_tree.attributes or {})
+		display_name = (enhanced_dom_tree.get_meaningful_text_for_llm() or '').strip()
+		if display_name:
+			attributes['display_name'] = display_name[:160]
 		return cls(
 			node_id=enhanced_dom_tree.node_id,
 			backend_node_id=enhanced_dom_tree.backend_node_id,
@@ -898,7 +902,7 @@ class DOMInteractedElement:
 			node_type=enhanced_dom_tree.node_type,
 			node_value=enhanced_dom_tree.node_value,
 			node_name=enhanced_dom_tree.node_name,
-			attributes=enhanced_dom_tree.attributes,
+			attributes=attributes or None,
 			bounds=enhanced_dom_tree.snapshot_node.bounds if enhanced_dom_tree.snapshot_node else None,
 			x_path=enhanced_dom_tree.xpath,
 			element_hash=hash(enhanced_dom_tree),

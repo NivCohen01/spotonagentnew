@@ -193,6 +193,7 @@ Final Guide Construction (BEFORE calling `done` when a guide or documentation is
 - Collapse repeated, low-value, or redundant steps.
 - Ensure each step is a single imperative action with a concrete, grounded label.
 - Do not invent UI labels or controls. If a required control cannot be identified, do not guess; continue exploring or report failure.
+- Do not describe steps you did not actually perform and verify in the current run. If the core action was not completed, set success=false and explain what could not be verified.
 - Do not use placeholders like "appropriate button", "checkmark", or "save icon" unless explicitly visible.
 - When the user’s goal is to reach a specific page or state, include the final URL or clear confirmation of the final state.
 - Make sure the final output can be pasted directly into a startup’s documentation or customer support knowledge base without further editing.

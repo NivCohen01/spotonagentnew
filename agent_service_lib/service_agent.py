@@ -244,6 +244,9 @@ async def _generate_final_guide_with_evidence(
         - Form fields and multiple inputs MUST NOT be separate parent steps; they MUST be sub_steps under one parent summary (e.g., "Fill in the form and submit it").
         - Use sub_steps when 3+ micro-actions happen on the same screen (form fills, multiple toggles, multi-click sequences). The parent step description should summarize the cluster; each sub_step is one concrete action.
         - One action per step or sub_step. Do not combine independent actions in a single step.
+        - Never create a parent step with only ONE sub_step. If there is only one action, keep it as a parent step and omit sub_steps.
+        - Do not repeat the same sentence in a parent step and its sub_step. The parent must summarize; the sub_step must be a concrete action.
+        - If the evidence table shows 2+ distinct evidence_ids with screenshots, produce at least 2 top-level steps unless they are truly the same action on the same screen.
         - Be direct: avoid filler ("navigate to", "access"). Prefer: "In the left sidebar, click 'Chat'."
         - Use exact visible UI text in quotes ("Chat", "New message", "Send").
         - For icon-only controls, name the function and add a short hint: "Send (paper-plane icon)".
@@ -256,7 +259,9 @@ async def _generate_final_guide_with_evidence(
         - Banned hedging words/phrases in user-facing text: "usually", "typically", "might", "may", "often", "likely",
           "around", "approximately", "roughly", "or a similar option", "or equivalent", "if needed".
         - Do not use vague placeholders like "appropriate button", "checkmark", "save icon", or "some menu".
-        - If a required control or label is not identifiable from evidence, set success=false and add a short note explaining what could not be verified.
+        - If a required control or label is not identifiable from evidence AND is not present in the draft, set success=false and add a short note explaining what could not be verified.
+        - If evidence labels are generic or low-information (e.g., "button button", "div div[4]"), prefer the draft step text and leave evidence_ids empty rather than dropping the step.
+        - Do not collapse the guide to a single step when the draft contains multiple distinct actions; keep separate steps for distinct actions even if evidence is sparse.
 
         EVIDENCE CONSTRAINTS (HARD RULES)
         - Use ONLY evidence_ids from the provided evidence table. Do not invent IDs.

@@ -632,6 +632,9 @@ def _derive_label(entry: ActionTraceEntry | None) -> str | None:
             return text[:120]
     attrs = entry.element_attributes or {}
     if isinstance(attrs, dict):
+        display_name = attrs.get("display_name")
+        if isinstance(display_name, str) and display_name.strip():
+            return display_name.strip()[:120]
         for key in ("aria-label", "aria_label", "label", "name", "title", "placeholder"):
             val = attrs.get(key)
             if isinstance(val, str) and val.strip():
@@ -791,6 +794,30 @@ def _preferred_action_kind(description: str | None) -> str:
     return "any"
 
 
+def _extract_quoted_labels(description: str | None) -> list[str]:
+    if not description:
+        return []
+    matches = re.findall(r"['\"]([^'\"]{1,80})['\"]", description)
+    labels = [m.strip().lower() for m in matches if m.strip()]
+    return labels
+
+
+def _evidence_label_text(ev: EvidenceEvent) -> str:
+    parts = [
+        ev.label,
+        ev.element_text,
+        ev.element_tag,
+    ]
+    return " ".join([str(p) for p in parts if p]).lower()
+
+
+def _label_matches_tokens(ev: EvidenceEvent, tokens: list[str]) -> bool:
+    if not tokens:
+        return True
+    label_text = _evidence_label_text(ev)
+    return any(tok in label_text for tok in tokens)
+
+
 def _first_screenshot_evidence_id(step: GuideStepWithEvidence, ev_lookup: dict[int, EvidenceEvent]) -> int | None:
     for eid in step.evidence_ids:
         ev = ev_lookup.get(eid)
@@ -861,8 +888,10 @@ def _select_gap_fill_candidate(
     evidence_table: list[EvidenceEvent],
     used: set[int],
     last_screenshot_id: int | None,
+    label_tokens: list[str] | None = None,
 ) -> EvidenceEvent | None:
     # Prefer same-page evidence when a pageUrl is present; otherwise fall back to nearest unused evidence with a screenshot.
+    label_tokens = label_tokens or []
     if not step.pageUrl:
         anchor_ids = [last_screenshot_id] if last_screenshot_id is not None else None
         candidate = _nearest_unused_evidence(
@@ -872,10 +901,17 @@ def _select_gap_fill_candidate(
             evidence_table=evidence_table,
             anchor_ids=anchor_ids,
         )
-        if candidate and candidate.best_image:
+        if candidate and candidate.best_image and _label_matches_tokens(candidate, label_tokens):
             return candidate
-        # If the best nearby evidence lacks a dedicated screenshot, allow it as a last resort
-        # so we still attach something rather than leave the step empty.
+        # If label didn't match, try any matching candidate with a screenshot.
+        matching = [
+            ev
+            for ev in evidence_table
+            if ev.evidence_id not in used and ev.best_image and _label_matches_tokens(ev, label_tokens)
+        ]
+        if matching:
+            return min(matching, key=lambda ev: ev.evidence_id)
+        # If the best nearby evidence lacks a dedicated screenshot, allow it as a last resort.
         return candidate
 
     candidates = [
@@ -886,11 +922,15 @@ def _select_gap_fill_candidate(
 
     preferred_kind = _preferred_action_kind(step.description)
     if preferred_kind == "click":
-        preferred = [ev for ev in candidates if "click" in ev.action_types]
+        preferred = [ev for ev in candidates if "click" in ev.action_types and _label_matches_tokens(ev, label_tokens)]
     elif preferred_kind == "input":
-        preferred = [ev for ev in candidates if any(a in ev.action_types for a in ("input", "type", "send_keys"))]
+        preferred = [
+            ev
+            for ev in candidates
+            if any(a in ev.action_types for a in ("input", "type", "send_keys")) and _label_matches_tokens(ev, label_tokens)
+        ]
     else:
-        preferred = []
+        preferred = [ev for ev in candidates if _label_matches_tokens(ev, label_tokens)]
     pool = preferred or candidates
 
     if last_screenshot_id is None:
@@ -937,8 +977,25 @@ def _post_process_guide_steps(steps: list[Any], evidence_table: list[EvidenceEve
         original_ids_by_idx[idx] = list(step_obj.evidence_ids)
         step_objs.append(step_obj)
 
-    # A) Page-url coherence filter
+    # A) Label-based filter + page-url coherence filter
     for step_obj in step_objs:
+        label_tokens = _extract_quoted_labels(step_obj.description)
+        needs_screenshot = _needs_screenshot(step_obj.description)
+        filtered_by_label: list[int] = []
+        for eid in step_obj.evidence_ids:
+            ev = ev_lookup.get(eid)
+            if not ev:
+                continue
+            if "done" in ev.action_types:
+                continue
+            if needs_screenshot and not ev.best_image:
+                continue
+            if label_tokens and not _label_matches_tokens(ev, label_tokens):
+                continue
+            filtered_by_label.append(eid)
+        if filtered_by_label or label_tokens:
+            step_obj.evidence_ids = filtered_by_label
+
         if not step_obj.pageUrl:
             continue
         before = list(step_obj.evidence_ids)
@@ -1020,6 +1077,7 @@ def _post_process_guide_steps(steps: list[Any], evidence_table: list[EvidenceEve
     # C) Fill missing screenshot evidence
     last_screenshot_id: int | None = None
     for step_obj in step_objs:
+        label_tokens = _extract_quoted_labels(step_obj.description)
         existing_screenshot_id = _first_screenshot_evidence_id(step_obj, ev_lookup)
         if existing_screenshot_id is not None:
             last_screenshot_id = existing_screenshot_id
@@ -1028,7 +1086,7 @@ def _post_process_guide_steps(steps: list[Any], evidence_table: list[EvidenceEve
         if not _needs_screenshot(step_obj.description):
             continue
 
-        candidate = _select_gap_fill_candidate(step_obj, evidence_table, used, last_screenshot_id)
+        candidate = _select_gap_fill_candidate(step_obj, evidence_table, used, last_screenshot_id, label_tokens=label_tokens)
         if candidate:
             step_obj.evidence_ids.append(candidate.evidence_id)
             used.add(candidate.evidence_id)
