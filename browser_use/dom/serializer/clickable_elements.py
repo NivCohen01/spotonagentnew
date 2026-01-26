@@ -179,6 +179,19 @@ class ClickableElementDetector:
 			if node.ax_node.role in interactive_ax_roles:
 				return True
 
+		def _has_pointer_cursor(current: EnhancedDOMTreeNode, max_depth: int = 3) -> bool:
+			depth = 0
+			while current and depth <= max_depth:
+				snapshot = current.snapshot_node
+				if snapshot:
+					if snapshot.cursor_style == 'pointer':
+						return True
+					if snapshot.computed_styles and snapshot.computed_styles.get('cursor') == 'pointer':
+						return True
+				current = current.parent_node
+				depth += 1
+			return False
+
 		# ICON AND SMALL ELEMENT CHECK: Elements that might be icons
 		if (
 			node.snapshot_node
@@ -192,9 +205,11 @@ class ClickableElementDetector:
 				icon_attributes = {'class', 'role', 'onclick', 'data-action', 'aria-label'}
 				if any(attr in node.attributes for attr in icon_attributes):
 					return True
+			if node.attributes and node.attributes.get('role') == 'img' and _has_pointer_cursor(node):
+				return True
 
 		# Final fallback: cursor style indicates interactivity (for cases Chrome missed)
-		if node.snapshot_node and node.snapshot_node.cursor_style and node.snapshot_node.cursor_style == 'pointer':
+		if _has_pointer_cursor(node):
 			return True
 
 		return False

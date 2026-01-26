@@ -31,6 +31,9 @@ DEFAULT_INCLUDE_ATTRIBUTES = [
 	'aria-expanded',
 	'data-state',
 	'aria-checked',
+	'data-testid',
+	'data-test',
+	'data-qa',
 	# ARIA value attributes for datetime/range inputs
 	'aria-valuemin',
 	'aria-valuemax',
