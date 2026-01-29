@@ -4,9 +4,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .playwright_replayer import ReplayProfile, RequiredActionError, replay_trace_to_video
+from .playwright_replayer import HumanizationProfile, ReplayProfile, RequiredActionError, replay_trace_to_video
 from .service_config import RECORDINGS_BASE
-from .service_models import ActionTraceEntry, DeviceType
+from .service_models import ActionTraceEntry, DeviceType, ReplayHumanizationOptions
 
 logger = logging.getLogger("service")
 
@@ -75,6 +75,15 @@ def _sort_entries(entries: list[ActionTraceEntry]) -> list[ActionTraceEntry]:
         return entries
 
 
+def _build_humanization(overrides: Optional[ReplayHumanizationOptions]) -> HumanizationProfile:
+    base = HumanizationProfile()
+    if not overrides:
+        return base
+    data = base.model_dump()
+    data.update(overrides.model_dump(exclude_none=True))
+    return HumanizationProfile.model_validate(data)
+
+
 async def replay_action_trace_to_video(
     session_id: str,
     entries: list[ActionTraceEntry],
@@ -82,6 +91,12 @@ async def replay_action_trace_to_video(
     device_type: DeviceType = "desktop",
     viewport_width: Optional[int] = None,
     viewport_height: Optional[int] = None,
+    video_width: Optional[int] = None,
+    video_height: Optional[int] = None,
+    recording_fps: Optional[int] = None,
+    trim_leading_seconds: Optional[float] = None,
+    trim_before_first_page_load: bool = True,
+    humanization_overrides: Optional[ReplayHumanizationOptions] = None,
     full_entries: Optional[list[ActionTraceEntry]] = None,
     otp_email: Optional[str] = None,
     otp_password: Optional[str] = None,
@@ -104,7 +119,10 @@ async def replay_action_trace_to_video(
         device_type=device_type,
         viewport_width=viewport_width,
         viewport_height=viewport_height,
+        video_width=video_width,
+        video_height=video_height,
     )
+    human = _build_humanization(humanization_overrides)
 
     attempt = 0
     last_error: Optional[Exception] = None
@@ -132,10 +150,14 @@ async def replay_action_trace_to_video(
                 initial_url,
                 output_dir,
                 profile,
+                humanization=human,
                 logger_instance=log,
                 stop_on_required_failure=True,
                 otp_email=otp_email,
                 otp_password=otp_password,
+                recording_fps=recording_fps or 60,
+                trim_leading_seconds=trim_leading_seconds,
+                trim_before_first_page_load=trim_before_first_page_load,
             )
             return mp4_path, applied, skipped
         except RequiredActionError as exc:

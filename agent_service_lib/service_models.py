@@ -112,11 +112,51 @@ class ActionTraceEntry(BaseModel):
     relevance: int = Field(default=1, ge=0, le=1)
 
 
+class ReplayHumanizationOptions(BaseModel):
+    """Optional overrides for replay timing/behavior."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    action_delay: Optional[float] = None
+    action_jitter: Optional[float] = None
+
+    cursor_min_ms: Optional[int] = None
+    cursor_max_ms: Optional[int] = None
+    cursor_steps_min: Optional[int] = None
+    cursor_steps_max: Optional[int] = None
+    cursor_speed_multiplier: Optional[float] = None
+    highlight_ms: Optional[int] = None
+
+    type_delay_ms: Optional[int] = None
+    type_jitter_ms: Optional[int] = None
+    type_speed_multiplier: Optional[float] = None
+    pre_type_pause_range: Optional[tuple[float, float]] = None
+    post_type_pause_range: Optional[tuple[float, float]] = None
+    clear_pause_range: Optional[tuple[float, float]] = None
+
+    post_nav_idle_range: Optional[tuple[float, float]] = None
+    post_idle_range: Optional[tuple[float, float]] = None
+    network_idle_timeout_ms: Optional[int] = None
+    navigation_timeout_ms: Optional[int] = None
+    initial_nav_wait_for_network_idle: Optional[bool] = None
+    initial_nav_ready_pause_range: Optional[tuple[float, float]] = None
+
+    scroll_amount: Optional[int] = None
+
+
 class GenerateVideoRequest(BaseModel):
     """Optional credentials for video replay (OTP / verification links)."""
 
     email: Optional[str] = None
     password: Optional[str] = None
+    video_width: Optional[int] = None
+    video_height: Optional[int] = None
+    recording_fps: Optional[int] = None
+    trim_leading_seconds: Optional[float] = None
+    trim_before_first_page_load: bool = True
+    humanization: Optional[ReplayHumanizationOptions] = None
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class ActionScreenshotOptions(BaseModel):

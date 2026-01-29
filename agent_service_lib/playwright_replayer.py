@@ -5,6 +5,7 @@ import contextlib
 import logging
 import random
 import shutil
+import time
 import uuid
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -55,25 +56,29 @@ class HumanizationProfile(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    action_delay: float = Field(default=0.35)
-    action_jitter: float = Field(default=0.25)
+    action_delay: float = Field(default=0.2)
+    action_jitter: float = Field(default=0.15)
 
-    cursor_min_ms: int = Field(default=450)
-    cursor_max_ms: int = Field(default=650)
-    cursor_steps_min: int = Field(default=18)
-    cursor_steps_max: int = Field(default=34)
-    highlight_ms: int = Field(default=240)
+    cursor_min_ms: int = Field(default=320)
+    cursor_max_ms: int = Field(default=520)
+    cursor_steps_min: int = Field(default=14)
+    cursor_steps_max: int = Field(default=26)
+    cursor_speed_multiplier: float = Field(default=1.15)
+    highlight_ms: int = Field(default=200)
 
-    type_delay_ms: int = Field(default=70)
-    type_jitter_ms: int = Field(default=35)
-    pre_type_pause_range: Tuple[float, float] = Field(default=(0.18, 0.42))
-    post_type_pause_range: Tuple[float, float] = Field(default=(0.22, 0.55))
-    clear_pause_range: Tuple[float, float] = Field(default=(0.10, 0.22))
+    type_delay_ms: int = Field(default=50)
+    type_jitter_ms: int = Field(default=20)
+    type_speed_multiplier: float = Field(default=1.1)
+    pre_type_pause_range: Tuple[float, float] = Field(default=(0.12, 0.28))
+    post_type_pause_range: Tuple[float, float] = Field(default=(0.15, 0.35))
+    clear_pause_range: Tuple[float, float] = Field(default=(0.08, 0.16))
 
-    post_nav_idle_range: Tuple[float, float] = Field(default=(0.6, 1.25))
-    post_idle_range: Tuple[float, float] = Field(default=(0.45, 0.9))
+    post_nav_idle_range: Tuple[float, float] = Field(default=(0.15, 0.35))
+    post_idle_range: Tuple[float, float] = Field(default=(0.15, 0.35))
     network_idle_timeout_ms: int = Field(default=3500)
     navigation_timeout_ms: int = Field(default=12000)
+    initial_nav_wait_for_network_idle: bool = Field(default=True)
+    initial_nav_ready_pause_range: Tuple[float, float] = Field(default=(0.0, 0.12))
 
     scroll_amount: int = Field(default=800)
 
@@ -678,6 +683,20 @@ async def _perform_navigation(page: Page, url: str, human: HumanizationProfile, 
     return url
 
 
+async def _wait_for_initial_ready(page: Page, human: HumanizationProfile, log: logging.Logger) -> None:
+    """Wait until the initial page is fully ready for actions."""
+    with contextlib.suppress(Exception):
+        await page.wait_for_load_state("load", timeout=human.navigation_timeout_ms)
+    if human.initial_nav_wait_for_network_idle:
+        with contextlib.suppress(Exception):
+            await page.wait_for_load_state("networkidle", timeout=human.network_idle_timeout_ms)
+    # Give the browser a beat to paint the final state
+    with contextlib.suppress(Exception):
+        await page.wait_for_timeout(50)
+    await asyncio.sleep(random.uniform(*human.initial_nav_ready_pause_range))
+    await _ensure_cursor_helpers(page)
+
+
 async def _human_type_text(page: Page, text: str, human: HumanizationProfile) -> None:
     for ch in str(text):
         if ch == "\n":
@@ -688,7 +707,8 @@ async def _human_type_text(page: Page, text: str, human: HumanizationProfile) ->
                 await page.keyboard.insert_text(ch)
 
         delay_ms = max(12, human.type_delay_ms + random.randint(-human.type_jitter_ms, human.type_jitter_ms))
-        await asyncio.sleep(delay_ms / 1000.0)
+        speed = max(0.1, float(human.type_speed_multiplier or 1.0))
+        await asyncio.sleep((delay_ms / speed) / 1000.0)
 
 
 async def _move_cursor_to_rect_center(
@@ -700,6 +720,8 @@ async def _move_cursor_to_rect_center(
     cx = float(rect["x"] + rect["width"] / 2)
     cy = float(rect["y"] + rect["height"] / 2)
     duration = random.randint(human.cursor_min_ms, human.cursor_max_ms)
+    speed = max(0.1, float(human.cursor_speed_multiplier or 1.0))
+    duration = max(40, int(duration / speed))
 
     # Visual cursor + real mouse move together
     await asyncio.gather(
@@ -742,6 +764,8 @@ async def _perform_click(
     elif coords:
         cx, cy = coords
         duration = random.randint(human.cursor_min_ms, human.cursor_max_ms)
+        speed = max(0.1, float(human.cursor_speed_multiplier or 1.0))
+        duration = max(40, int(duration / speed))
         await asyncio.gather(
             _animate_cursor(page, cx, cy, duration),
             _human_mouse_move(page, state, cx, cy, duration, human),
@@ -882,6 +906,9 @@ async def replay_trace_to_video(
     stop_on_required_failure: bool = False,
     otp_email: Optional[str] = None,
     otp_password: Optional[str] = None,
+    recording_fps: int = 60,
+    trim_leading_seconds: Optional[float] = None,
+    trim_before_first_page_load: bool = True,
 ) -> tuple[Optional[Path], int, list[str]]:
     """
     Replay an action trace in Playwright Chromium and return (mp4_path, applied_count, skipped_msgs).
@@ -912,6 +939,8 @@ async def replay_trace_to_video(
     skipped: list[str] = []
     mp4_path: Optional[Path] = None
     page_video = None
+    recording_started_at: Optional[float] = None
+    first_nav_done_at: Optional[float] = None
 
     ensure_ffmpeg_available()
 
@@ -943,6 +972,7 @@ async def replay_trace_to_video(
             await context.add_init_script(_CURSOR_HELPER_SCRIPT)
 
             page = await context.new_page()
+            recording_started_at = time.monotonic()
             await _ensure_cursor_helpers(page)
 
             # Initialize state/mouse/cursor to center once
@@ -965,6 +995,8 @@ async def replay_trace_to_video(
             # 1) If initial_url is given, that's the ONLY navigation we do.
             if initial_url:
                 last_url = await _perform_navigation(page, initial_url, human, log)
+                await _wait_for_initial_ready(page, human, log)
+                first_nav_done_at = time.monotonic()
                 did_first_nav = True
                 await _ensure_cursor_helpers(page)
 
@@ -999,6 +1031,9 @@ async def replay_trace_to_video(
                         continue
 
                     last_url = await _perform_navigation(page, str(url), human, log)
+                    if first_nav_done_at is None:
+                        await _wait_for_initial_ready(page, human, log)
+                        first_nav_done_at = time.monotonic()
                     did_first_nav = True
                     applied += 1
                     if last_url is None and stop_on_required_failure and is_required:
@@ -1170,8 +1205,14 @@ async def replay_trace_to_video(
         webm_path = Path(webm_path_str)
         mp4_path = final_mp4
 
+        trim_seconds = None
+        if trim_before_first_page_load and recording_started_at and first_nav_done_at:
+            trim_seconds = max(0.0, first_nav_done_at - recording_started_at)
+        elif trim_leading_seconds is not None:
+            trim_seconds = max(0.0, float(trim_leading_seconds))
+
         try:
-            convert_webm_to_mp4(webm_path, mp4_path)
+            convert_webm_to_mp4(webm_path, mp4_path, fps=recording_fps, trim_start_seconds=trim_seconds)
             log.info("[replay] converted %s -> %s", webm_path, mp4_path)
         except Exception as exc:
             log.error("[replay] ffmpeg conversion failed: %s", exc)

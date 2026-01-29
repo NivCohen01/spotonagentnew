@@ -29,7 +29,8 @@ def convert_webm_to_mp4(
     output_mp4: Path | str,
     *,
     ffmpeg_bin: Optional[str] = None,
-    fps: int = 30,
+    fps: int = 60,
+    trim_start_seconds: Optional[float] = None,
 ) -> Path:
     """Convert a WebM video to MP4 (libx264 + yuv420p) with faststart flags."""
     input_path = Path(input_webm)
@@ -40,25 +41,28 @@ def convert_webm_to_mp4(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg = ensure_ffmpeg_available(ffmpeg_bin)
 
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(input_path),
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-r",
-        str(fps),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        str(output_path),
-    ]
+    cmd = [ffmpeg, "-y"]
+    if trim_start_seconds is not None and trim_start_seconds > 0:
+        cmd.extend(["-ss", f"{trim_start_seconds:.3f}"])
+    cmd.extend(
+        [
+            "-i",
+            str(input_path),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-r",
+            str(fps),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(output_path),
+        ]
+    )
 
     logger.info("[video] ffmpeg command: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, check=False, text=True)

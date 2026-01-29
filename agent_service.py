@@ -235,6 +235,12 @@ async def generate_video(sid: str, req: GenerateVideoRequest | None = None):
 
     otp_email = req.email if req else None
     otp_password = req.password if req else None
+    humanization_overrides = req.humanization if req else None
+    video_width = req.video_width if req else None
+    video_height = req.video_height if req else None
+    recording_fps = req.recording_fps if req else None
+    trim_leading_seconds = req.trim_leading_seconds if req else None
+    trim_before_first_page_load = req.trim_before_first_page_load if req else True
     if sess:
         if not otp_email:
             otp_email = (sess.generated_credentials or {}).get("email") or (sess.user_credentials or {}).get("email")
@@ -249,6 +255,12 @@ async def generate_video(sid: str, req: GenerateVideoRequest | None = None):
             device_type=sess.device_type if sess else "desktop",
             viewport_width=sess.viewport_width if sess else None,
             viewport_height=sess.viewport_height if sess else None,
+            video_width=video_width,
+            video_height=video_height,
+            recording_fps=recording_fps,
+            trim_leading_seconds=trim_leading_seconds,
+            trim_before_first_page_load=trim_before_first_page_load,
+            humanization_overrides=humanization_overrides,
             otp_email=otp_email,
             otp_password=otp_password,
         )
