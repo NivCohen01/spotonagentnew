@@ -57,7 +57,15 @@ from agent_service_lib.service_db import (
     engine,
 )
 from agent_service_lib.service_logging import PerRunDBAndMemoryHandler, RunIdFilter, _hijack_library_loggers
-from agent_service_lib.service_models import GenerateVideoResponse, OptimizeReq, OptimizeResp, ResultPayload, StartReq, Status
+from agent_service_lib.service_models import (
+    GenerateVideoRequest,
+    GenerateVideoResponse,
+    OptimizeReq,
+    OptimizeResp,
+    ResultPayload,
+    StartReq,
+    Status,
+)
 from agent_service_lib.service_optimize import OptimizeAgentPrompt
 from agent_service_lib.service_queue import QueueManager
 from agent_service_lib.service_replay import replay_action_trace_to_video
@@ -203,14 +211,17 @@ async def get_result(sid: str):
 
 
 @app.post("/sessions/{sid}/generate-video", response_model=GenerateVideoResponse, dependencies=[Depends(require_api_key)])
-async def generate_video(sid: str):
+async def generate_video(sid: str, req: GenerateVideoRequest | None = None):
     sess = sessions.get(sid)
     if sess and sess.action_trace:
         trace_entries = sess.action_trace
+        full_entries = sess.action_trace_full or sess.action_trace
     else:
         trace_entries = await db_fetch_action_trace(sid)
+        full_entries = None
 
     if not trace_entries:
+        logger.warning("generate-video: no trace entries found for session %s", sid)
         reason = "session not found" if sess is None else "action_trace not found for session"
         with contextlib.suppress(Exception):
             await db_update_video_filename(sid, "failed")
@@ -222,13 +233,24 @@ async def generate_video(sid: str):
             skipped_actions=[],
         )
 
+    otp_email = req.email if req else None
+    otp_password = req.password if req else None
+    if sess:
+        if not otp_email:
+            otp_email = (sess.generated_credentials or {}).get("email") or (sess.user_credentials or {}).get("email")
+        if not otp_password:
+            otp_password = (sess.generated_credentials or {}).get("password") or (sess.user_credentials or {}).get("password")
+
     try:
         video_path, applied, skipped = await replay_action_trace_to_video(
             sid,
             trace_entries,
+            full_entries=full_entries,
             device_type=sess.device_type if sess else "desktop",
             viewport_width=sess.viewport_width if sess else None,
             viewport_height=sess.viewport_height if sess else None,
+            otp_email=otp_email,
+            otp_password=otp_password,
         )
     except Exception as exc:
         logger.exception("Video generation failed | session_id=%s", sid)
@@ -246,6 +268,7 @@ async def generate_video(sid: str):
     if not video_path:
         with contextlib.suppress(Exception):
             await db_update_video_filename(sid, "failed")
+        logger.warning("generate-video: video generation produced no file for session %s (applied=%s skipped=%s)", sid, applied, skipped)
         return GenerateVideoResponse(
             session_id=sid,
             accepted=True,

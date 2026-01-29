@@ -40,6 +40,27 @@ _COMMON_DUMMY = {
 }
 
 
+def _record_auth_event(sess: Any, event: dict[str, Any]) -> None:
+    events = getattr(sess, "auth_events", None)
+    if events is None:
+        return
+    seen = getattr(sess, "_auth_event_keys", None)
+    if seen is None:
+        seen = set()
+        setattr(sess, "_auth_event_keys", seen)
+    key_parts = [
+        str(event.get("action") or event.get("type") or ""),
+        str(event.get("step") or ""),
+        str(event.get("page_url") or ""),
+        str(event.get("params", {}).get("email") or ""),
+    ]
+    key = "|".join(key_parts)
+    if key in seen:
+        return
+    events.append(event)
+    seen.add(key)
+
+
 async def ensure_signup_mailbox(sess: Any, log: Optional[logging.Logger] = None) -> dict[str, str]:
     """
     Ensure sess.generated_credentials exists. Creates a deterministic pathix mailbox if needed.
@@ -159,6 +180,20 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                             await _send_otp(otp_indices[pos], digit)
 
                     log.info("OTP auto-fill completed for %s on %s", allowed_email, current_url or "<unknown>")
+                    _record_auth_event(
+                        sess,
+                        {
+                            "action": "otp",
+                            "step": getattr(sess, "current_step", None),
+                            "page_url": current_url,
+                            "params": {
+                                "email": allowed_email,
+                                "since_ts": since_ts.isoformat() if isinstance(since_ts, dt.datetime) else None,
+                                "digits": len(code),
+                            },
+                            "ts": int(dt.datetime.utcnow().timestamp() * 1000),
+                        },
+                    )
 
         if "fetch_mailbox_verification_link" in action_data and browser_session:
             current_url = ""
@@ -200,6 +235,19 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
 
             redacted_link = _redact_url(pending_url)
             log.info("Opened verification link: %s", redacted_link)
+            _record_auth_event(
+                sess,
+                {
+                    "action": "verification_link",
+                    "step": getattr(sess, "current_step", None),
+                    "page_url": current_url,
+                    "params": {
+                        "email": allowed_email,
+                        "since_ts": (getattr(sess, "generated_credentials_created_at", None) or dt.datetime.utcnow()).isoformat(),
+                    },
+                    "ts": int(dt.datetime.utcnow().timestamp() * 1000),
+                },
+            )
             return ActionResult(
                 extracted_content="Opened verification link.",
                 long_term_memory="Opened verification link from mailbox.",
@@ -288,6 +336,19 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
 
                     redacted_link = _redact_url(pending_url)
                     log.info("Opened verification link for %s: %s", target_email, redacted_link)
+                    _record_auth_event(
+                        sess,
+                        {
+                            "action": "verification_link",
+                            "step": getattr(sess, "current_step", None),
+                            "page_url": current_url,
+                            "params": {
+                                "email": target_email,
+                                "since_ts": (getattr(sess, "generated_credentials_created_at", None) or dt.datetime.utcnow()).isoformat(),
+                            },
+                            "ts": int(dt.datetime.utcnow().timestamp() * 1000),
+                        },
+                    )
                     return ActionResult(
                         extracted_content="Opened verification link.",
                         long_term_memory="Opened verification link from mailbox.",
@@ -331,6 +392,9 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
 
                 if target_email and target_email.endswith(f"@{DEFAULT_DOMAIN}"):
                     log.info("OTP fields detected %s; attempting auto-fill using %s", otp_indices, target_email)
+                    current_url = ""
+                    with contextlib.suppress(Exception):
+                        current_url = await browser_session.get_current_page_url()
                     password_candidates = _candidate_mailbox_passwords(sess, target_email, allowed_password)
                     mailbox_password = password_candidates[0] if password_candidates else None
                     if not mailbox_password:
@@ -366,6 +430,20 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                                 break
                             await _send_otp_text(otp_indices[pos], digit)
                     log.info("OTP auto-fill completed for %s", target_email)
+                    _record_auth_event(
+                        sess,
+                        {
+                            "action": "otp",
+                            "step": getattr(sess, "current_step", None),
+                            "page_url": current_url,
+                            "params": {
+                                "email": target_email,
+                                "since_ts": since_ts.isoformat() if isinstance(since_ts, dt.datetime) else None,
+                                "digits": len(code),
+                            },
+                            "ts": int(dt.datetime.utcnow().timestamp() * 1000),
+                        },
+                    )
                 else:
                     return ActionResult(error="OTP required; cannot continue automatically.")
 

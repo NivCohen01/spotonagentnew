@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from browser_use.tools.registry.views import ActionModel
 
 
-def _draw_solid_rect(draw: ImageDraw.ImageDraw, bbox: tuple[int, int, int, int], color: str = '#FF3B30', width: int = 3) -> None:
+def _draw_solid_rect(draw: ImageDraw.ImageDraw, bbox: tuple[int, int, int, int], color: str = '#FF3B30', width: int = 4) -> None:
     x1, y1, x2, y2 = bbox
     for offset in range(width):
         draw.rectangle([x1 - offset, y1 - offset, x2 + offset, y2 + offset], outline=color, width=1)
@@ -34,6 +34,7 @@ def _draw_short_arrow(
     shaft: int = 28,
     head: int = 10,
     offset: int = 12,
+    line_width: int = 5,
 ) -> None:
     """Draw an unobtrusive arrow pointing toward the interacted element."""
 
@@ -45,11 +46,11 @@ def _draw_short_arrow(
     end_x = target_x - offset
     end_y = target_y + offset
 
-    draw.line([(start_x, start_y), (end_x, end_y)], fill=color, width=3)
+    draw.line([(start_x, start_y), (end_x, end_y)], fill=color, width=line_width)
     angle = math.atan2(end_y - start_y, end_x - start_x)
     left = (end_x - head * math.cos(angle - math.pi / 6), end_y - head * math.sin(angle - math.pi / 6))
     right = (end_x - head * math.cos(angle + math.pi / 6), end_y - head * math.sin(angle + math.pi / 6))
-    draw.line([left, (end_x, end_y), right], fill=color, width=3)
+    draw.line([left, (end_x, end_y), right], fill=color, width=line_width)
 
 
 def _apply_spotlight(img: Image.Image, bbox: tuple[int, int, int, int], pad: int = 12, opacity: int = 230) -> None:

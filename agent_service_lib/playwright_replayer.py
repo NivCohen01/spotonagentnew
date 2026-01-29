@@ -6,6 +6,7 @@ import logging
 import random
 import shutil
 import uuid
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -29,10 +30,21 @@ from browser_use.browser.video_recorder import convert_webm_to_mp4, ensure_ffmpe
 
 from .service_config import CHROME_BIN, MAX_CHROME_CONCURRENCY
 from .service_models import ActionTraceEntry, DeviceType
+from .mailbox_service import DEFAULT_DOMAIN, compute_password, fetch_latest_otp_imap, fetch_recent_messages_imap
+from .service_agent_auth_utils import _select_verification_link
 
 logger = logging.getLogger("service")
 
 _CHROME_SEMAPHORE = asyncio.Semaphore(MAX_CHROME_CONCURRENCY)
+
+
+class RequiredActionError(RuntimeError):
+    def __init__(self, order: int, step: int, action: str, reason: str):
+        super().__init__(f"Required action failed (order={order}, step={step}, action={action}): {reason}")
+        self.order = order
+        self.step = step
+        self.action = action
+        self.reason = reason
 
 
 # -------------------------------------------------------------------
@@ -249,6 +261,51 @@ def _resolve_viewport(profile: ReplayProfile) -> dict:
     return {"width": 1920, "height": 1080}
 
 
+def _normalize_url_for_match(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return None
+    if not parts.scheme or not parts.netloc:
+        return None
+    path = parts.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    return f"{parts.scheme}://{parts.netloc}{path}"
+
+
+def _find_resume_index(entries: list[ActionTraceEntry], current_url: Optional[str], start_index: int) -> Optional[int]:
+    """Find the next entry index whose page_url matches the current page URL."""
+    current_norm = _normalize_url_for_match(current_url)
+    if not current_norm:
+        return None
+    for idx in range(start_index + 1, len(entries)):
+        entry = entries[idx]
+        candidate_url = entry.page_url
+        if not candidate_url and entry.action == "navigate" and isinstance(entry.params, dict):
+            candidate_url = entry.params.get("url")
+        candidate_norm = _normalize_url_for_match(candidate_url)
+        if candidate_norm and candidate_norm == current_norm:
+            return idx
+    return None
+
+
+def _entry_page_matches(current_url: Optional[str], entry: ActionTraceEntry) -> bool:
+    """Check whether the current page URL matches the entry's intended page."""
+    current_norm = _normalize_url_for_match(current_url)
+    if not current_norm:
+        return False
+    candidate_url = entry.page_url
+    if not candidate_url and entry.action == "navigate" and isinstance(entry.params, dict):
+        candidate_url = entry.params.get("url")
+    candidate_norm = _normalize_url_for_match(candidate_url)
+    if not candidate_norm:
+        return False
+    return candidate_norm == current_norm
+
+
 def _resolve_video_size(profile: ReplayProfile, viewport: dict) -> dict:
     width = int(profile.video_width or viewport["width"])
     height = int(profile.video_height or viewport["height"])
@@ -302,6 +359,99 @@ def _candidate_text(entry: ActionTraceEntry) -> Optional[str]:
     if isinstance(text, str) and text.strip():
         return text.strip()
     return None
+
+
+def _parse_since_ts(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _resolve_mailbox_password(email: Optional[str], provided: Optional[str]) -> Optional[str]:
+    if provided:
+        return provided
+    if not email:
+        return None
+    if email.lower().endswith(f"@{DEFAULT_DOMAIN}"):
+        try:
+            return compute_password(email)
+        except Exception:
+            return None
+    return None
+
+
+async def _fetch_verification_link(email: str, password: str, current_url: str, since_ts: Optional[datetime]) -> Optional[str]:
+    try:
+        messages = await fetch_recent_messages_imap(
+            email,
+            password,
+            since_ts or (datetime.utcnow() - timedelta(minutes=10)),
+            attempts=18,
+            interval=10,
+        )
+    except Exception:
+        return None
+    if not messages:
+        return None
+
+    target_domain = ""
+    try:
+        target_domain = urlsplit(current_url or "").netloc
+    except Exception:
+        target_domain = ""
+
+    try:
+        selection = await _select_verification_link(target_domain, current_url, messages)
+    except Exception:
+        return None
+    return selection.url
+
+
+async def _find_otp_inputs(page: Page) -> list[Locator]:
+    selectors = [
+        "input[autocomplete='one-time-code']",
+        "input[inputmode='numeric']",
+        "input[type='tel']",
+        "input[type='number']",
+        "input[name*='otp' i]",
+        "input[name*='code' i]",
+    ]
+    locator = page.locator(",".join(selectors))
+    count = await locator.count()
+    inputs: list[Locator] = []
+    for i in range(count):
+        item = locator.nth(i)
+        with contextlib.suppress(Exception):
+            if await item.is_visible():
+                inputs.append(item)
+    return inputs
+
+
+async def _fill_otp_inputs(page: Page, code: str, human: HumanizationProfile) -> bool:
+    inputs = await _find_otp_inputs(page)
+    if not inputs:
+        return False
+
+    if len(inputs) == 1:
+        with contextlib.suppress(Exception):
+            await inputs[0].click(timeout=2000)
+            await asyncio.sleep(random.uniform(*human.pre_type_pause_range))
+        await _human_type_text(page, code, human)
+        await asyncio.sleep(random.uniform(*human.post_type_pause_range))
+        return True
+
+    for i, digit in enumerate(code):
+        if i >= len(inputs):
+            break
+        with contextlib.suppress(Exception):
+            await inputs[i].fill(str(digit))
+    await asyncio.sleep(random.uniform(*human.post_type_pause_range))
+    return True
 
 
 async def _ensure_cursor_helpers(page: Page) -> None:
@@ -606,6 +756,39 @@ async def _perform_click(
     return True, new_url
 
 
+async def _find_fallback_locator(page: Page, entry: ActionTraceEntry) -> Optional[Locator]:
+    """Best-effort locator if original selector/index is missing."""
+    params = entry.params or {}
+    text = params.get("text") or entry.value or ""
+
+    # Password candidate
+    if text and isinstance(text, str) and len(text) >= 6:
+        candidate = page.locator("input[type='password']")
+        try:
+            if await candidate.count() > 0:
+                return candidate.nth(0)
+        except Exception:
+            pass
+
+    # Email candidate
+    if text and isinstance(text, str) and "@" in text:
+        candidate = page.locator("input[type='email'], input[autocomplete='username']")
+        try:
+            if await candidate.count() > 0:
+                return candidate.nth(0)
+        except Exception:
+            pass
+
+    # Generic text field
+    candidate = page.locator("input, textarea")
+    try:
+        if await candidate.count() > 0:
+            return candidate.nth(0)
+    except Exception:
+        pass
+    return None
+
+
 async def _perform_type_like(
     page: Page,
     state: ReplayState,
@@ -617,7 +800,9 @@ async def _perform_type_like(
     await _ensure_cursor_helpers(page)
     locator = await _resolve_locator(page, entry, log)
     if not locator:
-        return False, previous_url
+        locator = await _find_fallback_locator(page, entry)
+        if not locator:
+            return False, previous_url
 
     with contextlib.suppress(Exception):
         await locator.scroll_into_view_if_needed(timeout=5000)
@@ -694,6 +879,9 @@ async def replay_trace_to_video(
     *,
     humanization: Optional[HumanizationProfile] = None,
     logger_instance: Optional[logging.Logger] = None,
+    stop_on_required_failure: bool = False,
+    otp_email: Optional[str] = None,
+    otp_password: Optional[str] = None,
 ) -> tuple[Optional[Path], int, list[str]]:
     """
     Replay an action trace in Playwright Chromium and return (mp4_path, applied_count, skipped_msgs).
@@ -772,6 +960,7 @@ async def replay_trace_to_video(
 
             last_url: Optional[str] = None
             did_first_nav = False
+            verification_done = False
 
             # 1) If initial_url is given, that's the ONLY navigation we do.
             if initial_url:
@@ -783,9 +972,14 @@ async def replay_trace_to_video(
             while i < len(entries):
                 entry = entries[i]
                 action = (entry.action or "").lower()
+                is_required = int(getattr(entry, "relevance", 1) or 1) == 1
 
                 log.info("[replay] action=%s step=%s order=%s page=%s", entry.action, entry.step, entry.order, entry.page_url)
                 await _ensure_cursor_helpers(page)
+
+                current_url = None
+                with contextlib.suppress(Exception):
+                    current_url = page.url
 
                 # 2) If no initial_url, allow exactly ONE 'navigate' from trace (the first one), skip the rest.
                 if action == "navigate":
@@ -807,27 +1001,122 @@ async def replay_trace_to_video(
                     last_url = await _perform_navigation(page, str(url), human, log)
                     did_first_nav = True
                     applied += 1
+                    if last_url is None and stop_on_required_failure and is_required:
+                        raise RequiredActionError(entry.order or 0, entry.step, entry.action, "navigation failed")
                     await asyncio.sleep(_human_sleep(human))
                     i += 1
                     continue
 
                 # 3) Click
                 if action == "click":
+                    if entry.page_url and not _entry_page_matches(current_url, entry):
+                        resume_index = _find_resume_index(entries, current_url, i)
+                        if resume_index is not None:
+                            skipped.append(
+                                f"click (step {entry.step}): page mismatch; jumping ahead to index {resume_index} (at {current_url})"
+                            )
+                            i = resume_index
+                            continue
                     ok, last_url = await _perform_click(page, state, entry, human, last_url, log)
                     if ok:
                         applied += 1
                     else:
+                        resume_index = _find_resume_index(entries, current_url, i)
+                        if resume_index is not None:
+                            skipped.append(
+                                f"click (step {entry.step}): failed; jumping ahead to index {resume_index} (already at {current_url})"
+                            )
+                            i = resume_index
+                            continue
                         skipped.append(f"click (step {entry.step}): locator/coords not found or click failed")
+                        if stop_on_required_failure and is_required:
+                            raise RequiredActionError(entry.order or 0, entry.step, entry.action, "click failed")
                     i += 1
                     continue
 
                 # 4) Type OR Input (same mechanics)
                 if action in ("type", "input"):
+                    if entry.page_url and not _entry_page_matches(current_url, entry):
+                        resume_index = _find_resume_index(entries, current_url, i)
+                        if resume_index is not None:
+                            skipped.append(
+                                f"{action} (step {entry.step}): page mismatch; jumping ahead to index {resume_index} (at {current_url})"
+                            )
+                            i = resume_index
+                            continue
                     ok, last_url = await _perform_type_like(page, state, entry, human, last_url, log)
                     if ok:
                         applied += 1
                     else:
-                        skipped.append(f"{action} (step {entry.step}): locator not found or typing failed")
+                        # If verification is already complete, we can safely treat a missing locator as a no-op to keep the video flowing.
+                        if verification_done:
+                            log.info("[replay/type] locator missing after verification; treating as no-op")
+                            await asyncio.sleep(random.uniform(*human.post_idle_range))
+                            applied += 1
+                        else:
+                            resume_index = _find_resume_index(entries, current_url, i)
+                            if resume_index is not None:
+                                skipped.append(
+                                    f"{action} (step {entry.step}): failed; jumping ahead to index {resume_index} (already at {current_url})"
+                                )
+                                i = resume_index
+                                continue
+                            skipped.append(f"{action} (step {entry.step}): locator not found or typing failed")
+                            if stop_on_required_failure and is_required:
+                                raise RequiredActionError(entry.order or 0, entry.step, entry.action, "type failed")
+                    i += 1
+                    continue
+
+                # 4.5) OTP / Verification link
+                if action in ("otp", "verification_link"):
+                    params = entry.params or {}
+                    email = params.get("email") or otp_email
+                    password = _resolve_mailbox_password(email, otp_password)
+                    since_ts = _parse_since_ts(params.get("since_ts"))
+
+                    if not email or not password:
+                        skipped.append(f"{action} (step {entry.step}): missing credentials")
+                        i += 1
+                        continue
+
+                    if action == "otp":
+                        try:
+                            code = await fetch_latest_otp_imap(
+                                str(email),
+                                str(password),
+                                since_ts or (datetime.utcnow() - timedelta(minutes=10)),
+                                attempts=18,
+                                interval=10,
+                            )
+                        except Exception:
+                            skipped.append(f"otp (step {entry.step}): otp fetch failed")
+                            i += 1
+                            continue
+                        if not code:
+                            skipped.append(f"otp (step {entry.step}): otp not received")
+                            i += 1
+                            continue
+                        filled = await _fill_otp_inputs(page, str(code), human)
+                        if not filled:
+                            skipped.append(f"otp (step {entry.step}): otp fields not found")
+                            if stop_on_required_failure and is_required:
+                                raise RequiredActionError(entry.order or 0, entry.step, entry.action, "otp fields not found")
+                        else:
+                            applied += 1
+                        i += 1
+                        continue
+
+                    link = await _fetch_verification_link(str(email), str(password), page.url, since_ts)
+                    if not link:
+                        skipped.append(f"verification_link (step {entry.step}): link not found")
+                        i += 1
+                        continue
+                    last_url = await _perform_navigation(page, link, human, log)
+                    if last_url is None and stop_on_required_failure and is_required:
+                        raise RequiredActionError(entry.order or 0, entry.step, entry.action, "verification link nav failed")
+                    applied += 1
+                    verification_done = True
+                    await asyncio.sleep(_human_sleep(human))
                     i += 1
                     continue
 

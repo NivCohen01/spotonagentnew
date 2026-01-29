@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 GUIDE_SCHEMA_VERSION = "v2"
 
+logger = logging.getLogger("service")
+
 engine = create_async_engine(DB_URL, pool_pre_ping=True) if DB_URL else None
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False) if engine else None
 
@@ -612,6 +614,7 @@ async def db_finish_run(sess: "Session"):
 async def db_fetch_action_trace(session_id: str) -> list[ActionTraceEntry]:
     """Fetch and parse the stored action_trace summary from guides.description for a run."""
     if not SessionLocal:
+        logger.warning("db_fetch_action_trace: SessionLocal is None; DB_URL missing?")
         return []
 
     async with SessionLocal() as db:
@@ -621,25 +624,73 @@ async def db_fetch_action_trace(session_id: str) -> list[ActionTraceEntry]:
         )
         description = row.scalar()
 
-    if not description:
-        return []
-
-    if isinstance(description, (bytes, bytearray)):
-        with contextlib.suppress(Exception):
-            description = description.decode("utf-8", errors="ignore")
-
     desc_obj = None
-    if isinstance(description, str):
-        with contextlib.suppress(Exception):
-            desc_obj = json.loads(description)
-    elif isinstance(description, dict):
-        desc_obj = description
+    if description:
+        if isinstance(description, (bytes, bytearray)):
+            with contextlib.suppress(Exception):
+                description = description.decode("utf-8", errors="ignore")
 
-    if not isinstance(desc_obj, dict):
-        return []
+        if isinstance(description, str):
+            try:
+                desc_obj = json.loads(description)
+            except Exception as exc:
+                logging.getLogger("service").warning("db_fetch_action_trace: json parse failed for session %s: %r", session_id, exc)
+                desc_obj = None
+        elif isinstance(description, dict):
+            desc_obj = description
+    else:
+        logger.warning("db_fetch_action_trace: no guide description found for run_id=%s", session_id)
 
-    trace = desc_obj.get("action_trace") or desc_obj.get("actionTrace")
-    return _flatten_action_trace_summary(trace)
+    def _entries_from_obj(obj: Any) -> list[ActionTraceEntry]:
+        if not isinstance(obj, dict):
+            return []
+        full = obj.get("action_trace_full") or obj.get("actionTraceFull")
+        if isinstance(full, list):
+            entries: list[ActionTraceEntry] = []
+            for item in full:
+                if not isinstance(item, dict):
+                    continue
+                with contextlib.suppress(Exception):
+                    entries.append(ActionTraceEntry.model_validate(item))
+            if entries:
+                return entries
+        trace = obj.get("action_trace") or obj.get("actionTrace")
+        return _flatten_action_trace_summary(trace)
+
+    entries = _entries_from_obj(desc_obj)
+    if entries:
+        return entries
+
+    # Fallback: try runs.result or runs.final_response
+    async with SessionLocal() as db:
+        row = await db.execute(
+            text("SELECT result, final_response FROM runs WHERE id=:run_id LIMIT 1"),
+            {"run_id": session_id},
+        )
+        run_row = row.fetchone()
+
+    if run_row:
+        mapping = run_row._mapping if hasattr(run_row, "_mapping") else {}
+        for col in ("result", "final_response"):
+            payload = mapping.get(col)
+            if not payload:
+                continue
+            if isinstance(payload, (bytes, bytearray)):
+                with contextlib.suppress(Exception):
+                    payload = payload.decode("utf-8", errors="ignore")
+            obj = None
+            if isinstance(payload, str):
+                with contextlib.suppress(Exception):
+                    obj = json.loads(payload)
+            elif isinstance(payload, dict):
+                obj = payload
+            entries = _entries_from_obj(obj)
+            if entries:
+                logger.info("db_fetch_action_trace: loaded trace from runs.%s for run_id=%s", col, session_id)
+                return entries
+
+    logger.warning("db_fetch_action_trace: no trace found for run_id=%s", session_id)
+    return []
 
 
 async def db_create_empty_guide(sess: "Session") -> None:

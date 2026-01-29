@@ -376,6 +376,7 @@ def _summarize_action_trace(entries: list[ActionTraceEntry]) -> dict[str, Any]:
             "page_url": entry.page_url,
             "element_text": entry.element_text,
             "element_tag": entry.element_tag,
+            "relevance": entry.relevance,
         }
         if entry.params:
             packed["params"] = entry.params
@@ -417,6 +418,7 @@ def _flatten_action_trace_summary(trace: Any) -> list[ActionTraceEntry]:
                         element_text=item.get("element_text"),
                         element_tag=item.get("element_tag"),
                         params=params,
+                        relevance=int(item.get("relevance", 1) or 1),
                     )
                 )
             except Exception:
@@ -424,6 +426,75 @@ def _flatten_action_trace_summary(trace: Any) -> list[ActionTraceEntry]:
 
     entries.sort(key=lambda e: (e.step, e.order))
     return entries
+
+
+def _apply_relevance_labels(entries: list[ActionTraceEntry], labels: list[int]) -> None:
+    """Apply relevance labels (0/1) to action trace entries in order."""
+    if not entries:
+        return
+    if len(labels) != len(entries):
+        logger.warning("Relevance label count mismatch: %s labels for %s entries", len(labels), len(entries))
+        return
+    for entry, label in zip(entries, labels):
+        entry.relevance = 1 if int(label or 0) else 0
+        if entry.action in ("otp", "verification_link"):
+            entry.relevance = 1
+
+
+def _filter_relevant_actions(entries: list[ActionTraceEntry]) -> list[ActionTraceEntry]:
+    """Return only relevance=1 entries in original order."""
+    return [entry for entry in entries if int(getattr(entry, "relevance", 1) or 1) == 1]
+
+
+def _inject_auth_events(entries: list[ActionTraceEntry], auth_events: list[dict[str, Any]] | None) -> list[ActionTraceEntry]:
+    """Insert OTP / verification events into the action trace near their step."""
+    if not auth_events:
+        return entries
+
+    events_by_step: dict[int, list[dict[str, Any]]] = {}
+    for ev in auth_events:
+        try:
+            step_val = int(ev.get("step") or 0)
+        except Exception:
+            step_val = 0
+        events_by_step.setdefault(step_val, []).append(ev)
+
+    entries_by_step: dict[int, list[ActionTraceEntry]] = {}
+    for entry in entries:
+        entries_by_step.setdefault(int(entry.step), []).append(entry)
+
+    all_steps = sorted(set(entries_by_step.keys()) | set(events_by_step.keys()))
+    new_entries: list[ActionTraceEntry] = []
+    order = 1
+
+    for step_id in all_steps:
+        step_events = sorted(events_by_step.get(step_id, []), key=lambda e: e.get("ts") or 0)
+        for ev in step_events:
+            action = str(ev.get("action") or ev.get("type") or "otp")
+            params = ev.get("params") if isinstance(ev.get("params"), dict) else {}
+            new_entries.append(
+                ActionTraceEntry(
+                    step=step_id,
+                    order=order,
+                    action=action,
+                    value=ev.get("value"),
+                    page_url=ev.get("page_url"),
+                    xpath=ev.get("xpath"),
+                    element_text=ev.get("element_text"),
+                    element_tag=ev.get("element_tag"),
+                    params=params,
+                    relevance=1,
+                )
+            )
+            order += 1
+
+        step_actions = sorted(entries_by_step.get(step_id, []), key=lambda e: e.order)
+        for entry in step_actions:
+            entry.order = order
+            new_entries.append(entry)
+            order += 1
+
+    return new_entries
 
 
 def _parse_image_from_filename(p: Path) -> EvidenceImage | None:

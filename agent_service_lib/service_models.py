@@ -109,6 +109,14 @@ class ActionTraceEntry(BaseModel):
     element_tag: Optional[str] = None
     element_attributes: Optional[dict[str, Any]] = None
     params: dict[str, Any] = Field(default_factory=dict)
+    relevance: int = Field(default=1, ge=0, le=1)
+
+
+class GenerateVideoRequest(BaseModel):
+    """Optional credentials for video replay (OTP / verification links)."""
+
+    email: Optional[str] = None
+    password: Optional[str] = None
 
 
 class ActionScreenshotOptions(BaseModel):

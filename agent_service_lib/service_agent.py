@@ -47,16 +47,20 @@ from .service_models import (
     StartReq,
 )
 from .service_trace import (
+    _apply_relevance_labels,
     _attach_images_by_evidence,
     _build_evidence_table,
     _build_action_trace,
     _coerce_guide_output_dict,
     _ensure_json_text,
+    _filter_relevant_actions,
     _format_evidence_table,
     _discover_screenshots,
+    _inject_auth_events,
     _shape_steps_with_placeholders,
     _summarize_action_trace,
 )
+import json
 
 
 _SUBMIT_TERMS: tuple[str, ...] = ()
@@ -161,6 +165,114 @@ def _draft_steps_to_text(draft_steps: list[Any]) -> str:
             lines.append("... truncated ...")
             break
     return "\n".join(lines)
+
+
+class TraceRelevanceLabels(BaseModel):
+    labels: list[int]
+
+
+def _flatten_guide_steps(guide: GuideOutputWithEvidence | dict | None) -> list[str]:
+    if not guide:
+        return []
+    try:
+        guide_dict = guide.model_dump() if isinstance(guide, GuideOutputWithEvidence) else dict(guide)
+    except Exception:
+        return []
+    steps = guide_dict.get("steps") or []
+    flat: list[str] = []
+    for step in steps:
+        if isinstance(step, dict):
+            desc = step.get("description") or step.get("text") or step.get("title")
+        else:
+            desc = str(step)
+        if desc:
+            flat.append(str(desc))
+    return flat
+
+
+def _summarize_action_for_rank(entry: ActionTraceEntry) -> dict[str, Any]:
+    payload = {
+        "order": entry.order,
+        "step": entry.step,
+        "action": entry.action,
+        "value": entry.value,
+        "page_url": entry.page_url,
+        "element_text": entry.element_text,
+        "element_tag": entry.element_tag,
+    }
+    if entry.params:
+        # keep params small and JSON-safe
+        compact = {}
+        for key, value in entry.params.items():
+            if value is None:
+                continue
+            text = str(value)
+            compact[key] = text[:120]
+        if compact:
+            payload["params"] = compact
+    return payload
+
+
+async def _rank_action_trace(
+    entries: list[ActionTraceEntry],
+    *,
+    task: str,
+    guide: GuideOutputWithEvidence | dict | None,
+    llm: ChatOpenAI,
+    batch_size: int = 35,
+) -> list[int]:
+    if not entries:
+        return []
+
+    guide_steps = _flatten_guide_steps(guide)
+    labels: list[int] = []
+    system_text = dedent(
+        """
+        You label whether each action was relevant to reaching the final goal.
+
+        Rules:
+        - Return STRICT JSON only.
+        - "labels" must be a list of 0/1 with the same length as the input actions.
+        - If unsure, use 1 (relevant) to avoid removing required steps.
+        - Consider the task and final guide steps to decide which actions were actually needed.
+        """
+    ).strip()
+
+    for start in range(0, len(entries), batch_size):
+        batch = entries[start : start + batch_size]
+        actions_payload = [_summarize_action_for_rank(e) for e in batch]
+        user_text = json.dumps(
+            {
+                "task": task,
+                "final_guide_steps": guide_steps,
+                "actions": actions_payload,
+            },
+            ensure_ascii=False,
+        )
+        try:
+            result = await llm.ainvoke(
+                [
+                    SystemMessage(content=[ContentPartTextParam(text=system_text)]),
+                    UserMessage(content=[ContentPartTextParam(text=user_text)]),
+                ],
+                output_format=TraceRelevanceLabels,
+            )
+            batch_labels = list(result.completion.labels or [])
+        except Exception as exc:
+            logging.getLogger("service").warning("Trace relevance ranking failed; defaulting to 1s | %r", exc)
+            batch_labels = [1] * len(batch)
+
+        if len(batch_labels) != len(batch):
+            logging.getLogger("service").warning(
+                "Trace relevance label count mismatch (got %s, expected %s). Defaulting to 1s.",
+                len(batch_labels),
+                len(batch),
+            )
+            batch_labels = [1] * len(batch)
+
+        labels.extend([1 if int(val or 0) else 0 for val in batch_labels])
+
+    return labels
 
 
 def _fallback_guide_from_evidence(task: str, draft: dict | None, evidence_table: list[EvidenceEvent]) -> GuideOutputWithEvidence:
@@ -480,6 +592,11 @@ class Session:
         self.result_only: Optional[str] = None
         self.action_trace: Optional[list[ActionTraceEntry]] = None
         self.action_trace_summary: Optional[dict[str, Any]] = None
+        self.action_trace_full: Optional[list[ActionTraceEntry]] = None
+        self.auth_events: list[dict[str, Any]] = []
+        self._auth_event_keys: set[str] = set()
+        self.current_step: Optional[int] = None
+        self.current_url: Optional[str] = None
         self.error: Optional[str] = None
 
         self.screenshots_dir: Path = SCREENSHOTS_BASE / self.id / "images"
@@ -739,6 +856,11 @@ async def run_session(sess: Session):
             )
 
         agent_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "generation", token_cost, guide_id_for_run)
+
+        def _update_step_context(browser_state_summary, _model_output, step_number: int):
+            sess.current_step = int(step_number)
+            sess.current_url = getattr(browser_state_summary, "url", None) if browser_state_summary else None
+
         agent = Agent(
             llm=agent_llm,
             tools=tools,
@@ -764,6 +886,7 @@ async def run_session(sess: Session):
             device_type=sess.device_type,
             viewport_width=sess.viewport_width,
             viewport_height=sess.viewport_height,
+            register_new_step_callback=_update_step_context,
         )
 
         sess.state = "running"
@@ -778,8 +901,9 @@ async def run_session(sess: Session):
         if usage_summary is not None:
             history_payload["usage"] = usage_summary
 
-        sess.action_trace = _build_action_trace(result)
-        sess.action_trace_summary = _summarize_action_trace(sess.action_trace) if sess.action_trace else None
+        full_trace = _build_action_trace(result)
+        full_trace = _inject_auth_events(full_trace, sess.auth_events)
+        sess.action_trace_full = full_trace
 
         sess.final_response = _ensure_json_text(history_payload)
 
@@ -789,7 +913,7 @@ async def run_session(sess: Session):
             with contextlib.suppress(Exception):
                 evidence_images = _discover_screenshots(sess.screenshots_dir)
         with contextlib.suppress(Exception):
-            evidence_table = _build_evidence_table(sess.action_trace or [], evidence_images)
+            evidence_table = _build_evidence_table(full_trace or [], evidence_images)
 
         if evidence_table:
             log.info("Evidence table:\n%s", _format_evidence_table(evidence_table))
@@ -817,6 +941,14 @@ async def run_session(sess: Session):
             include_auth=bool(sess.intent.include_auth_in_final_guide) if sess.intent else False,
         )
 
+        rank_llm = _wrap_llm_with_logging(
+            ChatOpenAI(model=OPENAI_MODEL, temperature=0), sess, "trace_ranking", token_cost, guide_id_for_run
+        )
+        relevance_labels = await _rank_action_trace(full_trace, task=sess.task, guide=final_guide, llm=rank_llm)
+        _apply_relevance_labels(full_trace, relevance_labels)
+        sess.action_trace = _filter_relevant_actions(full_trace)
+        sess.action_trace_summary = _summarize_action_trace(sess.action_trace) if sess.action_trace else None
+
         final_with_images = _attach_images_by_evidence(final_guide, evidence_table)
         if not final_with_images and isinstance(final_guide, GuideOutputWithEvidence):
             final_with_images = final_guide.model_dump()
@@ -825,6 +957,9 @@ async def run_session(sess: Session):
         if sess.action_trace_summary:
             final_with_images = dict(final_with_images)
             final_with_images["action_trace"] = sess.action_trace_summary
+        if sess.action_trace_full:
+            final_with_images = dict(final_with_images)
+            final_with_images["action_trace_full"] = [entry.model_dump() for entry in sess.action_trace_full]
         if evidence_table:
             final_with_images = dict(final_with_images)
             final_with_images["evidence"] = [ev.model_dump() for ev in evidence_table]
