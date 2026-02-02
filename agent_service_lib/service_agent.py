@@ -26,6 +26,7 @@ from .mailbox_service import DEFAULT_DOMAIN
 from .service_agent_auth_utils import (
     TaskIntent,
     TaskCredentials,
+    PageStateClassification,
     _sanitize_credentials_payload,
     _register_mailbox_actions,
     _is_micro_action,
@@ -521,6 +522,11 @@ def _wrap_llm_with_logging(
                 prompt_text = _messages_to_prompt_text(messages)
                 response_text = _response_to_text(response)
 
+                # Get step_id for generation calls, None for non-step calls (planning, summarization, etc.)
+                step_id = None
+                if purpose == "generation":
+                    step_id = getattr(sess, "current_step", None)
+
                 await db_insert_llm_call(
                     workspace_id=sess.workspace_id,
                     guide_id=guide_id,
@@ -533,6 +539,8 @@ def _wrap_llm_with_logging(
                     cost_cents=cost_cents,
                     latency_ms=latency_ms,
                     success=success,
+                    step_id=step_id,
+                    run_id=sess.id,
                 )
             except Exception:
                 pass
@@ -598,6 +606,7 @@ class Session:
         self.current_step: Optional[int] = None
         self.current_url: Optional[str] = None
         self.error: Optional[str] = None
+        self.page_state: Optional[PageStateClassification] = None  # Page state from agent output
 
         self.screenshots_dir: Path = SCREENSHOTS_BASE / self.id / "images"
         self.chrome_proc: Optional[asyncio.subprocess.Process] = None
@@ -780,8 +789,8 @@ async def run_session(sess: Session):
 
             EXECUTION RULES (HARD)
             - Follow page state: credential fields (email/password) or OTP fields mean you are not authenticated; complete them before proceeding.
-            - NEVER type dummy/placeholder credentials. Only use user-provided credentials or generated pathix.io credentials.
-            - If credential fields appear and no usable credentials exist but account creation is appropriate, call `create_signup_mailbox` to get a pathix.io email/password and use them. Otherwise, stop with an error.
+            - NEVER type dummy/placeholder credentials like "<your email>". Only use user-provided credentials or generated pathix.io credentials.
+            - If credential fields appear and no usable credentials exist, call `create_signup_mailbox` to get a pathix.io email/password and use them to sign up/login. PROACTIVELY create accounts rather than stopping with an incomplete guide.
             - OTP/verification: When page state shows OTP fields (numeric short inputs, autocomplete one-time-code, etc.), call `fetch_mailbox_otp` for @pathix.io accounts you can access, enter the code, and continue. If the email is not @pathix.io or no mailbox creds exist, stop and say "OTP required; cannot continue automatically."
 
             DECISION LOOP (HARD)
@@ -810,11 +819,32 @@ async def run_session(sess: Session):
             - Avoid hedging words like "usually", "typically", "might", or "may".
 
             AUTH / MAILBOX RULES (HARD GUARDRAILS)
-            - If you cannot proceed because a page requires credentials and none are available, and account creation is appropriate, call `create_signup_mailbox` to get a pathix.io email/password.
-            - If no credentials are available and account creation is not appropriate, stop and say credentials are required.
+            - Account creation IS APPROPRIATE when ALL of these are true: (1) you need to authenticate to complete the task, (2) no user credentials were provided to you, (3) the site offers a signup/create-account option. In this case, call `create_signup_mailbox` to get a pathix.io email/password and use them to sign up.
+            - Account creation is NOT appropriate only when: the task explicitly requires using a specific existing account, OR the site has no signup option (invite-only/enterprise-only).
+            - When you encounter a login/signup page and have no credentials, DO NOT stop and generate a speculative guide. Instead, call `create_signup_mailbox`, sign up, then continue with the actual task.
             - When an OTP/verification code is requested for a pathix.io email, call `fetch_mailbox_otp` (it polls for ~2 minutes). If the email is not @pathix.io, stop and say: "OTP required; cannot continue automatically."
             {signup_execution_block}
             {agent_profile_block}
+
+            PAGE STATE CLASSIFICATION (REQUIRED IN EVERY RESPONSE)
+            As part of your response, you MUST classify the current page state. Include in your `memory` field a JSON block with key "page_state" containing:
+            - needs_otp: boolean - Does the page show OTP/verification code input fields?
+            - needs_email_link: boolean - Does the page ask user to click a verification link in their email (not enter a code)?
+            - has_login_error: boolean - Does the page show ANY error message preventing login success? This includes CAPTCHA errors, validation errors, network errors, or any text indicating the login attempt failed or was blocked.
+            - has_captcha: boolean - Is there a CAPTCHA widget OR CAPTCHA-related error message visible? Set TRUE if you see any text mentioning reCAPTCHA, hCaptcha, Turnstile, "verify you're human", or error messages like "An error with reCAPTCHA occurred", "CAPTCHA validation failed", etc. A CAPTCHA error message means CAPTCHA is blocking login even if no widget is visible.
+            - error_type: string or null - One of: "invalid_password", "account_not_found", "account_locked", "captcha_error", "other"
+            - error_message: string or null - Copy the exact error text shown on the page (e.g. "An error with reCAPTCHA occured. Please try again.")
+            - reason: string or null - Brief explanation of why you classified the page this way
+
+            Example memory format: "Observed login page with email field. page_state: {{"needs_otp": false, "needs_email_link": false, "has_login_error": false, "has_captcha": false, "error_type": null, "error_message": null, "reason": "Clean login form, no errors visible"}}"
+            Example with CAPTCHA error: "Login form shows reCAPTCHA error. page_state: {{"needs_otp": false, "needs_email_link": false, "has_login_error": true, "has_captcha": true, "error_type": "captcha_error", "error_message": "An error with reCAPTCHA occured. Please try again.", "reason": "reCAPTCHA error text visible on page, blocking login"}}"
+
+            CAPTCHA HANDLING (CRITICAL)
+            - If you see a reCAPTCHA/CAPTCHA error message on the page, use `detect_captcha` to identify the type.
+            - If `detect_captcha` returns "recaptcha_enterprise" with "unsolvable: true", OR if you see a CAPTCHA error but `detect_captcha` finds no widget, this means the site uses INVISIBLE reCAPTCHA Enterprise which CANNOT be solved programmatically.
+            - In this case, DO NOT retry login in a loop. Report failure immediately with: "Site uses invisible reCAPTCHA Enterprise that blocks automated logins. Cannot proceed automatically."
+            - Retrying login when blocked by reCAPTCHA will only worsen the block. Stop after seeing CAPTCHA errors.
+            - Only solvable CAPTCHA types (recaptcha_v2, hcaptcha, turnstile, funcaptcha) can be addressed with `solve_captcha`.
 
             OUTPUT (HARD RULES)
             - When finished, call `done`.
@@ -857,9 +887,59 @@ async def run_session(sess: Session):
 
         agent_llm = _wrap_llm_with_logging(ChatOpenAI(model=OPENAI_MODEL), sess, "generation", token_cost, guide_id_for_run)
 
-        def _update_step_context(browser_state_summary, _model_output, step_number: int):
+        def _extract_page_state_from_memory(memory: str | None) -> PageStateClassification | None:
+            """Extract page_state JSON from agent's memory field."""
+            if not memory:
+                return None
+            try:
+                # Look for page_state: {...} pattern in memory - use greedy match to capture full JSON
+                match = re.search(r'page_state:\s*(\{.*?\})\s*(?:$|["\']|[A-Z])', memory, re.IGNORECASE | re.DOTALL)
+                if not match:
+                    # Try alternate patterns the LLM might use
+                    match = re.search(r'"page_state":\s*(\{.*?\})', memory, re.IGNORECASE | re.DOTALL)
+                if match:
+                    state_json = match.group(1)
+                    # Try parsing; if it fails, try extending to find more closing braces
+                    state_dict = None
+                    for _ in range(3):  # Try up to 3 times to find valid JSON
+                        try:
+                            state_dict = json.loads(state_json)
+                            break
+                        except json.JSONDecodeError:
+                            # Might have cut off too early, try finding next }
+                            rest = memory[match.end():]
+                            next_brace = rest.find('}')
+                            if next_brace >= 0:
+                                state_json = state_json + rest[:next_brace + 1]
+                            else:
+                                break
+                    if state_dict:
+                        return PageStateClassification(
+                            needs_otp=bool(state_dict.get("needs_otp", False)),
+                            needs_email_link=bool(state_dict.get("needs_email_link", False)),
+                            has_login_error=bool(state_dict.get("has_login_error", False)),
+                            has_captcha=bool(state_dict.get("has_captcha", False)),
+                            error_type=state_dict.get("error_type"),
+                            error_message=state_dict.get("error_message"),
+                            reason=state_dict.get("reason", "Extracted from agent memory"),
+                        )
+            except Exception as exc:
+                log.debug("Failed to extract page state from memory: %r", exc)
+            return None
+
+        def _update_step_context(browser_state_summary, model_output, step_number: int):
             sess.current_step = int(step_number)
             sess.current_url = getattr(browser_state_summary, "url", None) if browser_state_summary else None
+            # Extract and store page state from agent's memory field
+            if model_output:
+                memory = getattr(model_output, "memory", None)
+                page_state = _extract_page_state_from_memory(memory)
+                if page_state:
+                    sess.page_state = page_state
+                    log.debug("Page state extracted: otp=%s, email_link=%s, error=%s (type=%s, msg=%r), captcha=%s, reason=%r",
+                              page_state.needs_otp, page_state.needs_email_link,
+                              page_state.has_login_error, page_state.error_type, page_state.error_message,
+                              page_state.has_captcha, page_state.reason)
 
         agent = Agent(
             llm=agent_llm,

@@ -264,6 +264,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
 		)
 
+		# Apply viewport settings - either from device_type profile or explicit dimensions
 		if device_type:
 			try:
 				self._apply_device_profile(
@@ -274,6 +275,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				)
 			except Exception as e:
 				logger.warning(f'dY"? Could not apply device profile ({device_type}): {type(e).__name__}: {e}')
+		elif viewport_width and viewport_height:
+			# Apply explicit viewport dimensions even without device_type
+			self.browser_session.browser_profile.viewport = ViewportSize(width=int(viewport_width), height=int(viewport_height))
+			self.browser_session.browser_profile.no_viewport = False
+			logger.info(f'🖥️  Applied custom viewport: {viewport_width}x{viewport_height}')
 
 		# Initialize available file paths as direct attribute
 		self.available_file_paths = available_file_paths
@@ -642,7 +648,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	) -> None:
 		"""Force browser viewport characteristics to match requested device type."""
 		if device_type == 'desktop':
-			if browser_profile.viewport is None:
+			# For desktop, use explicit dimensions if provided, otherwise enforce 1920x1080
+			if device_width and device_height:
+				browser_profile.viewport = ViewportSize(width=int(device_width), height=int(device_height))
+			else:
+				# Always set 1920x1080 for desktop mode (don't rely on detected screen size)
 				browser_profile.viewport = ViewportSize(width=1920, height=1080)
 			browser_profile.device_scale_factor = float(browser_profile.device_scale_factor or 1.0)
 			browser_profile.no_viewport = False

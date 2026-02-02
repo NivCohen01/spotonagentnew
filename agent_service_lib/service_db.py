@@ -933,12 +933,18 @@ async def db_insert_llm_call(
     cost_cents: float,
     latency_ms: int,
     success: bool,
+    step_id: Optional[int] = None,
+    run_id: Optional[str] = None,
 ) -> None:
     if not SessionLocal:
         return
 
     now = dt.datetime.utcnow()
     org_id = await _fetch_org_id_for_workspace(workspace_id)
+
+    # Use run_id as guide_id fallback if guide_id is not provided
+    # (guide_id column stores the run identifier)
+    effective_guide_id = guide_id
 
     async with SessionLocal() as db:
         await db.execute(
@@ -948,6 +954,7 @@ async def db_insert_llm_call(
                     organization_id,
                     workspace_id,
                     guide_id,
+                    step_id,
                     purpose,
                     model,
                     prompt_text,
@@ -963,6 +970,7 @@ async def db_insert_llm_call(
                     :organization_id,
                     :workspace_id,
                     :guide_id,
+                    :step_id,
                     :purpose,
                     :model,
                     :prompt_text,
@@ -979,7 +987,8 @@ async def db_insert_llm_call(
             {
                 "organization_id": org_id,
                 "workspace_id": workspace_id,
-                "guide_id": guide_id,
+                "guide_id": effective_guide_id,
+                "step_id": step_id,
                 "purpose": purpose,
                 "model": model,
                 "prompt_text": prompt_text,

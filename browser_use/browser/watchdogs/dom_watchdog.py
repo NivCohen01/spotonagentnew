@@ -759,7 +759,7 @@ class DOMWatchdog(BaseWatchdog):
 			return str(screenshot_b64)
 
 		except TimeoutError:
-			self.logger.warning('📸 Clean screenshot timed out after 6 seconds - no handler registered or slow page?')
+			self.logger.warning('📸 Clean screenshot timed out - no handler registered or slow page?')
 			raise
 		except Exception as e:
 			self.logger.warning(f'📸 Clean screenshot failed: {type(e).__name__}: {e}')

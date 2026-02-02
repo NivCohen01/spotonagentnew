@@ -313,6 +313,215 @@ async def _select_verification_link(
     return selection
 
 
+# Combined page state classification - uses LLM for language-agnostic detection
+class PageStateClassification(BaseModel):
+    """Combined classification of page authentication state - all in one LLM call."""
+    needs_otp: bool = Field(description="Page requires entering a verification code/OTP")
+    needs_email_link: bool = Field(description="Page asks user to verify via email link (not OTP)")
+    has_login_error: bool = Field(description="Page shows ANY error preventing login success, including CAPTCHA errors, validation errors, or any text indicating login was blocked/failed")
+    has_captcha: bool = Field(description="Page has a CAPTCHA widget OR shows a CAPTCHA error message (e.g. 'An error with reCAPTCHA occurred', 'CAPTCHA validation failed'). Set TRUE for any reCAPTCHA/hCaptcha/Turnstile related content or error")
+    error_type: str | None = Field(default=None, description="Type of error: invalid_password, account_not_found, account_locked, captcha_error, or other")
+    error_message: str | None = Field(default=None, description="Exact error text shown on page (copy verbatim)")
+    reason: str = Field(description="Brief explanation of the classification")
+
+
+class LoginErrorState(BaseModel):
+    has_error: bool
+    error_type: str | None = None
+    error_message: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str
+
+
+# Cache for page state classification to avoid redundant LLM calls within the same step
+_page_state_cache: dict[str, tuple[float, PageStateClassification]] = {}
+_CACHE_TTL_SECONDS = 5.0  # Cache valid for 5 seconds
+
+
+async def classify_page_state(
+    browser_session,
+    page_extraction_llm,
+    *,
+    current_url: str,
+) -> PageStateClassification:
+    """
+    Combined LLM-based page state classification - language agnostic.
+    Makes ONE LLM call to detect: OTP needed, email verification needed, login errors, CAPTCHA.
+    Results are cached briefly to avoid redundant calls within the same step.
+    """
+    import time
+
+    # Check cache first
+    cache_key = current_url or "unknown"
+    now = time.time()
+    if cache_key in _page_state_cache:
+        cached_time, cached_result = _page_state_cache[cache_key]
+        if now - cached_time < _CACHE_TTL_SECONDS:
+            return cached_result
+
+    # Default result if we can't classify
+    default_result = PageStateClassification(
+        needs_otp=False,
+        needs_email_link=False,
+        has_login_error=False,
+        has_captcha=False,
+        reason="Could not classify page state.",
+    )
+
+    if not browser_session:
+        return default_result
+
+    # Build page snapshot
+    snapshot = await _build_page_snapshot(
+        browser_session,
+        current_url=current_url,
+    )
+    if not snapshot:
+        return default_result
+
+    # Also check for OTP input fields via DOM (fast, no LLM needed)
+    otp_indices = await _detect_otp_indices(browser_session)
+    has_otp_fields = bool(otp_indices)
+
+    llm = page_extraction_llm or ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+
+    system_text = """You classify the authentication state of a web page. Analyze the page content and determine:
+
+1. needs_otp: Does the page require entering a verification code/OTP sent via email or SMS?
+2. needs_email_link: Does the page ask the user to check their email and click a verification link (NOT enter a code)?
+3. has_login_error: Does the page show any login/authentication error message?
+4. has_captcha: Is there a CAPTCHA (reCAPTCHA, hCaptcha, etc.) blocking the user?
+
+If has_login_error is true, also set:
+- error_type: "invalid_password", "account_not_found", "account_locked", or "other"
+- error_message: Brief description of the error
+
+This must work for pages in ANY language. Look for semantic meaning, not specific words.
+
+Return STRICT JSON only."""
+
+    user_text = f"Page snapshot:\n{snapshot}"
+    if has_otp_fields:
+        user_text += "\n\nNote: DOM analysis detected OTP input fields on this page."
+
+    try:
+        result = await llm.ainvoke(
+            [
+                SystemMessage(content=[ContentPartTextParam(text=system_text)]),
+                UserMessage(content=[ContentPartTextParam(text=user_text)]),
+            ],
+            output_format=PageStateClassification,
+        )
+        classification = result.completion
+
+        # If DOM detected OTP fields, ensure needs_otp is true
+        if has_otp_fields:
+            classification = PageStateClassification(
+                needs_otp=True,
+                needs_email_link=classification.needs_email_link,
+                has_login_error=classification.has_login_error,
+                has_captcha=classification.has_captcha,
+                error_type=classification.error_type,
+                error_message=classification.error_message,
+                reason=classification.reason if not classification.needs_otp else f"OTP fields detected. {classification.reason}",
+            )
+
+        # Cache the result
+        _page_state_cache[cache_key] = (now, classification)
+        return classification
+
+    except Exception as exc:
+        logging.getLogger("service").info("Page state classification failed | %r", exc)
+        # If DOM detected OTP fields, return that even if LLM failed
+        if has_otp_fields:
+            return PageStateClassification(
+                needs_otp=True,
+                needs_email_link=False,
+                has_login_error=False,
+                has_captcha=False,
+                reason="OTP fields detected via DOM analysis.",
+            )
+        return default_result
+
+
+async def detect_login_error_heuristic(
+    browser_session,
+    page_extraction_llm=None,
+    *,
+    current_url: str,
+) -> LoginErrorState:
+    """Detect login errors using combined LLM classification."""
+    classification = await classify_page_state(
+        browser_session,
+        page_extraction_llm,
+        current_url=current_url,
+    )
+
+    if classification.has_login_error:
+        return LoginErrorState(
+            has_error=True,
+            error_type=classification.error_type,
+            error_message=classification.error_message,
+            confidence=0.9,
+            reason=classification.reason,
+        )
+
+    if classification.has_captcha:
+        return LoginErrorState(
+            has_error=True,
+            error_type="captcha_required",
+            error_message="CAPTCHA detected",
+            confidence=0.9,
+            reason=classification.reason,
+        )
+
+    return LoginErrorState(
+        has_error=False,
+        confidence=0.9,
+        reason=classification.reason,
+    )
+
+
+async def detect_email_link_verification_heuristic(
+    browser_session,
+    page_extraction_llm=None,
+    *,
+    current_url: str,
+) -> EmailLinkVerificationState:
+    """Detect email link verification using combined LLM classification."""
+    classification = await classify_page_state(
+        browser_session,
+        page_extraction_llm,
+        current_url=current_url,
+    )
+
+    return EmailLinkVerificationState(
+        needs_email_link_verification=classification.needs_email_link,
+        confidence=0.9,
+        reason=classification.reason,
+    )
+
+
+async def detect_otp_verification_heuristic(
+    browser_session,
+    page_extraction_llm=None,
+    *,
+    current_url: str,
+) -> OtpVerificationState:
+    """Detect OTP verification using combined LLM classification."""
+    classification = await classify_page_state(
+        browser_session,
+        page_extraction_llm,
+        current_url=current_url,
+    )
+
+    return OtpVerificationState(
+        needs_otp_verification=classification.needs_otp,
+        confidence=0.95 if classification.needs_otp else 0.9,
+        reason=classification.reason,
+    )
+
+
 async def detect_email_link_verification_required(
     browser_session,
     page_extraction_llm,
@@ -595,11 +804,19 @@ def _register_mailbox_actions(tools: Tools, sess: Any) -> None:
         since_ts = params.since_ts or getattr(sess, "generated_credentials_created_at", None) or (dt.datetime.utcnow() - dt.timedelta(minutes=10))
         code = await fetch_latest_otp_imap(target_email, mailbox_password, since_ts, attempts=18, interval=10)
         if code:
-            message = f"OTP for {target_email}: {code}"
-            log.info("OTP retrieved for %s", target_email)
+            # Make OTP extremely explicit so LLM cannot miss it
+            digits_display = " ".join(list(code))  # e.g. "1 2 3 4 5 6"
+            message = (
+                f"SUCCESS: OTP CODE RETRIEVED!\n"
+                f"Email: {target_email}\n"
+                f"OTP CODE: {code}\n"
+                f"Digits: {digits_display}\n"
+                f"IMPORTANT: Use EXACTLY these digits in order. Do NOT guess or make up digits!"
+            )
+            log.info("OTP retrieved for %s: %s", target_email, code)
             return ActionResult(
                 extracted_content=message,
-                long_term_memory="OTP retrieved from mailbox",
+                long_term_memory=f"OTP code is {code} - use exactly these digits",
                 metadata={"otp": code, "email": target_email},
             )
 
@@ -668,3 +885,163 @@ def _register_mailbox_actions(tools: Tools, sess: Any) -> None:
         )
 
     setattr(sess, "fetch_mailbox_verification_link", fetch_mailbox_verification_link)
+
+    # CAPTCHA detection and solving actions
+    @tools.action(
+        "Detect if the current page has a CAPTCHA (reCAPTCHA, hCaptcha, Turnstile, etc.) and return its type and sitekey.",
+    )
+    async def detect_captcha(browser_session=None):
+        if not browser_session:
+            return ActionResult(error="No browser session available.")
+
+        try:
+            from browser_use.captcha.service import get_detection_script
+        except ImportError:
+            return ActionResult(error="CAPTCHA detection not available.")
+
+        try:
+            page = await browser_session.get_current_page()
+            if not page:
+                return ActionResult(error="No page available.")
+
+            detection_script = get_detection_script()
+            result = await page.evaluate(detection_script)
+
+            # Handle string result from CDP (some page implementations serialize to JSON string)
+            if isinstance(result, str):
+                import json
+                try:
+                    result = json.loads(result)
+                except json.JSONDecodeError:
+                    log.warning("CAPTCHA detection returned non-JSON string: %s", result[:100] if result else "empty")
+                    result = {"type": None}
+
+            if not result or not result.get("type"):
+                return ActionResult(
+                    extracted_content="No CAPTCHA detected on this page.",
+                    metadata={"captcha_detected": False},
+                )
+
+            captcha_type = result.get("type")
+            sitekey = result.get("sitekey")
+            is_invisible = result.get("is_invisible", False)
+            is_unsolvable = result.get("unsolvable", False)
+            log.info("CAPTCHA detected: type=%s, sitekey=%s, invisible=%s, unsolvable=%s",
+                     captcha_type, sitekey[:20] + "..." if sitekey and len(sitekey) > 20 else sitekey,
+                     is_invisible, is_unsolvable)
+
+            # Provide clear message for unsolvable CAPTCHAs
+            if is_unsolvable:
+                content = (f"CAPTCHA detected: type={captcha_type} (INVISIBLE/BEHAVIORAL). "
+                          "This CAPTCHA type uses behavioral analysis and CANNOT be solved programmatically. "
+                          "The site is blocking automated access. Options: use pre-authenticated cookies, "
+                          "use the site's API, or try from a different IP with better reputation.")
+                memory = f"Site uses {captcha_type} which blocks automated logins - cannot proceed"
+            else:
+                content = f"CAPTCHA detected: type={captcha_type}, sitekey={'present' if sitekey else 'not found'}"
+                memory = f"Page has {captcha_type} CAPTCHA"
+
+            return ActionResult(
+                extracted_content=content,
+                long_term_memory=memory,
+                metadata={
+                    "captcha_detected": True,
+                    "captcha_type": captcha_type,
+                    "sitekey": sitekey,
+                    "page_url": result.get("url"),
+                    "is_invisible": is_invisible,
+                    "unsolvable": is_unsolvable,
+                },
+            )
+        except Exception as exc:
+            log.info("CAPTCHA detection failed | %r", exc)
+            return ActionResult(error=f"CAPTCHA detection failed: {exc}")
+
+    @tools.action(
+        "Solve a CAPTCHA on the current page using 2Captcha service. Requires TWOCAPTCHA_API_KEY environment variable.",
+    )
+    async def solve_captcha(browser_session=None):
+        if not browser_session:
+            return ActionResult(error="No browser session available.")
+
+        try:
+            from browser_use.captcha.service import CaptchaSolver, get_detection_script, get_injection_script
+            from browser_use.captcha.views import CaptchaType
+        except ImportError:
+            return ActionResult(error="CAPTCHA solver not available. Install with: pip install 2captcha-python")
+
+        try:
+            page = await browser_session.get_current_page()
+            if not page:
+                return ActionResult(error="No page available.")
+
+            # First detect the CAPTCHA
+            detection_script = get_detection_script()
+            detection_result = await page.evaluate(detection_script)
+
+            if not detection_result or not detection_result.get("type"):
+                return ActionResult(error="No CAPTCHA detected on this page.")
+
+            captcha_type_str = detection_result.get("type")
+            sitekey = detection_result.get("sitekey")
+            page_url = detection_result.get("url")
+
+            if not sitekey and captcha_type_str != "image":
+                return ActionResult(error=f"CAPTCHA sitekey not found for {captcha_type_str}.")
+
+            # Map string type to enum
+            type_mapping = {
+                "recaptcha_v2": CaptchaType.RECAPTCHA_V2,
+                "recaptcha_v3": CaptchaType.RECAPTCHA_V3,
+                "hcaptcha": CaptchaType.HCAPTCHA,
+                "turnstile": CaptchaType.TURNSTILE,
+                "funcaptcha": CaptchaType.FUNCAPTCHA,
+                "image": CaptchaType.IMAGE,
+            }
+            captcha_type = type_mapping.get(captcha_type_str)
+            if not captcha_type:
+                return ActionResult(error=f"Unsupported CAPTCHA type: {captcha_type_str}")
+
+            # Initialize solver
+            try:
+                solver = CaptchaSolver()
+            except ValueError as e:
+                return ActionResult(error=str(e))
+
+            # Solve the CAPTCHA
+            log.info("Solving %s CAPTCHA...", captcha_type_str)
+            from browser_use.captcha.views import SolveCaptchaParams
+            params = SolveCaptchaParams(
+                captcha_type=captcha_type,
+                sitekey=sitekey,
+                page_url=page_url,
+                action=detection_result.get("action"),
+            )
+            solution = await solver.solve(params, page_url=page_url)
+
+            if not solution.get("success"):
+                error_msg = solution.get("error", "Unknown error")
+                log.info("CAPTCHA solve failed: %s", error_msg)
+                return ActionResult(error=f"CAPTCHA solve failed: {error_msg}")
+
+            token = solution.get("code")
+            if not token:
+                return ActionResult(error="CAPTCHA solved but no token returned.")
+
+            # Inject the token into the page
+            injection_script = get_injection_script(captcha_type, token)
+            injection_result = await page.evaluate(injection_script)
+            log.info("CAPTCHA solved and injected: %s", injection_result)
+
+            return ActionResult(
+                extracted_content=f"CAPTCHA solved successfully. Token injected into page.",
+                long_term_memory=f"Solved {captcha_type_str} CAPTCHA",
+                metadata={
+                    "captcha_type": captcha_type_str,
+                    "solved": True,
+                    "injection_result": str(injection_result),
+                },
+            )
+        except Exception as exc:
+            log.info("CAPTCHA solve failed | %r", exc)
+            return ActionResult(error=f"CAPTCHA solve failed: {exc}")

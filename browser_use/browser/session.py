@@ -784,11 +784,23 @@ class BrowserSession(BaseModel):
 		quiet_ms: int = 400,
 		min_text_len: int = 40,
 		min_interactables: int = 2,
+		fallback_quiet_ms: int = 50,
 	) -> UiStabilityResult:
-		"""Wait for DOM quiet period and basic UI signal before declaring stability."""
+		"""Wait for DOM quiet period and basic UI signal before declaring stability.
+
+		Args:
+			timeout: Maximum time to wait for stability (seconds)
+			quiet_ms: Target quiet period - DOM must be unchanged for this duration (milliseconds)
+			min_text_len: Minimum text content length required
+			min_interactables: Minimum number of interactive elements required
+			fallback_quiet_ms: Fallback quiet period for noisy sites (milliseconds).
+				If timeout expires but ready_state='complete' and best_quiet >= fallback_quiet_ms,
+				stability is accepted. This helps with JavaScript-heavy sites that never fully quiet.
+		"""
 		cdp_session = await self.get_or_create_cdp_session(focus=True)
 		start_time = time.monotonic()
 		last_metrics: UiMetrics | None = None
+		best_quiet_ms = 0  # Track best quiet period achieved
 
 		js_code = """
 (() => {
@@ -837,6 +849,10 @@ class BrowserSession(BaseModel):
 			except Exception:
 				last_metrics = UiMetrics(ready_state='unknown', quiet_for_ms=0, text_len=0, interactables=0)
 
+			# Track best quiet period achieved
+			if last_metrics.quiet_for_ms > best_quiet_ms:
+				best_quiet_ms = last_metrics.quiet_for_ms
+
 			if last_metrics.ready_state in ('interactive', 'complete'):
 				is_quiet = last_metrics.quiet_for_ms >= quiet_ms
 				has_ui_signal = last_metrics.interactables >= min_interactables or last_metrics.text_len >= min_text_len
@@ -844,6 +860,17 @@ class BrowserSession(BaseModel):
 					return UiStabilityResult(is_stable=True, metrics=last_metrics)
 
 			await asyncio.sleep(0.05)
+
+		# Adaptive fallback for noisy sites (JavaScript-heavy pages that never fully quiet)
+		# Accept stability if ready_state is 'complete' and we achieved at least fallback_quiet_ms
+		if last_metrics and last_metrics.ready_state == 'complete' and best_quiet_ms >= fallback_quiet_ms:
+			has_ui_signal = last_metrics.interactables >= min_interactables or last_metrics.text_len >= min_text_len
+			if has_ui_signal:
+				self.logger.debug(
+					f'UI stability fallback: best_quiet={best_quiet_ms}ms (target={quiet_ms}ms), '
+					f'accepting ready_state=complete with ui_signal'
+				)
+				return UiStabilityResult(is_stable=True, metrics=last_metrics)
 
 		return UiStabilityResult(is_stable=False, metrics=last_metrics)
 
@@ -2066,28 +2093,41 @@ class BrowserSession(BaseModel):
 
 		def score_candidate(node: EnhancedDOMTreeNode) -> int:
 			score = 0
+			# Tag match: +2
 			if fingerprint.tag and self._normalize_fingerprint_value(node.tag_name) == fingerprint.tag:
 				score += 2
+			# Role match: +2
 			if fingerprint.role and get_role(node) == fingerprint.role:
 				score += 2
+			# Name match: +4 exact, +1 partial (with length ratio check)
 			if fingerprint.name:
 				candidate_name = get_name(node)
 				if candidate_name == fingerprint.name:
-					score += 3
+					score += 4  # Increased from 3
 				elif candidate_name and fingerprint.name in candidate_name:
-					score += 1
+					# Only award partial match if original is >=70% of candidate length
+					# This prevents "sign in" matching "sign up free" (7/12 = 58%)
+					len_ratio = len(fingerprint.name) / len(candidate_name) if candidate_name else 0
+					if len_ratio >= 0.7:
+						score += 1
+			# Text match: +5 exact, +1 partial (with length ratio check)
 			if fingerprint.text:
 				candidate_text = get_text(node)
 				if candidate_text == fingerprint.text:
-					score += 3
+					score += 5  # Increased from 3
 				elif candidate_text and fingerprint.text in candidate_text:
-					score += 1
+					# Only award partial match if original is >=70% of candidate length
+					len_ratio = len(fingerprint.text) / len(candidate_text) if candidate_text else 0
+					if len_ratio >= 0.7:
+						score += 1
+			# Href match: +2 exact, +1 partial
 			if fingerprint.href:
 				candidate_href = get_href(node)
 				if candidate_href == fingerprint.href:
 					score += 2
 				elif candidate_href and fingerprint.href in candidate_href:
 					score += 1
+			# Type match: +1
 			if fingerprint.type:
 				if get_input_type(node) == fingerprint.type:
 					score += 1
@@ -2101,9 +2141,65 @@ class BrowserSession(BaseModel):
 				best_score = score
 				best_node = node
 
-		if best_score < 3:
+		# MIN_SCORE = 5 requires strong evidence (e.g., tag+role+partial or exact text/name)
+		# This prevents loose matches like "Sign In" -> "Sign Up Free"
+		if best_score < 5:
 			return None
 		return best_node
+
+	def _text_word_similarity(self, text_a: str | None, text_b: str | None) -> float:
+		"""Calculate Jaccard word-level similarity between two texts."""
+		if not text_a or not text_b:
+			return 0.0
+		words_a = set(text_a.lower().split())
+		words_b = set(text_b.lower().split())
+		if not words_a or not words_b:
+			return 0.0
+		intersection = words_a & words_b
+		union = words_a | words_b
+		return len(intersection) / len(union) if union else 0.0
+
+	def validate_recovered_element(
+		self,
+		fingerprint: ElementFingerprint,
+		candidate: EnhancedDOMTreeNode,
+	) -> tuple[bool, str]:
+		"""Validate that a recovered element semantically matches the original fingerprint.
+
+		Returns (is_valid, reason) where reason explains validation result.
+		"""
+		# Get candidate's text
+		candidate_text = candidate.node_value or ''
+		if not candidate_text and candidate.node_type == NodeType.ELEMENT_NODE:
+			candidate_text = candidate.get_all_children_text(max_depth=2)
+		candidate_text = self._normalize_fingerprint_value(candidate_text.strip()[:120] if candidate_text else '')
+
+		# Get candidate's name (aria-label, name, title)
+		candidate_name = None
+		if candidate.ax_node and candidate.ax_node.name:
+			candidate_name = self._normalize_fingerprint_value(candidate.ax_node.name)
+		elif candidate.attributes:
+			candidate_name = self._normalize_fingerprint_value(
+				candidate.attributes.get('aria-label') or candidate.attributes.get('name') or candidate.attributes.get('title')
+			)
+
+		# Validation 1: If fingerprint has text, it must match exactly or have >85% word similarity
+		if fingerprint.text:
+			if candidate_text == fingerprint.text:
+				pass  # Exact match is valid
+			elif candidate_text:
+				similarity = self._text_word_similarity(fingerprint.text, candidate_text)
+				if similarity < 0.85:
+					return False, f'Text mismatch: "{fingerprint.text}" vs "{candidate_text}" (similarity={similarity:.0%})'
+			else:
+				return False, f'Text mismatch: expected "{fingerprint.text}", got empty'
+
+		# Validation 2: If fingerprint has name, candidate name must match exactly
+		if fingerprint.name and candidate_name:
+			if candidate_name != fingerprint.name:
+				return False, f'Name mismatch: "{fingerprint.name}" vs "{candidate_name}"'
+
+		return True, 'Validated'
 
 	async def reacquire_element_by_fingerprint(self, index: int) -> EnhancedDOMTreeNode | None:
 		"""Re-acquire a DOM element by fingerprint after stale index failures."""
@@ -2122,7 +2218,17 @@ class BrowserSession(BaseModel):
 			return None
 
 		selector_map = state.dom_state.selector_map if state and state.dom_state else {}
-		return self.find_element_by_fingerprint(fingerprint, selector_map)
+		candidate = self.find_element_by_fingerprint(fingerprint, selector_map)
+
+		# Validate recovered element before returning
+		if candidate:
+			is_valid, reason = self.validate_recovered_element(fingerprint, candidate)
+			if not is_valid:
+				self.logger.warning(f'Rejected fingerprint match for index {index}: {reason}')
+				return None
+			self.logger.debug(f'Validated fingerprint match for index {index}: {reason}')
+
+		return candidate
 
 	def record_console_error(self, message: str, target_id: TargetID | None = None, level: str | None = None) -> None:
 		"""Record console errors for debugging bundles."""

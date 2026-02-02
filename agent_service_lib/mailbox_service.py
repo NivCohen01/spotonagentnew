@@ -27,8 +27,26 @@ DEFAULT_DOMAIN = "pathix.io"
 DEFAULT_IMAP_HOST = "127.0.0.1"
 DEFAULT_IMAP_PORT = 993
 
-# 4–8 digit OTP anywhere in subject/body
-_OTP_PATTERN = re.compile(r"\b(\d{4,8})\b")
+# OTP extraction patterns - ordered by specificity
+# Pattern 1: Look for numbers after OTP-related keywords (most reliable)
+_OTP_KEYWORD_PATTERN = re.compile(
+    r"(?:code|otp|verification|verify|confirm|pin|token|passcode|one[- ]?time)[:\s\-_#]*(\d{4,8})\b",
+    re.IGNORECASE
+)
+# Pattern 2: Look for numbers before OTP-related keywords (e.g., "123456 is your code")
+_OTP_SUFFIX_PATTERN = re.compile(
+    r"\b(\d{4,8})\s*(?:is\s+(?:your|the)|code|otp|verification)",
+    re.IGNORECASE
+)
+# Pattern 3: Look for prominently displayed numbers (on their own line or surrounded by whitespace)
+_OTP_PROMINENT_PATTERN = re.compile(r"(?:^|\n)\s*(\d{4,8})\s*(?:\n|$)", re.MULTILINE)
+# Pattern 4: Look for exactly 6-digit codes (most common OTP length) - prioritize these
+_OTP_SIX_DIGIT_PATTERN = re.compile(r"\b(\d{6})\b")
+# Pattern 5: Generic 4-8 digit number
+_OTP_GENERIC_PATTERN = re.compile(r"\b(\d{4,8})\b")
+# Patterns to EXCLUDE (years, copyright footers, etc.)
+_YEAR_PATTERN = re.compile(r"^(19|20)\d{2}$")
+_COPYRIGHT_PATTERN = re.compile(r"[©®]\s*\d{4}", re.IGNORECASE)  # © 2026
 _URL_PATTERN = re.compile(r"(https?://[^\s\"'<>]+)", re.IGNORECASE)
 
 
@@ -588,8 +606,55 @@ def _extract_otp_from_message(msg: Message, since_ts: Optional[dt.datetime]) -> 
                         return None
 
     blob = _message_text(msg)
-    m = _OTP_PATTERN.search(blob)
-    return m.group(1) if m else None
+
+    # Remove copyright patterns that contain years (e.g., "© 2026")
+    blob_cleaned = _COPYRIGHT_PATTERN.sub(" ", blob)
+
+    # Helper to check if a candidate looks like a date/year
+    def _is_excluded(candidate: str) -> bool:
+        # Skip 4-digit years (19XX, 20XX)
+        if _YEAR_PATTERN.match(candidate):
+            return True
+        return False
+
+    # Priority 1: OTP after keyword (e.g., "Your code is 123456", "OTP: 123456")
+    m = _OTP_KEYWORD_PATTERN.search(blob_cleaned)
+    if m:
+        return m.group(1)
+
+    # Priority 2: OTP before keyword (e.g., "123456 is your verification code")
+    m = _OTP_SUFFIX_PATTERN.search(blob_cleaned)
+    if m:
+        return m.group(1)
+
+    # Priority 3: Look for prominently displayed numbers (on their own line)
+    # These are typically the OTP codes formatted for visibility
+    for m in _OTP_PROMINENT_PATTERN.finditer(blob_cleaned):
+        candidate = m.group(1)
+        if not _is_excluded(candidate):
+            return candidate
+
+    # Priority 4: Look for exactly 6-digit codes (most common OTP length)
+    for m in _OTP_SIX_DIGIT_PATTERN.finditer(blob_cleaned):
+        candidate = m.group(1)
+        # Skip if looks like YYYYMM date format
+        if candidate[:4].isdigit():
+            try:
+                year = int(candidate[:4])
+                if 1990 <= year <= 2030:
+                    continue
+            except ValueError:
+                pass
+        return candidate
+
+    # Priority 5: Generic numeric pattern, but skip year-like values
+    for m in _OTP_GENERIC_PATTERN.finditer(blob_cleaned):
+        candidate = m.group(1)
+        if _is_excluded(candidate):
+            continue
+        return candidate
+
+    return None
 
 
 def _imap_fetch_latest_otp_sync(

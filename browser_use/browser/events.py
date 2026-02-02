@@ -177,7 +177,7 @@ class ScreenshotEvent(BaseEvent[str]):
 	full_page: bool = False
 	clip: dict[str, float] | None = None  # {x, y, width, height}
 
-	event_timeout: float | None = _get_timeout('TIMEOUT_ScreenshotEvent', 8.0)  # seconds
+	event_timeout: float | None = _get_timeout('TIMEOUT_ScreenshotEvent', 15.0)  # seconds
 
 
 class BrowserStateRequestEvent(BaseEvent[BrowserStateSummary]):

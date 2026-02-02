@@ -303,11 +303,19 @@ def _register_mailbox_actions(tools: Tools, sess: "Session") -> None:
         since_ts = params.since_ts or sess.generated_credentials_created_at or (dt.datetime.utcnow() - dt.timedelta(minutes=10))
         code = await fetch_latest_otp_imap(target_email, mailbox_password, since_ts, attempts=18, interval=10)
         if code:
-            message = f"OTP for {target_email}: {code}"
-            log.info("OTP retrieved for %s", target_email)
+            # Make OTP extremely explicit so LLM cannot miss it
+            digits_display = " ".join(list(code))  # e.g. "1 2 3 4 5 6"
+            message = (
+                f"SUCCESS: OTP CODE RETRIEVED!\n"
+                f"Email: {target_email}\n"
+                f"OTP CODE: {code}\n"
+                f"Digits: {digits_display}\n"
+                f"IMPORTANT: Use EXACTLY these digits in order. Do NOT guess or make up digits!"
+            )
+            log.info("OTP retrieved for %s: %s", target_email, code)
             return ActionResult(
                 extracted_content=message,
-                long_term_memory="OTP retrieved from mailbox",
+                long_term_memory=f"OTP code is {code} - use exactly these digits",
                 metadata={"otp": code, "email": target_email},
             )
 

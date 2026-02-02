@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import datetime as dt
 import logging
@@ -24,9 +25,11 @@ from .service_agent_auth_utils import (
     _page_has_password_or_otp,
     _save_workspace_domain_if_applicable,
     _redact_url,
-    detect_email_link_verification_required,
-    detect_otp_verification_required,
+    detect_email_link_verification_heuristic,
+    detect_otp_verification_heuristic,
+    detect_login_error_heuristic,
     FetchVerifyLinkParams,
+    PageStateClassification,
 )
 
 _COMMON_DUMMY = {
@@ -262,20 +265,30 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
             with contextlib.suppress(Exception):
                 current_url = await browser_session.get_current_page_url()
             redacted_url = _redact_url(current_url)
-            verification_state = await detect_email_link_verification_required(
-                browser_session,
-                page_extraction_llm,
-                current_url=redacted_url,
-            )
-            if verification_state.needs_email_link_verification:
-                return ActionResult(error="Not authenticated yet; continue.")
-            otp_state = await detect_otp_verification_required(
-                browser_session,
-                page_extraction_llm,
-                current_url=redacted_url,
-            )
-            if otp_state.needs_otp_verification:
-                return ActionResult(error="Not authenticated yet; continue.")
+
+            # Check page_state from session first (extracted from agent's memory)
+            page_state: PageStateClassification | None = getattr(sess, "page_state", None)
+            if page_state:
+                if page_state.needs_email_link:
+                    return ActionResult(error="Not authenticated yet; continue.")
+                if page_state.needs_otp:
+                    return ActionResult(error="Not authenticated yet; continue.")
+            else:
+                # Fallback to LLM classification if page_state not available
+                verification_state = await detect_email_link_verification_heuristic(
+                    browser_session,
+                    page_extraction_llm,
+                    current_url=redacted_url,
+                )
+                if verification_state.needs_email_link_verification:
+                    return ActionResult(error="Not authenticated yet; continue.")
+                otp_state = await detect_otp_verification_heuristic(
+                    browser_session,
+                    page_extraction_llm,
+                    current_url=redacted_url,
+                )
+                if otp_state.needs_otp_verification:
+                    return ActionResult(error="Not authenticated yet; continue.")
 
         # Auto-handle email link verification when required (non-OTP flows only).
         if browser_session and requires_auth and not otp_indices and "done" not in action_data:
@@ -292,12 +305,21 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
             if redacted_url and redacted_url in attempted:
                 pass
             else:
-                verification_state = await detect_email_link_verification_required(
-                    browser_session,
-                    page_extraction_llm,
-                    current_url=redacted_url,
-                )
-                if verification_state.needs_email_link_verification:
+                # Check page_state from session first (extracted from agent's memory)
+                page_state = getattr(sess, "page_state", None)
+                needs_email_link = False
+                if page_state:
+                    needs_email_link = page_state.needs_email_link
+                else:
+                    # Fallback to LLM classification if page_state not available
+                    verification_state = await detect_email_link_verification_heuristic(
+                        browser_session,
+                        page_extraction_llm,
+                        current_url=redacted_url,
+                    )
+                    needs_email_link = verification_state.needs_email_link_verification
+
+                if needs_email_link:
                     target_email = None
                     if allowed_email and allowed_email.lower().endswith(f"@{DEFAULT_DOMAIN}"):
                         target_email = allowed_email.lower()
@@ -511,35 +533,37 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                     action = _rebuild_action_with_text(profile_value)
                 elif field_kind == "email":
                     if allowed_email:
+                        # Use existing credentials
                         action = _rebuild_action_with_text(allowed_email)
-                    else:
-                        if getattr(sess, "signup_intent", False):
-                            creds = await ensure_signup_mailbox(sess, log=log)
-                            allowed_creds_holder["email"] = creds.get("email")
-                            action = _rebuild_action_with_text(creds.get("email"))
-                        else:
-                            return ActionResult(error="Credentials required; cannot continue.")
+                    elif getattr(sess, "signup_intent", False):
+                        # Explicit signup intent - auto-generate credentials
+                        log.info("Auto-generating credentials for email field (signup_intent=True)")
+                        creds = await ensure_signup_mailbox(sess, log=log)
+                        allowed_creds_holder["email"] = creds.get("email")
+                        allowed_creds_holder["password"] = creds.get("password")
+                        action = _rebuild_action_with_text(creds.get("email") or "")
+                    # else: No credentials and no signup_intent - let agent decide (allow placeholder for demos)
 
                 elif field_kind == "password":
-                    if "<" in text_val or ">" in text_val:
-                        return ActionResult(error="Credentials required; cannot proceed.")
-
                     if allowed_password:
                         action = _rebuild_action_with_text(allowed_password)
-                    else:
-                        if getattr(sess, "signup_intent", False):
-                            creds = await ensure_signup_mailbox(sess, log=log)
-                            allowed_creds_holder["password"] = creds.get("password")
-                            action = _rebuild_action_with_text(creds.get("password"))
-                        elif dummy_password:
-                            return ActionResult(error="Credentials required; cannot proceed.")
-                        else:
-                            return ActionResult(error="Credentials required; cannot continue.")
+                    elif allowed_creds_holder.get("password"):
+                        # Use password from recently generated credentials
+                        action = _rebuild_action_with_text(allowed_creds_holder.get("password") or "")
+                    elif getattr(sess, "signup_intent", False):
+                        # Explicit signup intent - auto-generate credentials
+                        log.info("Auto-generating credentials for password field (signup_intent=True)")
+                        creds = await ensure_signup_mailbox(sess, log=log)
+                        allowed_creds_holder["email"] = creds.get("email")
+                        allowed_creds_holder["password"] = creds.get("password")
+                        action = _rebuild_action_with_text(creds.get("password") or "")
+                    # else: No credentials and no signup_intent - let agent decide (allow placeholder for demos)
                 else:
                     # For otp/other fields, allow without credential enforcement.
                     pass
 
-        return await orig_act(
+        # Execute the action
+        result = await orig_act(
             action=action,
             browser_session=browser_session,
             page_extraction_llm=page_extraction_llm,
@@ -547,5 +571,79 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
             available_file_paths=available_file_paths,
             file_system=file_system,
         )
+
+        # After click actions on auth pages, wait for navigation/page stability and check for login errors
+        if "click" in action_data and browser_session and requires_auth:
+            # Wait for page to stabilize after clicking (especially for form submissions)
+            # This gives the page time to: submit the form, navigate, or show error messages
+            try:
+                await asyncio.sleep(1.5)  # Initial wait for network request to start
+                await browser_session.wait_for_stable_ui(timeout=3.0, quiet_ms=300)
+            except Exception as stability_exc:
+                log.debug("UI stability wait after click: %r", stability_exc)
+
+            current_url = ""
+            with contextlib.suppress(Exception):
+                current_url = await browser_session.get_current_page_url()
+
+            # Check page_state from session first (extracted from agent's memory)
+            page_state = getattr(sess, "page_state", None)
+            has_error = False
+            error_type: str | None = None
+            error_msg: str | None = None
+
+            if page_state:
+                has_error = page_state.has_login_error or page_state.has_captcha
+                if page_state.has_login_error:
+                    error_type = page_state.error_type or "unknown"
+                    error_msg = page_state.error_message or "Authentication error detected"
+                elif page_state.has_captcha:
+                    error_type = "captcha_required"
+                    error_msg = "CAPTCHA detected"
+            else:
+                # Fallback to LLM classification if page_state not available
+                error_state = await detect_login_error_heuristic(
+                    browser_session,
+                    page_extraction_llm,
+                    current_url=current_url,
+                )
+                has_error = error_state.has_error
+                error_type = error_state.error_type
+                error_msg = error_state.error_message
+
+            if has_error:
+                error_type = error_type or "unknown"
+                error_msg = error_msg or "Authentication error detected"
+                log.info("Login error detected: type=%s, message=%s", error_type, error_msg)
+
+                # Record the auth event
+                _record_auth_event(
+                    sess,
+                    {
+                        "action": "login_error",
+                        "step": getattr(sess, "current_step", None),
+                        "page_url": current_url,
+                        "params": {
+                            "error_type": error_type,
+                            "error_message": error_msg,
+                        },
+                        "ts": int(dt.datetime.utcnow().timestamp() * 1000),
+                    },
+                )
+
+                # For CAPTCHA errors, inform the agent to use solve_captcha
+                if error_type == "captcha_required":
+                    return ActionResult(
+                        error="CAPTCHA required. Use detect_captcha and solve_captcha actions to proceed.",
+                        extracted_content=f"Login blocked by CAPTCHA: {error_msg}",
+                    )
+
+                # For other errors, return informative error
+                return ActionResult(
+                    error=f"Login failed: {error_msg}",
+                    extracted_content=f"Authentication error ({error_type}): {error_msg}",
+                )
+
+        return result
 
     tools.act = guarded_act  # type: ignore
