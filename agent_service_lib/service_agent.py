@@ -358,7 +358,9 @@ async def _generate_final_guide_with_evidence(
         - Use sub_steps when 3+ micro-actions happen on the same screen (form fills, multiple toggles, multi-click sequences). The parent step description should summarize the cluster; each sub_step is one concrete action.
         - One action per step or sub_step. Do not combine independent actions in a single step.
         - Never create a parent step with only ONE sub_step. If there is only one action, keep it as a parent step and omit sub_steps.
-        - Do not repeat the same sentence in a parent step and its sub_step. The parent must summarize; the sub_step must be a concrete action.
+        - CRITICAL: Parent steps with sub_steps must NOT repeat or paraphrase the sub_step content. The parent should be a SHORT high-level goal (3-6 words), NOT a concatenation of sub_steps.
+          BAD: "Type your message into the input box and click send" with sub_steps ["Type your message...", "Click send..."]
+          GOOD: "Send a message" with sub_steps ["Type your message into the input box labeled 'Type a Message'.", "Click the send button (paper plane icon)."]
         - If the evidence table shows 2+ distinct evidence_ids with screenshots, produce at least 2 top-level steps unless they are truly the same action on the same screen.
         - Be direct: avoid filler ("navigate to", "access"). Prefer: "In the left sidebar, click 'Chat'."
         - Use exact visible UI text in quotes ("Chat", "New message", "Send").
@@ -421,6 +423,7 @@ async def _generate_final_guide_with_evidence(
         Reminder (must follow):
         - Only use evidence_ids from the evidence table.
         - 3+ micro-actions (enter/type/select/check/toggle/click submit/save/send) on the SAME pageUrl => one parent summary with sub_steps; do NOT leave them as separate parent steps.
+        - Parent step descriptions must be SHORT high-level goals (3-6 words like "Send a message" or "Complete the form"), NOT a concatenation of sub_step actions.
         - Each PARENT step should include at least one evidence_id when evidence exists; avoid reusing the same evidence_id across different parent steps when possible.
         - sub_steps may reuse evidence_ids (including the parent's primary_evidence_id). Set them when you know the mapping; they may be empty if no specific sub-step evidence.
         - primary_evidence_id must be either null or one of evidence_ids.
