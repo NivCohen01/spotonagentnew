@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import anyio
 from PIL import Image, ImageDraw
@@ -19,6 +19,9 @@ from browser_use.screenshots.models import ActionScreenshotSettings
 if TYPE_CHECKING:
     from browser_use.browser import BrowserProfile, BrowserSession
     from browser_use.tools.registry.views import ActionModel
+
+# Annotation mode type for screenshot capture
+AnnotationMode = Literal["clean", "highlight", "arrow", "skip"]
 
 
 def _draw_solid_rect(draw: ImageDraw.ImageDraw, bbox: tuple[int, int, int, int], color: str = '#FF3B30', width: int = 4) -> None:
@@ -145,7 +148,8 @@ def _normalize_coordinates_to_viewport(
 class ActionScreenshotRecorder:
     """Captures annotated screenshots for each interactive action."""
 
-    _CLICK_ACTION_NAMES = {'click'}
+    # Actions where "default" mode maps to "arrow" (element-pointing) rather than "clean" (page-level)
+    _ARROW_DEFAULT_ACTIONS = {'click'}
 
     def __init__(self, settings: ActionScreenshotSettings, agent_directory: Path, session_id: str):
         self.settings = settings
@@ -168,6 +172,23 @@ class ActionScreenshotRecorder:
             base = base / self.session_id
         return base
 
+    def _get_annotation_mode(self, action_name: str, action_params: dict) -> AnnotationMode:
+        """Determine annotation mode from action parameters. LLM must explicitly request capture."""
+        mode = action_params.get('screenshot_mode')
+        if mode == 'skip' or mode is None:
+            return 'skip'
+        elif mode == 'default':
+            # LLM explicitly chose "default" — use arrow for clicks
+            return 'arrow' if action_name in self._ARROW_DEFAULT_ACTIONS else 'clean'
+        elif mode == 'clean':
+            return 'clean'
+        elif mode == 'highlight':
+            return 'highlight'
+        elif mode == 'arrow':
+            return 'arrow'
+        # Unknown mode — skip
+        return 'skip'
+
     @observe_debug(ignore_output=True, name='action_screenshot_capture')
     async def capture(
         self,
@@ -188,7 +209,10 @@ class ActionScreenshotRecorder:
         action_name = action_name or 'action'
         action_params = action_params or {}
 
-        if action_name not in self._CLICK_ACTION_NAMES:
+        # Determine annotation mode (fully LLM-driven)
+        annotation_mode = self._get_annotation_mode(action_name, action_params)
+        if annotation_mode == 'skip':
+            self.logger.debug(f'Skipping screenshot for action "{action_name}" (screenshot_mode=skip)')
             return None
 
         target_index = action.get_index()
@@ -281,13 +305,13 @@ class ActionScreenshotRecorder:
             self.logger.debug(
                 f'Annotating screenshot for action "{action_name}" using coordinates ({coordinate_x}, {coordinate_y}).'
             )
-        elif bbox is None:
+        elif bbox is None and annotation_mode != 'clean':
             self.logger.debug(
-                f'Skipping action screenshot for "{action_name}": no selector index or coordinates available.'
+                f'Skipping action screenshot for "{action_name}": no selector index or coordinates available for annotation.'
             )
             return None
 
-        if bbox and self.settings.annotate:
+        if bbox and self.settings.annotate and annotation_mode != 'clean':
             # Clamp to image bounds to avoid spillover, then only shrink when bbox is coordinate-derived
             bbox = _clamp_bbox_to_image(bbox, image)
             if target_index is None:
@@ -296,7 +320,10 @@ class ActionScreenshotRecorder:
                 _apply_spotlight(image, bbox)
             draw = ImageDraw.Draw(image)
             _draw_solid_rect(draw, bbox)
-            _draw_short_arrow(draw, bbox)
+            # Only draw arrow if mode is 'arrow' (default for clicks)
+            if annotation_mode == 'arrow':
+                _draw_short_arrow(draw, bbox)
+            # 'highlight' mode: only draws the rectangle border (no arrow)
 
         filename = self._build_filename(action, step_number, action_index, target_index)
         output_path = self.base_dir / filename
@@ -323,6 +350,115 @@ class ActionScreenshotRecorder:
         index_fragment = str(target_index) if target_index is not None else 'na'
         return f'step_{step_number:03d}_{action_name}_{action_index}_{index_fragment}_{timestamp_ms}.png'
 
+    @observe_debug(ignore_output=True, name='capture_for_guide')
+    async def capture_for_guide(
+        self,
+        *,
+        step_number: int,
+        run_step_id: int | None = None,
+        browser_session: 'BrowserSession',
+        browser_profile: 'BrowserProfile',
+        mode: AnnotationMode = 'clean',
+        element_indices: list[int] | None = None,
+        reason: str | None = None,
+    ) -> str | None:
+        """
+        Capture a screenshot for the guide with configurable annotations.
+        This is called by the capture_screenshot tool, not by click actions.
+
+        Args:
+            step_number: Current step number
+            run_step_id: Run step ID for manifest
+            browser_session: Browser session
+            browser_profile: Browser profile
+            mode: Annotation mode ('clean', 'highlight', 'arrow')
+            element_indices: Element indices to highlight (optional)
+            reason: Why this screenshot is important (stored in manifest)
+        """
+        if not self.enabled or browser_session is None:
+            return None
+
+        # Temporarily disable element highlighting for clean capture
+        old_highlight = browser_profile.highlight_elements
+        browser_profile.highlight_elements = False
+        try:
+            state = await browser_session.get_browser_state_summary(include_screenshot=True)
+        finally:
+            browser_profile.highlight_elements = old_highlight
+
+        dom_state = getattr(state, 'dom_state', None)
+        selector_map = getattr(dom_state, 'selector_map', None) if dom_state else None
+        screenshot_b64 = getattr(state, 'screenshot', None)
+        if not screenshot_b64:
+            self.logger.debug('Skipping guide screenshot: screenshot data missing.')
+            return None
+
+        image_bytes = base64.b64decode(screenshot_b64)
+        image = Image.open(io.BytesIO(image_bytes)).convert('RGBA')
+
+        page_info = getattr(state, 'page_info', None)
+        page_url = getattr(state, 'url', None)
+        viewport_width = getattr(page_info, 'viewport_width', None) if page_info else None
+        viewport_height = getattr(page_info, 'viewport_height', None) if page_info else None
+        if viewport_width is None and browser_profile.viewport:
+            vp = browser_profile.viewport
+            viewport_width = vp.get('width') if isinstance(vp, dict) else getattr(vp, 'width', None)
+            viewport_height = vp.get('height') if isinstance(vp, dict) else getattr(vp, 'height', None)
+
+        cdp_session = await browser_session.get_or_create_cdp_session()
+        device_pixel_ratio, _, _ = await get_viewport_info_from_cdp(cdp_session)
+        dpr = device_pixel_ratio or 1.0
+
+        # Calculate scale factors
+        scale_x = scale_y = dpr
+        if viewport_width and viewport_height:
+            scale_x = image.width / float(viewport_width)
+            scale_y = image.height / float(viewport_height)
+
+        # Draw annotations based on mode
+        if mode != 'clean' and element_indices and selector_map and self.settings.annotate:
+            draw = ImageDraw.Draw(image)
+            for idx in element_indices:
+                if idx in selector_map:
+                    element = selector_map[idx]
+                    if element and element.absolute_position:
+                        rect = element.absolute_position
+                        bbox = (
+                            round(rect.x * scale_x),
+                            round(rect.y * scale_y),
+                            round((rect.x + rect.width) * scale_x),
+                            round((rect.y + rect.height) * scale_y),
+                        )
+                        bbox = _clamp_bbox_to_image(bbox, image)
+
+                        if self.settings.spotlight and len(element_indices) == 1:
+                            _apply_spotlight(image, bbox)
+
+                        _draw_solid_rect(draw, bbox)
+                        if mode == 'arrow':
+                            _draw_short_arrow(draw, bbox)
+
+        # Build filename matching expected pattern: step_{step}_{action}_{action_index}_{click_index}_{ts}.png
+        timestamp_ms = int(time.time() * 1000)
+        click_index_fragment = str(element_indices[0]) if element_indices else 'na'
+        filename = f'step_{step_number:03d}_captureScreenshot_0_{click_index_fragment}_{timestamp_ms}.png'
+        output_path = self.base_dir / filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        await anyio.to_thread.run_sync(image.save, output_path, 'PNG')
+        self.logger.info(f'Saved guide screenshot -> {output_path}')
+
+        self._write_manifest_entry(
+            run_step_id=run_step_id if run_step_id is not None else step_number,
+            action_type=f'capture_screenshot_{mode}',
+            phase='guide',
+            action_index=0,
+            click_index=element_indices[0] if element_indices else None,
+            page_url=page_url,
+            file_path=output_path,
+            reason=reason,
+        )
+        return str(output_path)
+
     def _write_manifest_entry(
         self,
         *,
@@ -333,6 +469,7 @@ class ActionScreenshotRecorder:
         click_index: int | None,
         page_url: str | None,
         file_path: Path,
+        reason: str | None = None,
     ) -> None:
         """Persist lightweight metadata for deterministic screenshot mapping."""
         if not self.enabled:
@@ -347,6 +484,8 @@ class ActionScreenshotRecorder:
             'ts': int(time.time() * 1000),
             'file': str(file_path),
         }
+        if reason:
+            entry['reason'] = reason
         try:
             self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
             with self.manifest_path.open('a', encoding='utf-8') as f:

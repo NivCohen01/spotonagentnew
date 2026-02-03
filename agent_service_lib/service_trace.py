@@ -1341,6 +1341,50 @@ def _attach_images_by_evidence(
                         sub["primary_evidence_id"] = fallback_ids[0]
                 _attach_for_step(sub, label="sub-step")
 
+    # ------------------------------------------------------------------
+    # Deduplication pass: each unique image should appear at most once
+    # across the entire guide. If a parent step and its sub-steps share
+    # the same image, keep it only on the parent. If the same image
+    # appears on multiple unrelated steps, keep it on the first one.
+    # ------------------------------------------------------------------
+    used_images: set[str] = set()
+
+    for step in processed_steps:
+        parent_imgs = step.get("images") or []
+        parent_img = parent_imgs[0] if parent_imgs else None
+
+        sub_steps = step.get("sub_steps") if isinstance(step, dict) else None
+        if isinstance(sub_steps, list):
+            for sub in sub_steps:
+                if not isinstance(sub, dict):
+                    continue
+                sub_imgs = sub.get("images") or []
+                if not sub_imgs:
+                    continue
+                sub_img = sub_imgs[0]
+                # Remove if same as parent or already used elsewhere
+                if sub_img == parent_img or sub_img in used_images:
+                    sub["images"] = []
+                    logger.debug(
+                        "Dedup: removed duplicate image %s from sub-step %s (parent has same or already used)",
+                        sub_img,
+                        sub.get("number"),
+                    )
+                else:
+                    used_images.add(sub_img)
+
+        # Now handle the parent image
+        if parent_img:
+            if parent_img in used_images:
+                step["images"] = []
+                logger.debug(
+                    "Dedup: removed duplicate image %s from step %s (already used)",
+                    parent_img,
+                    step.get("number"),
+                )
+            else:
+                used_images.add(parent_img)
+
     guide_dict["steps"] = processed_steps
     return guide_dict
 

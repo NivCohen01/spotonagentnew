@@ -154,6 +154,42 @@ def _regroup_micro_steps(guide: GuideOutputWithEvidence) -> GuideOutputWithEvide
     )
 
 
+def _flatten_single_substeps(guide: GuideOutputWithEvidence) -> GuideOutputWithEvidence:
+	"""
+	Collapse any parent step that has exactly ONE sub_step into a plain step
+	(using the sub_step's description, evidence, etc.). A single sub_step is
+	redundant — it's just one action, so it should be a standalone step.
+	"""
+	steps = list(guide.steps or [])
+	changed = False
+	for step in steps:
+		if step.sub_steps and len(step.sub_steps) == 1:
+			sole = step.sub_steps[0]
+			# Promote the sub_step's description (more detailed) to the parent
+			step.description = sole.description
+			# Merge evidence: keep parent's evidence but add any sub_step-only ids
+			parent_ids = set(step.evidence_ids or [])
+			merged = list(step.evidence_ids or []) + [eid for eid in (sole.evidence_ids or []) if eid not in parent_ids]
+			step.evidence_ids = merged
+			if step.primary_evidence_id is None and sole.primary_evidence_id is not None:
+				step.primary_evidence_id = sole.primary_evidence_id
+			step.sub_steps = []
+			changed = True
+
+	if changed:
+		# Renumber
+		for n, st in enumerate(steps, 1):
+			st.number = n
+
+	return GuideOutputWithEvidence(
+		title=guide.title,
+		steps=steps,
+		links=guide.links,
+		notes=guide.notes,
+		success=guide.success,
+	)
+
+
 def _draft_steps_to_text(draft_steps: list[Any]) -> str:
     lines: list[str] = []
     for idx, step in enumerate(draft_steps, 1):
@@ -357,8 +393,10 @@ async def _generate_final_guide_with_evidence(
         - Form fields and multiple inputs MUST NOT be separate parent steps; they MUST be sub_steps under one parent summary (e.g., "Fill in the form and submit it").
         - Use sub_steps when 3+ micro-actions happen on the same screen (form fills, multiple toggles, multi-click sequences). The parent step description should summarize the cluster; each sub_step is one concrete action.
         - One action per step or sub_step. Do not combine independent actions in a single step.
-        - Never create a parent step with only ONE sub_step. If there is only one action, keep it as a parent step and omit sub_steps.
-        - CRITICAL: Parent steps with sub_steps must NOT repeat or paraphrase the sub_step content. The parent should be a SHORT high-level goal (3-6 words), NOT a concatenation of sub_steps.
+        - NEVER create a parent step with only ONE sub_step — that is just one action and MUST be a standalone parent step with sub_steps omitted (set to []). A parent with a single sub_step will be rejected.
+        - CRITICAL distinction between steps WITH and WITHOUT sub_steps:
+          * Steps WITHOUT sub_steps: Should be detailed and specific with UI labels, e.g., "Click the 'Chat' button in the left sidebar."
+          * Steps WITH sub_steps: The parent description should be a SHORT high-level goal (3-6 words), NOT a concatenation of sub_steps. The detail goes in sub_steps.
           BAD: "Type your message into the input box and click send" with sub_steps ["Type your message...", "Click send..."]
           GOOD: "Send a message" with sub_steps ["Type your message into the input box labeled 'Type a Message'.", "Click the send button (paper plane icon)."]
         - If the evidence table shows 2+ distinct evidence_ids with screenshots, produce at least 2 top-level steps unless they are truly the same action on the same screen.
@@ -374,6 +412,7 @@ async def _generate_final_guide_with_evidence(
         - Banned hedging words/phrases in user-facing text: "usually", "typically", "might", "may", "often", "likely",
           "around", "approximately", "roughly", "or a similar option", "or equivalent", "if needed".
         - Do not use vague placeholders like "appropriate button", "checkmark", "save icon", or "some menu".
+        - Do NOT guess element positions (e.g., "top-right corner", "bottom-left", "in the header"). Only mention a position if the element label or its container clearly implies it (e.g., "in the left sidebar" when the label is in a sidebar context). The screenshot shows the user where to click — do not hallucinate coordinates or locations.
         - If a required control or label is not identifiable from evidence AND is not present in the draft, set success=false and add a short note explaining what could not be verified.
         - If evidence labels are generic or low-information (e.g., "button button", "div div[4]"), prefer the draft step text and leave evidence_ids empty rather than dropping the step.
         - Do not collapse the guide to a single step when the draft contains multiple distinct actions; keep separate steps for distinct actions even if evidence is sparse.
@@ -423,12 +462,15 @@ async def _generate_final_guide_with_evidence(
         Reminder (must follow):
         - Only use evidence_ids from the evidence table.
         - 3+ micro-actions (enter/type/select/check/toggle/click submit/save/send) on the SAME pageUrl => one parent summary with sub_steps; do NOT leave them as separate parent steps.
-        - Parent step descriptions must be SHORT high-level goals (3-6 words like "Send a message" or "Complete the form"), NOT a concatenation of sub_step actions.
+        - Steps WITHOUT sub_steps: Be detailed and specific (e.g., "Click the 'Chat' button in the left sidebar.").
+        - Steps WITH sub_steps: Parent description should be SHORT (3-6 words like "Send a message"), with details in sub_steps.
         - Each PARENT step should include at least one evidence_id when evidence exists; avoid reusing the same evidence_id across different parent steps when possible.
         - sub_steps may reuse evidence_ids (including the parent's primary_evidence_id). Set them when you know the mapping; they may be empty if no specific sub-step evidence.
         - primary_evidence_id must be either null or one of evidence_ids.
         - Always set images: [] for steps and sub_steps.
         - Do not invent UI labels or controls; avoid vague placeholders like "appropriate button" or "checkmark".
+        - Do NOT guess element positions (e.g., "top-right corner", "bottom-left"). The screenshot shows where to click — do not hallucinate locations.
+        - NEVER have a parent step with only ONE sub_step. Flatten it to a standalone step with sub_steps=[].
         - Do not use hedging words like "usually", "typically", "might", or "may".
     """).strip()
 
@@ -451,7 +493,7 @@ async def _generate_final_guide_with_evidence(
                 success=completion.success,
             )
         )
-        return regrouped
+        return _flatten_single_substeps(regrouped)
     except Exception as exc:  # pragma: no cover - safeguard
         logging.getLogger("service").warning("Guide generation with evidence failed, using fallback | %r", exc)
         return _fallback_guide_from_evidence(task, draft, evidence_table)
@@ -803,6 +845,7 @@ async def run_session(sess: Session):
             - Act: choose ONE action that best matches the next goal.
             - Verify: confirm progress using concrete signals (URL change, modal opened/closed, new fields visible, confirmation text). If no clear progress or any error occurred, do not mark success.
             - If the same action type fails twice, change strategy (open menu, search if present, scroll, or go back).
+            - WRONG ELEMENT RECOVERY: If you clicked the wrong element (e.g., "Cancel" instead of "Save"), your INDEX was wrong. Re-read the FULL element list and match by EXACT text label. After a mis-click, perform the corrective click as a SINGLE action (do NOT batch with other actions). After 3 wrong-element failures, try send_keys (Tab+Enter) or a completely different UI path.
             - Prefer elements with clear semantic purpose (roles/aria/labels). Avoid clicking large containers unless they clearly match the goal.
             - Close unrelated modals/overlays before continuing.
 
@@ -819,7 +862,19 @@ async def run_session(sess: Session):
             - No "Step X" text inside descriptions.
             - No secrets/credentials; use placeholders like <your email>, <your message>.
             - Do not invent UI labels or use vague placeholders like "appropriate button" or "checkmark".
+            - Do NOT guess element positions (e.g., "top-right corner", "bottom-left"). Only mention position when the element's container clearly implies it (e.g., "in the sidebar"). The screenshot shows the user where to click.
             - Avoid hedging words like "usually", "typically", "might", or "may".
+
+            SCREENSHOT CAPTURE (HARD RULES - YOU CONTROL ALL SCREENSHOTS)
+            Nothing is captured automatically. If you don't request a screenshot, there is NO visual evidence for that part of the guide.
+            - For click actions: set screenshot_mode to "arrow" (point at element), "highlight" (border only), or "clean" (no annotation). Omit screenshot_mode or set null = NO capture.
+            - For non-click situations: use the `capture_screenshot` action to capture page states. You can emit it alongside other actions in the same step.
+              Example: [capture_screenshot(mode="clean", reason="Show the form page"), extract(query="...")]
+            - MUST capture when you land on a NEW important page (form, dashboard, settings, results) — use capture_screenshot(mode="clean") or capture_screenshot(mode="highlight", element_indices=[...]).
+            - MUST capture before calling `done` if the final page state is guide-relevant.
+            - A guide with only 1 screenshot is almost always wrong. Each distinct page/screen the user will see should have visual evidence.
+            - Choose annotation wisely: "arrow" to point at a specific element, "highlight" to mark an area/group, "clean" to show the whole page.
+            - NEVER capture the same page twice. If you already captured a screenshot of the current page state, do NOT capture it again. One screenshot per distinct page state is enough.
 
             AUTH / MAILBOX RULES (HARD GUARDRAILS)
             - Account creation IS APPROPRIATE when ALL of these are true: (1) you need to authenticate to complete the task, (2) no user credentials were provided to you, (3) the site offers a signup/create-account option. In this case, call `create_signup_mailbox` to get a pathix.io email/password and use them to sign up.

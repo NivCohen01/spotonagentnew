@@ -830,6 +830,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		await self._force_done_after_last_step(step_info)
 		await self._force_done_after_failure()
+		self._detect_repeated_failures()
 		return browser_state_summary
 
 	@observe_debug(ignore_input=True, name='get_next_action')
@@ -1010,6 +1011,53 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug('Force done action, because we reached max_failures.')
 			self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
+
+	_FAILURE_KEYWORDS = frozenset([
+		'fail', 'wrong', 'incorrect', 'instead of', 'mistake', 'not saved',
+		'could not', 'unable to', 'did not', 'was not', 'weren\'t',
+	])
+
+	def _detect_repeated_failures(self) -> None:
+		"""Detect repeated failure loops and inject a corrective context message.
+
+		The standard consecutive_failures counter only triggers when actions return
+		an error.  But many loops involve actions that *succeed* mechanically (e.g.
+		clicking a valid button) while semantically failing (clicking "Cancel"
+		instead of "Save").  The agent's own evaluation flags these as failures,
+		but consecutive_failures resets whenever a successful step intervenes.
+
+		This method scans the last N evaluations for semantic failure keywords.
+		If the density is high enough, it injects a strong warning context message
+		that nudges the agent to change its approach.
+		"""
+		items = self._message_manager.state.agent_history_items
+		if len(items) < 5:
+			return
+
+		window = items[-8:]
+		failure_count = 0
+		for item in window:
+			eval_text = (item.evaluation_previous_goal or '').lower()
+			if any(kw in eval_text for kw in self._FAILURE_KEYWORDS):
+				failure_count += 1
+
+		if failure_count < 3:
+			return
+
+		self.logger.warning(
+			f'Repeated failure loop detected: {failure_count} semantic failures in last {len(window)} steps'
+		)
+
+		warning = (
+			'⚠️ LOOP DETECTED: You have failed the same type of action multiple times. '
+			'STOP repeating and change your approach:\n'
+			'1. Do NOT batch multiple actions. Perform ONE action at a time so you can verify the result.\n'
+			'2. Before clicking, carefully match the element\'s EXACT text label in the element list to the button you need.\n'
+			'3. If clicking keeps hitting the wrong button, the indices may be shifting. '
+			'Try using send_keys (Tab to reach the correct button, then Enter) or a different UI path entirely.\n'
+			'4. If you have already tried 3+ times, consider whether the task can be completed via an alternative route.'
+		)
+		self._message_manager._add_context_message(UserMessage(content=warning))
 
 	@observe(ignore_input=True, ignore_output=False)
 	async def _judge_trace(self) -> JudgementResult | None:
@@ -2026,6 +2074,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					page_extraction_llm=self.settings.page_extraction_llm,
 					sensitive_data=self.sensitive_data,
 					available_file_paths=self.available_file_paths,
+					action_screenshot_recorder=self.action_screenshot_recorder,
+					step_number=self.state.n_steps,
 				)
 
 				time_end = time.time()

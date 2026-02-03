@@ -52,6 +52,8 @@ class Registry(Generic[Context]):
 			'available_file_paths': list,
 			'has_sensitive_data': bool,
 			'file_system': FileSystem,
+			'action_screenshot_recorder': None,  # ActionScreenshotRecorder, avoid circular import
+			'step_number': int,
 		}
 
 	def _normalize_action_function_signature(
@@ -317,6 +319,8 @@ class Registry(Generic[Context]):
 		file_system: FileSystem | None = None,
 		sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		available_file_paths: list[str] | None = None,
+		action_screenshot_recorder: Any = None,  # ActionScreenshotRecorder, avoid circular import
+		step_number: int = 0,
 	) -> Any:
 		"""Execute a registered action with simplified parameter handling"""
 		if action_name not in self.registry.actions:
@@ -350,6 +354,8 @@ class Registry(Generic[Context]):
 				'available_file_paths': available_file_paths,
 				'has_sensitive_data': action_name == 'input' and bool(sensitive_data),
 				'file_system': file_system,
+				'action_screenshot_recorder': action_screenshot_recorder,
+				'step_number': step_number,
 			}
 
 			# Only pass sensitive_data to actions that explicitly need it (input)

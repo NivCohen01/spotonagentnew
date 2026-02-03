@@ -12,6 +12,7 @@ except ImportError:
 from pydantic import BaseModel
 
 from browser_use.agent.views import ActionModel, ActionResult
+from browser_use.screenshots.action_recorder import ActionScreenshotRecorder
 from browser_use.browser import BrowserSession
 from browser_use.browser.events import (
 	ClickElementEvent,
@@ -35,6 +36,7 @@ from browser_use.observability import observe_debug
 from browser_use.tools.registry.service import Registry
 from browser_use.tools.utils import get_click_description
 from browser_use.tools.views import (
+	CaptureScreenshotAction,
 	ClickElementAction,
 	CloseTabAction,
 	DoneAction,
@@ -996,6 +998,65 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				metadata={'include_screenshot': True},
 			)
 
+		@self.registry.action(
+			'Capture a screenshot for the guide with optional annotations. Use to show important page states, highlight form areas, or draw attention to specific elements. Modes: "clean"=no annotations (page state), "highlight"=border around elements, "arrow"=border+arrow pointing to element.',
+			param_model=CaptureScreenshotAction,
+		)
+		async def capture_screenshot(
+			params: CaptureScreenshotAction,
+			browser_session: BrowserSession,
+			action_screenshot_recorder: ActionScreenshotRecorder | None = None,
+			step_number: int = 0,
+		):
+			"""Capture a screenshot for the guide with configurable annotations"""
+			if action_screenshot_recorder is None:
+				# Fallback: just request screenshot in next observation
+				memory = f'Captured screenshot for guide (mode={params.mode})'
+				if params.reason:
+					memory += f' - {params.reason}'
+				logger.info(f'📸 {memory}')
+				return ActionResult(
+					extracted_content=memory,
+					metadata={
+						'include_screenshot': True,
+						'guide_screenshot': True,
+						'screenshot_mode': params.mode,
+						'element_indices': params.element_indices,
+						'reason': params.reason,
+					},
+				)
+
+			# Use the recorder to capture with annotations
+			try:
+				path = await action_screenshot_recorder.capture_for_guide(
+					step_number=step_number,
+					run_step_id=step_number,
+					browser_session=browser_session,
+					browser_profile=browser_session.browser_profile,
+					mode=params.mode,  # type: ignore
+					element_indices=params.element_indices,
+					reason=params.reason,
+				)
+				if path:
+					memory = f'Captured guide screenshot: {path}'
+					if params.reason:
+						memory += f' ({params.reason})'
+					logger.info(f'📸 {memory}')
+					return ActionResult(
+						extracted_content=memory,
+						metadata={
+							'guide_screenshot_path': path,
+							'screenshot_mode': params.mode,
+							'element_indices': params.element_indices,
+							'reason': params.reason,
+						},
+					)
+				else:
+					return ActionResult(error='Failed to capture guide screenshot')
+			except Exception as e:
+				logger.error(f'Failed to capture guide screenshot: {e}')
+				return ActionResult(error=f'Failed to capture guide screenshot: {str(e)}')
+
 		# Dropdown Actions
 
 		@self.registry.action(
@@ -1405,6 +1466,8 @@ Validated Code (after quote fixing):
 		sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		available_file_paths: list[str] | None = None,
 		file_system: FileSystem | None = None,
+		action_screenshot_recorder: ActionScreenshotRecorder | None = None,
+		step_number: int = 0,
 	) -> ActionResult:
 		"""Execute an action"""
 
@@ -1436,6 +1499,8 @@ Validated Code (after quote fixing):
 							file_system=file_system,
 							sensitive_data=sensitive_data,
 							available_file_paths=available_file_paths,
+							action_screenshot_recorder=action_screenshot_recorder,
+							step_number=step_number,
 						)
 					except BrowserError as e:
 						logger.error(f'❌ Action {action_name} failed with BrowserError: {str(e)}')

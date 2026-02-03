@@ -168,6 +168,10 @@ class SpecialActionParameters(BaseModel):
 	available_file_paths: list[str] | None = None
 	has_sensitive_data: bool = False
 
+	# screenshot recorder for guide-related actions (capture_screenshot, etc.)
+	action_screenshot_recorder: Any | None = None
+	step_number: int = 0
+
 	@classmethod
 	def get_browser_requiring_params(cls) -> set[str]:
 		"""Get parameter names that require browser_session"""

@@ -1,6 +1,10 @@
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
+
+
+# Screenshot annotation modes for dynamic capture
+ScreenshotMode = Literal["default", "clean", "highlight", "arrow", "skip"]
 
 
 # Action Input Models
@@ -38,6 +42,10 @@ class ClickElementAction(BaseModel):
 	index: int | None = Field(default=None, ge=1, description='Element index from browser_state')
 	coordinate_x: int | None = Field(default=None, description='Horizontal coordinate relative to viewport left edge')
 	coordinate_y: int | None = Field(default=None, description='Vertical coordinate relative to viewport top edge')
+	screenshot_mode: ScreenshotMode | None = Field(
+		default=None,
+		description='Screenshot capture mode. Omit or null=no screenshot. "arrow"=border+arrow pointing to element, "highlight"=border only, "clean"=page screenshot without annotations, "skip"=no screenshot'
+	)
 	# expect_download: bool = Field(default=False, description='set True if expecting a download, False otherwise')  # moved to downloads_watchdog.py
 	# click_count: int = 1  # TODO
 
@@ -96,3 +104,19 @@ class GetDropdownOptionsAction(BaseModel):
 class SelectDropdownOptionAction(BaseModel):
 	index: int
 	text: str = Field(description='exact text/value')
+
+
+class CaptureScreenshotAction(BaseModel):
+	"""Capture a screenshot with configurable annotation for the guide."""
+	mode: Literal["clean", "highlight", "arrow"] = Field(
+		default="clean",
+		description='Annotation mode: "clean"=no annotations (show page state), "highlight"=border around elements, "arrow"=border+arrow pointing to element'
+	)
+	element_indices: list[int] | None = Field(
+		default=None,
+		description='Element indices to highlight (for "highlight" or "arrow" mode). If None with highlight/arrow mode, captures clean screenshot.'
+	)
+	reason: str | None = Field(
+		default=None,
+		description='Why this screenshot is important for the guide (helps with guide generation)'
+	)

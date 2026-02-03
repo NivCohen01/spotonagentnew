@@ -116,6 +116,8 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
         sensitive_data=None,
         available_file_paths=None,
         file_system=None,
+        action_screenshot_recorder=None,
+        step_number=0,
     ):
         allowed_email = allowed_creds_holder.get("email") or (getattr(sess, "generated_credentials", None) or {}).get("email")
         allowed_password = allowed_creds_holder.get("password") or (getattr(sess, "generated_credentials", None) or {}).get("password")
@@ -172,6 +174,8 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                             sensitive_data=sensitive_data,
                             available_file_paths=available_file_paths,
                             file_system=file_system,
+                            action_screenshot_recorder=action_screenshot_recorder,
+                            step_number=step_number,
                         )
 
                     if len(otp_indices) == 1:
@@ -218,6 +222,8 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                 sensitive_data=sensitive_data,
                 available_file_paths=available_file_paths,
                 file_system=file_system,
+                action_screenshot_recorder=action_screenshot_recorder,
+                step_number=step_number,
             )
             if getattr(result, "error", None):
                 return result
@@ -442,6 +448,8 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                             sensitive_data=sensitive_data,
                             available_file_paths=available_file_paths,
                             file_system=file_system,
+                            action_screenshot_recorder=action_screenshot_recorder,
+                            step_number=step_number,
                         )
 
                     if len(otp_indices) == 1:
@@ -570,6 +578,8 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
             sensitive_data=sensitive_data,
             available_file_paths=available_file_paths,
             file_system=file_system,
+            action_screenshot_recorder=action_screenshot_recorder,
+            step_number=step_number,
         )
 
         # After click actions on auth pages, wait for navigation/page stability and check for login errors
