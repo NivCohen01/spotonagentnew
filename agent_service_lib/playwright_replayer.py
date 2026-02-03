@@ -756,6 +756,15 @@ async def _perform_click(
         try:
             with contextlib.suppress(Exception):
                 await locator.hover(timeout=2000)  # type: ignore[union-attr]
+            # During replay, if a button is disabled (e.g. React form didn't
+            # detect a value change), force-enable it.  We know the action
+            # succeeded in the original run so this is safe for video replay.
+            with contextlib.suppress(Exception):
+                is_disabled = await locator.evaluate("el => el.disabled === true")  # type: ignore[union-attr]
+                if is_disabled:
+                    log.info("[replay/click] element is disabled — force-enabling for replay")
+                    await locator.evaluate("el => { el.disabled = false; el.removeAttribute('disabled'); }")  # type: ignore[union-attr]
+                    await asyncio.sleep(0.15)
             await locator.click(timeout=human.navigation_timeout_ms, delay=40)  # type: ignore[union-attr]
         except Exception as exc:
             log.warning("[replay/click] click failed: %s", exc)
@@ -863,6 +872,11 @@ async def _perform_type_like(
             text = str(entry.value or "")
 
         await _human_type_text(page, text, human)
+
+        # Note: disabled submit buttons are handled at the click level
+        # (force-enabled during replay) rather than trying to trick
+        # framework-specific form dirty state detection here.
+
         await asyncio.sleep(random.uniform(*human.post_type_pause_range))
 
     except Exception as exc:
@@ -1004,7 +1018,7 @@ async def replay_trace_to_video(
             while i < len(entries):
                 entry = entries[i]
                 action = (entry.action or "").lower()
-                is_required = int(getattr(entry, "relevance", 1) or 1) == 1
+                is_required = int(getattr(entry, "relevance", 1)) == 1
 
                 log.info("[replay] action=%s step=%s order=%s page=%s", entry.action, entry.step, entry.order, entry.page_url)
                 await _ensure_cursor_helpers(page)
@@ -1103,7 +1117,7 @@ async def replay_trace_to_video(
                     continue
 
                 # 4.5) OTP / Verification link
-                if action in ("otp", "verification_link"):
+                if action in ("otp", "fetch_mailbox_otp", "verification_link"):
                     params = entry.params or {}
                     email = params.get("email") or otp_email
                     password = _resolve_mailbox_password(email, otp_password)
@@ -1114,7 +1128,7 @@ async def replay_trace_to_video(
                         i += 1
                         continue
 
-                    if action == "otp":
+                    if action in ("otp", "fetch_mailbox_otp"):
                         try:
                             code = await fetch_latest_otp_imap(
                                 str(email),
@@ -1138,6 +1152,20 @@ async def replay_trace_to_video(
                                 raise RequiredActionError(entry.order or 0, entry.step, entry.action, "otp fields not found")
                         else:
                             applied += 1
+                        # Skip subsequent OTP digit input actions (the trace records
+                        # individual digit-by-digit inputs that are now redundant
+                        # since _fill_otp_inputs already filled all fields).
+                        otp_page = entry.page_url
+                        while i + 1 < len(entries):
+                            nxt = entries[i + 1]
+                            nxt_action = (nxt.action or "").lower()
+                            nxt_val = nxt.value or (nxt.params or {}).get("text", "")
+                            if nxt_action == "input" and nxt.page_url == otp_page and len(str(nxt_val)) <= 1:
+                                log.info("[replay] skipping OTP digit input (order=%s, value=%s)", nxt.order, nxt_val)
+                                applied += 1
+                                i += 1
+                            else:
+                                break
                         i += 1
                         continue
 

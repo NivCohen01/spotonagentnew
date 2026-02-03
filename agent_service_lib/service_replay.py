@@ -108,7 +108,7 @@ async def replay_action_trace_to_video(
 
     log = logger
     ordered_entries = _sort_entries(_unsanitize_entries(base_entries, otp_email, otp_password))
-    optional_orders = {e.order for e in ordered_entries if int(getattr(e, "relevance", 1) or 1) == 0}
+    optional_orders = {e.order for e in ordered_entries if int(getattr(e, "relevance", 1)) == 0}
     included_optional: set[int] = set()
     max_attempts = len(optional_orders) + 1
 
@@ -129,7 +129,7 @@ async def replay_action_trace_to_video(
     while attempt < max_attempts:
         attempt += 1
         candidate_entries = [
-            e for e in ordered_entries if int(getattr(e, "relevance", 1) or 1) == 1 or e.order in included_optional
+            e for e in ordered_entries if int(getattr(e, "relevance", 1)) == 1 or e.order in included_optional
         ]
         if not candidate_entries:
             candidate_entries = list(ordered_entries)
@@ -166,7 +166,7 @@ async def replay_action_trace_to_video(
             for entry in reversed(ordered_entries):
                 if entry.order >= exc.order:
                     continue
-                if int(getattr(entry, "relevance", 1) or 1) != 0:
+                if int(getattr(entry, "relevance", 1)) != 0:
                     continue
                 if entry.order in included_optional:
                     continue

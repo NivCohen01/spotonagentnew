@@ -418,7 +418,7 @@ def _flatten_action_trace_summary(trace: Any) -> list[ActionTraceEntry]:
                         element_text=item.get("element_text"),
                         element_tag=item.get("element_tag"),
                         params=params,
-                        relevance=int(item.get("relevance", 1) or 1),
+                        relevance=int(item["relevance"]) if "relevance" in item and item["relevance"] is not None else 1,
                     )
                 )
             except Exception:
@@ -443,7 +443,7 @@ def _apply_relevance_labels(entries: list[ActionTraceEntry], labels: list[int]) 
 
 def _filter_relevant_actions(entries: list[ActionTraceEntry]) -> list[ActionTraceEntry]:
     """Return only relevance=1 entries in original order."""
-    return [entry for entry in entries if int(getattr(entry, "relevance", 1) or 1) == 1]
+    return [entry for entry in entries if int(getattr(entry, "relevance", 1)) == 1]
 
 
 def _inject_auth_events(entries: list[ActionTraceEntry], auth_events: list[dict[str, Any]] | None) -> list[ActionTraceEntry]:
