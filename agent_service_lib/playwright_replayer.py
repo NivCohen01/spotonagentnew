@@ -8,6 +8,7 @@ import shutil
 import time
 import uuid
 from datetime import datetime, timedelta
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -27,7 +28,7 @@ except ImportError as exc:  # pragma: no cover
         "Playwright is required for video replay. Install with `uv add playwright` and run `playwright install chromium`."
     ) from exc
 
-from browser_use.browser.video_recorder import convert_webm_to_mp4, ensure_ffmpeg_available
+from browser_use.browser.video_recorder import convert_webm_to_mp4, convert_with_idle_speedup, ensure_ffmpeg_available
 
 from .service_config import CHROME_BIN, MAX_CHROME_CONCURRENCY
 from .service_models import ActionTraceEntry, DeviceType
@@ -99,6 +100,8 @@ class ReplayProfile(BaseModel):
 class ReplayState:
     mouse_x: float = 0.0
     mouse_y: float = 0.0
+    recording_started_at: float = 0.0
+    action_timestamps: list[tuple[float, float]] = dataclasses.field(default_factory=list)
 
 
 # -------------------------------------------------------------------
@@ -750,6 +753,7 @@ async def _perform_click(
         rect = await _get_absolute_rect(locator)
 
     if rect:
+        _t0 = time.monotonic()
         await _move_cursor_to_rect_center(page, state, rect, human)
         await _highlight_rect(page, rect, human.highlight_ms)
 
@@ -769,8 +773,10 @@ async def _perform_click(
         except Exception as exc:
             log.warning("[replay/click] click failed: %s", exc)
             return False, previous_url
+        state.action_timestamps.append((_t0 - state.recording_started_at, time.monotonic() - state.recording_started_at))
 
     elif coords:
+        _t0 = time.monotonic()
         cx, cy = coords
         duration = random.randint(human.cursor_min_ms, human.cursor_max_ms)
         speed = max(0.1, float(human.cursor_speed_multiplier or 1.0))
@@ -781,6 +787,7 @@ async def _perform_click(
         )
         with contextlib.suppress(Exception):
             await page.mouse.click(cx, cy, delay=35)
+        state.action_timestamps.append((_t0 - state.recording_started_at, time.monotonic() - state.recording_started_at))
     else:
         return False, previous_url
 
@@ -840,6 +847,7 @@ async def _perform_type_like(
     with contextlib.suppress(Exception):
         await locator.scroll_into_view_if_needed(timeout=5000)
 
+    _t0 = time.monotonic()
     rect = await _get_absolute_rect(locator)
     if rect:
         await _move_cursor_to_rect_center(page, state, rect, human)
@@ -872,6 +880,7 @@ async def _perform_type_like(
             text = str(entry.value or "")
 
         await _human_type_text(page, text, human)
+        state.action_timestamps.append((_t0 - state.recording_started_at, time.monotonic() - state.recording_started_at))
 
         # Note: disabled submit buttons are handled at the click level
         # (force-enabled during replay) rather than trying to trick
@@ -888,7 +897,7 @@ async def _perform_type_like(
     return True, new_url
 
 
-async def _perform_scroll(page: Page, entry: ActionTraceEntry, human: HumanizationProfile, log: logging.Logger) -> None:
+async def _perform_scroll(page: Page, state: ReplayState, entry: ActionTraceEntry, human: HumanizationProfile, log: logging.Logger) -> None:
     params = entry.params or {}
     direction = (params.get("direction") or params.get("dir") or "down").lower()
     magnitude = params.get("pixels") or params.get("amount") or human.scroll_amount
@@ -898,8 +907,10 @@ async def _perform_scroll(page: Page, entry: ActionTraceEntry, human: Humanizati
         delta = human.scroll_amount
     dy = abs(delta) if direction in ("down", "next") else -abs(delta)
 
+    _t0 = time.monotonic()
     with contextlib.suppress(Exception):
         await page.mouse.wheel(0, dy)
+    state.action_timestamps.append((_t0 - state.recording_started_at, time.monotonic() - state.recording_started_at))
     log.info("[replay/scroll] direction=%s amount=%s", direction, dy)
 
     await asyncio.sleep(random.uniform(*human.post_idle_range))
@@ -987,6 +998,7 @@ async def replay_trace_to_video(
 
             page = await context.new_page()
             recording_started_at = time.monotonic()
+            state.recording_started_at = recording_started_at
             await _ensure_cursor_helpers(page)
 
             # Initialize state/mouse/cursor to center once
@@ -1145,7 +1157,10 @@ async def replay_trace_to_video(
                             skipped.append(f"otp (step {entry.step}): otp not received")
                             i += 1
                             continue
+                        _t0 = time.monotonic()
                         filled = await _fill_otp_inputs(page, str(code), human)
+                        if filled:
+                            state.action_timestamps.append((_t0 - state.recording_started_at, time.monotonic() - state.recording_started_at))
                         if not filled:
                             skipped.append(f"otp (step {entry.step}): otp fields not found")
                             if stop_on_required_failure and is_required:
@@ -1185,7 +1200,7 @@ async def replay_trace_to_video(
 
                 # 5) Scroll
                 if action == "scroll":
-                    await _perform_scroll(page, entry, human, log)
+                    await _perform_scroll(page, state, entry, human, log)
                     applied += 1
                     i += 1
                     continue
@@ -1239,9 +1254,31 @@ async def replay_trace_to_video(
         elif trim_leading_seconds is not None:
             trim_seconds = max(0.0, float(trim_leading_seconds))
 
+        log.info(
+            "[replay] trim_seconds=%.3f recording_started_at=%s first_nav_done_at=%s trim_before_first_page_load=%s",
+            trim_seconds or 0,
+            recording_started_at,
+            first_nav_done_at,
+            trim_before_first_page_load,
+        )
+
         try:
-            convert_webm_to_mp4(webm_path, mp4_path, fps=recording_fps, trim_start_seconds=trim_seconds)
-            log.info("[replay] converted %s -> %s", webm_path, mp4_path)
+            if state.action_timestamps:
+                log.info(
+                    "[replay] idle speedup: %d action intervals recorded, first=%.3f-%.3f last=%.3f-%.3f",
+                    len(state.action_timestamps),
+                    state.action_timestamps[0][0], state.action_timestamps[0][1],
+                    state.action_timestamps[-1][0], state.action_timestamps[-1][1],
+                )
+                convert_with_idle_speedup(
+                    webm_path, mp4_path, state.action_timestamps,
+                    fps=recording_fps, trim_start_seconds=trim_seconds,
+                    idle_speed=4.0,
+                )
+                log.info("[replay] converted with idle speedup %s -> %s", webm_path, mp4_path)
+            else:
+                convert_webm_to_mp4(webm_path, mp4_path, fps=recording_fps, trim_start_seconds=trim_seconds)
+                log.info("[replay] converted %s -> %s", webm_path, mp4_path)
         except Exception as exc:
             log.error("[replay] ffmpeg conversion failed: %s", exc)
             skipped.append(f"conversion failed: {exc}")
