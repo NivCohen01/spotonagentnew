@@ -378,6 +378,10 @@ async def _generate_final_guide_with_evidence(
 
         CRITICAL SCOPE POLICY (HARD RULES)
         - If authentication steps are out of scope, do NOT include login/MFA/signup/password reset/credential entry steps. Treat any "Start url: ..." text as tooling context, not a user step.
+        - Phrases like "Starting from https://.../login" or "Starting from https://.../signin" are CONTEXT ONLY.
+          Do NOT include login/sign-in steps unless the user explicitly asked for them.
+        - IMPORTANT: Tokens like "/login" appearing inside a URL do NOT count as the user explicitly asking for login instructions.
+          Only include login/sign-in steps if the user's non-URL text asks for them (e.g., "how do I log in", "I can't sign in").
         - If authentication steps are in scope, you may include them when relevant but never reveal secrets (use placeholders).
         - Default starting point is post-authenticated only when auth steps are out of scope; otherwise follow the run flow.
         - Credentials included in the task (username/password/OTP hints) are EXECUTION CONTEXT ONLY.
@@ -443,6 +447,11 @@ async def _generate_final_guide_with_evidence(
           * `steps` MUST NOT mention login, credentials, passwords, MFA, or the login page.
           * Any authentication-related evidence may be ignored and must not force login steps.
         - If any step violates this policy, regenerate a compliant guide.
+
+        ADDITIONAL CHECK (MANDATORY)
+        - If the task does NOT explicitly ask for login/sign-in help, your final `steps` MUST NOT include a "Sign In"/"Log in" step,
+          even if the run started at a login URL and the evidence table contains a login click.
+        - If you accidentally included an auth step, remove it and regenerate the guide.
         """).strip()
 
     draft_steps_text = _draft_steps_to_text(draft.get("steps") or [])
@@ -605,6 +614,10 @@ class Session:
         self.guide_id: Optional[int] = req.guide_id
         self.guide_family_key: Optional[str] = req.guide_family_key
 
+        # True when NodeJS pre-created the run/guide records (job queue flow).
+        # db_insert_run will UPDATE instead of INSERT when this is set.
+        self.run_preexists: bool = bool(req.run_id)
+
         self.use_vision = req.use_vision
         self.max_failures = req.max_failures
         self.extend_system_message = req.extend_system_message
@@ -618,7 +631,20 @@ class Session:
         self.directly_open_url = req.directly_open_url
         self.optimize_task = req.optimize_task
 
-        opts = req.action_screenshots or ActionScreenshotOptions()
+        # Back-compat: start from legacy flags, then override with explicitly provided nested options.
+        base_opts = ActionScreenshotOptions(
+            enabled=req.action_screenshots_enabled,
+            annotate=req.action_screenshots_annotate,
+            spotlight=req.action_screenshots_spotlight,
+            include_in_available_files=req.action_screenshots_include_files,
+            session_subdirectories=req.action_screenshots_session_dirs,
+        )
+        opts = req.action_screenshots
+        if opts is None:
+            opts = base_opts
+        else:
+            override = opts.model_dump(exclude_unset=True) if hasattr(opts, "model_dump") else {}
+            opts = base_opts.model_copy(update=override) if override else base_opts
         self.action_screenshot_options = opts
         self.action_screenshots_enabled = opts.enabled
         self.action_screenshots_annotate = opts.annotate
@@ -747,7 +773,10 @@ async def run_session(sess: Session):
                             - include_auth_in_final_guide can be true ONLY if the user explicitly asked for login/signup/password reset/MFA/verification
                             (in any language), e.g.:
                             - "how do I log in", "sign in", "create an account", "verify my email", "enter OTP", "reset password",
-                            - "from the login page", "I can't sign in", "my OTP doesn't arrive"
+                            - "I can't sign in", "my OTP doesn't arrive"
+                            - Phrases like "Starting from https://.../login", "Starting from the login page", or "Start url: https://.../login"
+                              are CONTEXT ONLY and do NOT mean the user wants login steps in the final guide.
+                            - IMPORTANT: Treat "/login" or similar tokens inside URLs as NOT being an explicit request to document login.
                             - If the task is about an in-app workflow (e.g., create article, send message, create user),
                             include_auth_in_final_guide MUST be false even if authentication is required to perform the task.
                             - Do NOT treat 'Start url: ...' as a user request. It's tooling context.
@@ -850,7 +879,8 @@ async def run_session(sess: Session):
             - Close unrelated modals/overlays before continuing.
 
             SCOPE / DEFAULT START STATE (HARD RULES)
-            - Include authentication steps in the final guide only if the classified intent says to include them; otherwise omit them (you may still perform them during execution).
+            - Do NOT include authentication steps (login/signup/password reset/MFA/OTP/credential entry) in the final guide unless the user explicitly asked for them.
+            - If the task contains a login URL or says "Starting from .../login", treat it as EXECUTION CONTEXT only and start the guide from the first in-app action after authentication.
             - Ignore any "Start url: ..." text; it is tooling context and must not appear in steps or notes.
             - Do NOT add notes like "You're signed in..."; just start from the first in-app action.
 
@@ -909,6 +939,7 @@ async def run_session(sess: Session):
             - `steps` must be plain strings (no numbering).
             - `title` should be short and task-focused.
             - `notes` optional; use only for one important caveat (not prerequisites).
+            - Do NOT use `write_file` or `read_file` for the final guide. Provide the guide directly in the `done` payload.
             - Only call `done` when the goal is verified from the CURRENT page state. If you cannot verify the outcome, keep working or return failure with a concrete reason.
             - Login success must be verified by absence of login form AND presence of authenticated UI signals (account/avatar/menu/dashboard).
             - Navigation success must be verified by a relevant URL/content change.

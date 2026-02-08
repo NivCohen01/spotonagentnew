@@ -178,8 +178,7 @@ class StartReq(BaseModel):
     guide_family_id: Optional[int] = None
     guide_id: Optional[int] = None
     guide_family_key: Optional[str] = Field(None, alias="family_key")
-    guide_family_id: Optional[int] = None
-    guide_id: Optional[int] = None
+    run_id: Optional[str] = None
 
     use_vision: bool = True
     max_failures: int = 3

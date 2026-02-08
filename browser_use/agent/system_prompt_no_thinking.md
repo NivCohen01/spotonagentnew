@@ -158,7 +158,7 @@ Be clear and concise in your decision-making. Exhibit the following reasoning pa
 - Before writing data into a file, analyze the <file_system> and check if the file already has some content to avoid overwriting.
 - Decide what concise, actionable context should be stored in memory to inform future reasoning.
 - When ready to finish, state you are preparing to call done and communicate completion/results to the user.
-- Before done, use read_file to verify file contents intended for user output.
+- Use read_file to verify file contents intended for user output only if you wrote or modified a file and need to confirm its contents. If you read a file for verification, call done in the very next step and do not re-read the same file unless it changed.
 - Always reason about the <user_request>. Make sure to carefully analyze the specific steps and information required. E.g. specific filters, specific form fields, specific information to search. Make sure to always compare the current trajactory with the user request and think carefully if thats how the user requested it.
 </reasoning_rules>
 <examples>

@@ -147,7 +147,7 @@ def root():
 async def start_session(req: StartReq):
     if req.workspace_id is None:
         raise HTTPException(status_code=400, detail="workspace_id (or ws_id) is required")
-    session_id = uuid.uuid4().hex[:12]
+    session_id = req.run_id if req.run_id else uuid.uuid4().hex[:12]
     sess = Session(session_id=session_id, req=req)
 
     if req.guide_family_key:

@@ -545,22 +545,33 @@ async def db_insert_run(sess: "Session"):
     if not SessionLocal:
         return
     log = logging.getLogger("service")
-    async with SessionLocal() as db:
-        await db.execute(
-            text(
-                """INSERT INTO runs (id, ws_id, task, start_url, headless, state)
-                    VALUES (:id, :ws_id, :task, :start_url, :headless, :state)"""
-            ),
-            {
-                "id": sess.id,
-                "ws_id": sess.workspace_id,
-                "task": sess.task,
-                "start_url": sess.start_url,
-                "headless": 1 if sess.headless else 0,
-                "state": "starting",
-            },
-        )
-        await db.commit()
+
+    if sess.run_preexists:
+        # NodeJS already created the runs record — just update state.
+        async with SessionLocal() as db:
+            await db.execute(
+                text("UPDATE runs SET state=:state WHERE id=:id"),
+                {"state": "starting", "id": sess.id},
+            )
+            await db.commit()
+        log.info("Run %s pre-exists (NodeJS job queue); updated state to 'starting'", sess.id)
+    else:
+        async with SessionLocal() as db:
+            await db.execute(
+                text(
+                    """INSERT INTO runs (id, ws_id, task, start_url, headless, state)
+                        VALUES (:id, :ws_id, :task, :start_url, :headless, :state)"""
+                ),
+                {
+                    "id": sess.id,
+                    "ws_id": sess.workspace_id,
+                    "task": sess.task,
+                    "start_url": sess.start_url,
+                    "headless": 1 if sess.headless else 0,
+                    "state": "starting",
+                },
+            )
+            await db.commit()
 
     family_key = getattr(sess, "guide_family_key", None) or derive_guide_family_key(sess.workspace_id, sess.task, sess.start_url)
     title = (sess.task or "Generating guide").strip()
