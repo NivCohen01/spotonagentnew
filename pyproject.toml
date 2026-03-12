@@ -168,6 +168,7 @@ include = [
     "browser_use/agent/system_prompt_no_thinking.md",
     "browser_use/agent/system_prompt_flash.md",
     "browser_use/agent/system_prompt_flash_anthropic.md",
+    "browser_use/agent/style_guide_prompt.md",
     "browser_use/code_use/system_prompt.md",
     "browser_use/cli_templates/*.py",
     "browser_use/py.typed",

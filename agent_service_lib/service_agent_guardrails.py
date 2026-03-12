@@ -87,14 +87,35 @@ async def ensure_signup_mailbox(sess: Any, log: Optional[logging.Logger] = None)
     return sess.generated_credentials
 
 
-def install_auth_guardrails(tools: Tools, sess: Any) -> None:
+def _email_is_otp_capable(email: str, allowed_otp_domains: list[str]) -> bool:
+    """Return True if the email domain is in the list of OTP-capable domains.
+
+    General, site-agnostic check. Does NOT hardcode any specific domain name.
+    Callers configure which domains support automated OTP retrieval.
     """
-    Install runtime guardrails on tools.act:
-    - OTP auto-fill for @pathix.io when OTP fields are detected
+    email_lower = email.lower()
+    return any(email_lower.endswith(f'@{d.lower().lstrip("@")}') for d in allowed_otp_domains)
+
+
+def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[str] | None = None) -> None:
+    """Install runtime guardrails on tools.act.
+
+    Args:
+        tools: The Tools instance to wrap.
+        sess: The session object (arbitrary; accessed via getattr).
+        allowed_otp_domains: Domains for which automated OTP retrieval is supported.
+            Defaults to [DEFAULT_DOMAIN] for backward compatibility.
+            Pass a custom list to enable OTP for other mailbox domains.
+
+    Guardrails applied:
+    - OTP auto-fill when OTP fields are detected and email is in allowed_otp_domains
     - Prevent calling done while still unauthenticated (password/otp fields visible)
     - Block dummy credentials; enforce allowed credentials only
-    - Auto-generate pathix credentials during signup intent
+    - Auto-generate credentials during signup intent (via ensure_signup_mailbox)
     """
+    if allowed_otp_domains is None:
+        allowed_otp_domains = [DEFAULT_DOMAIN]
+
     log = logging.getLogger("service")
 
     allowed_creds_holder = {
@@ -147,7 +168,7 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                     attempted.add(current_url or "")
                     if not allowed_email:
                         return ActionResult(error="OTP required; cannot continue automatically.")
-                    if not allowed_email.lower().endswith(f"@{DEFAULT_DOMAIN}"):
+                    if not _email_is_otp_capable(allowed_email, allowed_otp_domains):
                         return ActionResult(error="OTP required; cannot continue automatically.")
 
                     password_candidates = _candidate_mailbox_passwords(sess, allowed_email, allowed_password)
@@ -187,6 +208,13 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
                             await _send_otp(otp_indices[pos], digit)
 
                     log.info("OTP auto-fill completed for %s on %s", allowed_email, current_url or "<unknown>")
+                    # Cache the code so the agent's explicit fetch_mailbox_otp tool
+                    # returns it immediately without a second IMAP fetch.
+                    # Keyed by (url, email) to survive URL changes within the same session.
+                    if not hasattr(sess, 'otp_filled_cache'):
+                        sess.otp_filled_cache = {}
+                    sess.otp_filled_cache[current_url or ''] = code
+                    sess.otp_filled_cache[f'email:{allowed_email.lower()}'] = code
                     _record_auth_event(
                         sess,
                         {
@@ -327,9 +355,9 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
 
                 if needs_email_link:
                     target_email = None
-                    if allowed_email and allowed_email.lower().endswith(f"@{DEFAULT_DOMAIN}"):
+                    if allowed_email and _email_is_otp_capable(allowed_email, allowed_otp_domains):
                         target_email = allowed_email.lower()
-                    elif (getattr(sess, "user_credentials", None) or {}).get("email", "").lower().endswith(f"@{DEFAULT_DOMAIN}"):
+                    elif _email_is_otp_capable((getattr(sess, "user_credentials", None) or {}).get("email", ""), allowed_otp_domains):
                         target_email = (getattr(sess, "user_credentials", None) or {}).get("email", "").lower()
 
                     if not target_email:
@@ -413,67 +441,86 @@ def install_auth_guardrails(tools: Tools, sess: Any) -> None:
             otp_indices = await _detect_otp_indices(browser_session)
             if otp_indices:
                 target_email = None
-                if allowed_email and allowed_email.lower().endswith(f"@{DEFAULT_DOMAIN}"):
+                if allowed_email and _email_is_otp_capable(allowed_email, allowed_otp_domains):
                     target_email = allowed_email.lower()
-                elif (getattr(sess, "user_credentials", None) or {}).get("email", "").lower().endswith(f"@{DEFAULT_DOMAIN}"):
+                elif _email_is_otp_capable((getattr(sess, "user_credentials", None) or {}).get("email", ""), allowed_otp_domains):
                     target_email = (getattr(sess, "user_credentials", None) or {}).get("email", "").lower()
 
-                if target_email and target_email.endswith(f"@{DEFAULT_DOMAIN}"):
-                    log.info("OTP fields detected %s; attempting auto-fill using %s", otp_indices, target_email)
+                if target_email and _email_is_otp_capable(target_email, allowed_otp_domains):
                     current_url = ""
                     with contextlib.suppress(Exception):
                         current_url = await browser_session.get_current_page_url()
-                    password_candidates = _candidate_mailbox_passwords(sess, target_email, allowed_password)
-                    mailbox_password = password_candidates[0] if password_candidates else None
-                    if not mailbox_password:
-                        return ActionResult(error="OTP required; IMAP unavailable.")
 
-                    since_ts = getattr(sess, "generated_credentials_created_at", None) or (dt.datetime.utcnow() - dt.timedelta(minutes=10))
-                    try:
-                        code = await fetch_latest_otp_imap(target_email, mailbox_password, since_ts, attempts=18, interval=10)
-                    except Exception as exc:
-                        log.info("OTP auto-fill aborted: IMAP fetch failed for %s | %r", target_email, exc)
-                        return ActionResult(error="OTP required; IMAP unavailable.")
-                    if not code:
-                        log.info("OTP auto-fill exhausted polling for %s", target_email)
-                        return ActionResult(error="OTP not received")
+                    # Deduplication: skip if already handled for this URL or email
+                    _otp_attempted = getattr(sess, "otp_attempted_urls", None)
+                    if _otp_attempted is None:
+                        sess.otp_attempted_urls = set()
+                        _otp_attempted = sess.otp_attempted_urls
 
-                    async def _send_otp_text(idx: int, txt: str):
-                        new_input = InputTextAction(index=idx, text=txt, clear=True)
-                        input_action = action.__class__(**{"input": new_input})
-                        return await orig_act(
-                            action=input_action,
-                            browser_session=browser_session,
-                            page_extraction_llm=page_extraction_llm,
-                            sensitive_data=sensitive_data,
-                            available_file_paths=available_file_paths,
-                            file_system=file_system,
-                            action_screenshot_recorder=action_screenshot_recorder,
-                            step_number=step_number,
-                        )
-
-                    if len(otp_indices) == 1:
-                        await _send_otp_text(otp_indices[0], code)
-                    else:
-                        for pos, digit in enumerate(code):
-                            if pos >= len(otp_indices):
-                                break
-                            await _send_otp_text(otp_indices[pos], digit)
-                    log.info("OTP auto-fill completed for %s", target_email)
-                    _record_auth_event(
-                        sess,
-                        {
-                            "action": "otp",
-                            "step": getattr(sess, "current_step", None),
-                            "page_url": current_url,
-                            "params": {
-                                "email": target_email,
-                                "since_ts": since_ts.isoformat() if isinstance(since_ts, dt.datetime) else None,
-                                "digits": len(code),
-                            },
-                            "ts": int(dt.datetime.utcnow().timestamp() * 1000),
-                        },
+                    _already_done = (
+                        (current_url and current_url in _otp_attempted) or
+                        (f"email:{target_email}" in (getattr(sess, "otp_filled_cache", None) or {}))
                     )
+                    if _already_done:
+                        log.debug("OTP click handler: already handled for %s, skipping", target_email)
+                    else:
+                        log.info("OTP fields detected %s; attempting auto-fill using %s", otp_indices, target_email)
+                        _otp_attempted.add(current_url or "")
+                        password_candidates = _candidate_mailbox_passwords(sess, target_email, allowed_password)
+                        mailbox_password = password_candidates[0] if password_candidates else None
+                        if not mailbox_password:
+                            return ActionResult(error="OTP required; IMAP unavailable.")
+
+                        since_ts = getattr(sess, "generated_credentials_created_at", None) or (dt.datetime.utcnow() - dt.timedelta(minutes=10))
+                        try:
+                            code = await fetch_latest_otp_imap(target_email, mailbox_password, since_ts, attempts=18, interval=10)
+                        except Exception as exc:
+                            log.info("OTP auto-fill aborted: IMAP fetch failed for %s | %r", target_email, exc)
+                            return ActionResult(error="OTP required; IMAP unavailable.")
+                        if not code:
+                            log.info("OTP auto-fill exhausted polling for %s", target_email)
+                            return ActionResult(error="OTP not received")
+
+                        async def _send_otp_text(idx: int, txt: str):
+                            new_input = InputTextAction(index=idx, text=txt, clear=True)
+                            input_action = action.__class__(**{"input": new_input})
+                            return await orig_act(
+                                action=input_action,
+                                browser_session=browser_session,
+                                page_extraction_llm=page_extraction_llm,
+                                sensitive_data=sensitive_data,
+                                available_file_paths=available_file_paths,
+                                file_system=file_system,
+                                action_screenshot_recorder=action_screenshot_recorder,
+                                step_number=step_number,
+                            )
+
+                        if len(otp_indices) == 1:
+                            await _send_otp_text(otp_indices[0], code)
+                        else:
+                            for pos, digit in enumerate(code):
+                                if pos >= len(otp_indices):
+                                    break
+                                await _send_otp_text(otp_indices[pos], digit)
+                        log.info("OTP auto-fill completed for %s", target_email)
+                        if not hasattr(sess, "otp_filled_cache"):
+                            sess.otp_filled_cache = {}
+                        sess.otp_filled_cache[current_url or ""] = code
+                        sess.otp_filled_cache[f"email:{target_email}"] = code
+                        _record_auth_event(
+                            sess,
+                            {
+                                "action": "otp",
+                                "step": getattr(sess, "current_step", None),
+                                "page_url": current_url,
+                                "params": {
+                                    "email": target_email,
+                                    "since_ts": since_ts.isoformat() if isinstance(since_ts, dt.datetime) else None,
+                                    "digits": len(code),
+                                },
+                                "ts": int(dt.datetime.utcnow().timestamp() * 1000),
+                            },
+                        )
                 else:
                     return ActionResult(error="OTP required; cannot continue automatically.")
 

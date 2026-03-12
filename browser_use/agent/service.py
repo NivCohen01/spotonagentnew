@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hashlib
 import inspect
 import json
 import logging
@@ -7,6 +8,7 @@ import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
 from urllib.parse import urlparse
@@ -56,7 +58,7 @@ from browser_use.agent.views import (
 )
 from browser_use.browser.profile import ViewportSize
 from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
-from browser_use.browser.views import BrowserStateSummary
+from browser_use.browser.views import BrowserStateSummary, PageReadinessInfo
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement
 from browser_use.filesystem.file_system import FileSystem
@@ -789,6 +791,33 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
+		# ── READINESS GATE ─────────────────────────────────────────────────────────
+		# Wait for the DOM to settle before extracting state. This prevents the agent
+		# from seeing a stale/partial page and acting on incomplete information.
+		# We never block hard here — if the page doesn't stabilise within the timeout
+		# we proceed anyway but record is_ready=False in the state so the LLM knows.
+		self.logger.debug(f'🌐 Step {self.state.n_steps}: Waiting for stable UI...')
+		try:
+			stability = await self.browser_session.wait_for_stable_ui(
+				timeout=3.0,
+				quiet_ms=300,
+				fallback_quiet_ms=50,
+			)
+			page_readiness = PageReadinessInfo(
+				is_ready=stability.is_stable,
+				ready_state=stability.metrics.ready_state if stability.metrics else 'unknown',
+				stable_for_ms=stability.metrics.quiet_for_ms if stability.metrics else 0,
+			)
+			if not stability.is_stable:
+				self.logger.debug(
+					f'⚠️  Page not fully stable before step {self.state.n_steps} '
+					f'(ready_state={page_readiness.ready_state}, stable_for={page_readiness.stable_for_ms}ms)'
+				)
+		except Exception as e:
+			self.logger.debug(f'Readiness gate error (non-fatal): {e}')
+			page_readiness = PageReadinessInfo(is_ready=False, ready_state='unknown', stable_for_ms=0)
+		# ───────────────────────────────────────────────────────────────────────────
+
 		self.logger.debug(f'🌐 Step {self.state.n_steps}: Getting browser state...')
 		# Always take screenshots for all steps
 		self.logger.debug('📸 Requesting browser state with include_screenshot=True')
@@ -796,6 +825,44 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			include_screenshot=True,  # always capture even if use_vision=False so that cloud sync is useful (it's fast now anyway)
 			include_recent_events=self.include_recent_events,
 		)
+
+		# Attach readiness info to state summary
+		browser_state_summary.page_readiness = page_readiness
+
+		# ── OVERLAY DETECTION ──────────────────────────────────────────────────────
+		# Detect CSS-positioned overlays (modals, drawers, spinners) that may be
+		# blocking interaction. Results are attached to the state so the LLM can
+		# prioritise closing them before pursuing the main goal.
+		try:
+			overlays = await self.browser_session.detect_blocking_overlays()
+			# Try to find close button indices in the current selector map
+			if overlays and browser_state_summary.dom_state and browser_state_summary.dom_state.selector_map:
+				selector_map = browser_state_summary.dom_state.selector_map
+				for overlay in overlays:
+					# Look for a close button: element whose label contains close-like keywords.
+					# Uses get_meaningful_text_for_llm() which returns the LLM-visible description.
+					for idx, node in selector_map.items():
+						try:
+							label = (node.get_meaningful_text_for_llm() or '').lower()
+						except Exception:
+							label = ''
+						# Also check aria-label attribute directly
+						aria_label = (node.attributes or {}).get('aria-label', '') or ''
+						combined = label + ' ' + aria_label.lower()
+						if any(k in combined for k in ('close', 'dismiss', 'cancel', '×', '✕')):
+							overlay.close_index = idx
+							break
+			browser_state_summary.blocking_overlays = overlays
+			if overlays:
+				blocking = [o for o in overlays if o.is_blocking]
+				if blocking:
+					self.logger.debug(
+						f'🚨 Step {self.state.n_steps}: {len(blocking)} blocking overlay(s) detected: '
+						+ ', '.join(o.description for o in blocking)
+					)
+		except Exception as e:
+			self.logger.debug(f'Overlay detection error (non-fatal): {e}')
+		# ───────────────────────────────────────────────────────────────────────────
 		if browser_state_summary.screenshot:
 			self.logger.debug(f'📸 Got browser state WITH screenshot, length: {len(browser_state_summary.screenshot)}')
 		else:
@@ -831,6 +898,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		await self._force_done_after_last_step(step_info)
 		await self._force_done_after_failure()
 		self._detect_repeated_failures()
+
+		# Conceptual loop detection: check pending actions against recent history
+		if self.state.last_model_output and self.state.last_model_output.action:
+			loop_warning = self._check_action_loop(self.state.last_model_output.action)
+			if loop_warning:
+				self._message_manager._add_context_message(UserMessage(content=loop_warning))
+
 		return browser_state_summary
 
 	@observe_debug(ignore_input=True, name='get_next_action')
@@ -1017,6 +1091,115 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		'could not', 'unable to', 'did not', 'was not', 'weren\'t',
 	])
 
+	# Actions driven by external state (auth/session infra), not planner intent.
+	# Exclude from loop signature tracking to avoid false loop signals from
+	# internally-driven auth behavior that isn't a true planner loop.
+	# Also exclude observation/verification actions that are never "stuck" loops.
+	_LOOP_EXCLUDED_ACTION_TYPES: frozenset[str] = frozenset({
+		'fetch_mailbox_otp',
+		'fetch_mailbox_verification_link',
+		'wait',           # deliberate stall, not a conceptual loop
+		'screenshot',     # observation/verification, not planner intent
+		'take_screenshot',
+		'capture_screenshot',
+		'done',           # terminal action, never a loop
+	})
+
+	# Generic container HTML tags that should not be click targets when more specific
+	# interactive descendants exist in the selector map.
+	_CONTAINER_TAGS: frozenset[str] = frozenset({
+		'div', 'section', 'article', 'main', 'aside', 'nav',
+		'header', 'footer', 'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+		'figure', 'figcaption', 'details', 'form', 'fieldset',
+	})
+
+	# ── CONTAINER SPECIFICITY CHECK ─────────────────────────────────────────────
+
+	def _get_interactive_descendants_in_map(
+		self,
+		node: Any,
+		selector_map: dict,
+		max_depth: int = 6,
+		max_count: int = 12,
+	) -> list[int]:
+		"""Return backend_node_ids of descendants present in the selector map.
+
+		Caps traversal at max_depth and max_count for performance safety.
+		General: works for any DOM subtree, no site-specific logic.
+		"""
+		result: list[int] = []
+
+		def _traverse(n: Any, depth: int) -> None:
+			if depth > max_depth or len(result) >= max_count:
+				return
+			for child in (getattr(n, 'children_nodes', None) or []):
+				if getattr(child, 'backend_node_id', None) in selector_map:
+					result.append(child.backend_node_id)
+				if len(result) < max_count:
+					_traverse(child, depth + 1)
+
+		_traverse(node, 0)
+		return result
+
+	def _check_container_specificity(
+		self,
+		node: Any,
+		selector_map: dict,
+		action: ActionModel,
+	) -> 'Agent.GroundingResult | None':
+		"""Reject click on a generic container when interactive descendants exist.
+
+		Returns GroundingResult(is_valid=False) with guidance when:
+		- The action is a click
+		- The target element is a generic container tag (div, section, etc.)
+		- That container has no explicit interactive role (role=button etc.)
+		- At least one more-specific interactive descendant exists in the selector map
+
+		This prevents agents from clicking large dialog/form wrapper divs instead of
+		the specific input fields, buttons, or links inside them.
+
+		General: no hardcoded labels, classes, or site-specific conditions.
+		"""
+		# Only applies to click actions
+		action_data = action.model_dump(exclude_unset=True)
+		action_key = next(iter(action_data.keys()), '') if action_data else ''
+		if 'click' not in action_key.lower():
+			return None
+
+		# Skip if element has an explicit interactive role
+		attrs = getattr(node, 'attributes', None) or {}
+		role = attrs.get('role', '').lower()
+		if role in ('button', 'link', 'tab', 'menuitem', 'option', 'checkbox',
+					'radio', 'switch', 'treeitem', 'gridcell', 'columnheader'):
+			return None
+
+		# Skip if element is a standard interactive/semantic tag
+		tag = (getattr(node, 'tag_name', None) or getattr(node, 'node_name', None) or '').lower()
+		if tag in ('button', 'a', 'input', 'select', 'textarea', 'label',
+				   'summary', 'details', 'video', 'audio', 'canvas'):
+			return None
+
+		# Only continue for known generic container tags
+		if tag not in self._CONTAINER_TAGS:
+			return None
+
+		# Find interactive descendants in the current selector map
+		desc_indices = self._get_interactive_descendants_in_map(node, selector_map)
+		if not desc_indices:
+			return None  # No descendants → this container may be the only option
+
+		# Reject with actionable guidance
+		preview = ', '.join(f'[{i}]' for i in desc_indices[:6])
+		suffix = f' (+{len(desc_indices) - 6} more)' if len(desc_indices) > 6 else ''
+		return Agent.GroundingResult(
+			is_valid=False,
+			reason=(
+				f'Container <{tag}> rejected: {len(desc_indices)} specific interactive '
+				f'descendant(s) available — use one of: {preview}{suffix}. '
+				f'Prefer the most specific control: input field, submit button, or link.'
+			),
+		)
+
 	def _detect_repeated_failures(self) -> None:
 		"""Detect repeated failure loops and inject a corrective context message.
 
@@ -1058,6 +1241,177 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			'4. If you have already tried 3+ times, consider whether the task can be completed via an alternative route.'
 		)
 		self._message_manager._add_context_message(UserMessage(content=warning))
+
+	# ── CONCEPTUAL LOOP DETECTION ───────────────────────────────────────────────
+
+	def _compute_action_signature(self, action: ActionModel, url: str) -> str | None:
+		"""Compute a stable, site-agnostic loop-detection signature for an action.
+
+		Returns None for action types excluded from loop tracking (auth/infra actions
+		driven by external state, not planner choice).
+		Captures: (action_type, normalised_target_label, url_page_bucket).
+		Does NOT hardcode any domain, label, or element class.
+		"""
+		action_type = type(action).__name__
+		if action_type in self._LOOP_EXCLUDED_ACTION_TYPES:
+			return None
+		url_bucket = hashlib.md5(url.encode('utf-8', errors='replace')).hexdigest()[:8]
+
+		label = ''
+		try:
+			action_data = action.model_dump(exclude_unset=True)
+			# Try to get the index for element-based actions
+			action_payload = next(iter(action_data.values()), {}) if action_data else {}
+			index = action_payload.get('index') if isinstance(action_payload, dict) else None
+			if index is not None and self.browser_session is not None:
+				# Use the cached selector map (sync) — avoids needing await in a sync method
+				try:
+					cached = self.browser_session._cached_browser_state_summary
+					if cached and cached.dom_state and cached.dom_state.selector_map:
+						node = cached.dom_state.selector_map.get(index)
+						if node:
+							raw_label = node.get_meaningful_text_for_llm() or ''
+							label = raw_label[:30].lower().strip()
+				except Exception:
+					pass
+			# For non-index actions (navigate, search, type) use any text/query param
+			if not label:
+				for v in (action_payload.values() if isinstance(action_payload, dict) else []):
+					if isinstance(v, str) and v.strip():
+						label = v[:30].lower().strip()
+						break
+		except Exception:
+			pass  # non-fatal; signature will be less precise but still functional
+
+		return f'{action_type}:{label}:{url_bucket}'
+
+	def _check_action_loop(self, actions: list[ActionModel]) -> str | None:
+		"""Return a warning/block signal if a conceptual action loop is detected, else None.
+
+		count >= 2 → warning injected into LLM context (soft nudge to change strategy)
+		count >= 3 → returns 'LOOP_BLOCKED:<sig>:<count>' — caller must hard-block execution
+
+		Auth/infra actions excluded via _LOOP_EXCLUDED_ACTION_TYPES to avoid false signals
+		from internally-driven behavior that isn't a true planner loop.
+		"""
+		if not self.browser_session:
+			return None
+		try:
+			cached = self.browser_session._cached_browser_state_summary
+			url = cached.url if cached else ''
+		except Exception:
+			url = ''
+
+		recent = self.state.recent_action_signatures[-6:]
+		for action in actions:
+			sig = self._compute_action_signature(action, url)
+			if sig is None:
+				continue  # excluded action type
+			count = recent.count(sig)
+			if count >= 3:
+				self.logger.warning(
+					f'Loop hard-block: action signature "{sig}" seen {count}x in last 6 steps'
+				)
+				return f'LOOP_BLOCKED:{sig}:{count}'
+			if count >= 2:
+				self.logger.warning(
+					f'Conceptual loop detected: action signature "{sig}" seen {count}x in last 6 steps'
+				)
+				return (
+					f'⚠️ STRATEGY LOOP DETECTED: The action you are about to take has been attempted '
+					f'{count} times recently without success. '
+					f'You MUST choose a completely different approach:\n'
+					f'- Try a different UI path or element\n'
+					f'- Use keyboard navigation instead of clicking\n'
+					f'- Navigate to the target page directly via URL\n'
+					f'- If blocked by an overlay, close it first\n'
+					f'Do NOT repeat the same action again.'
+				)
+		return None
+
+	def _record_action_signatures(self, actions: list[ActionModel], url: str) -> None:
+		"""Record executed action signatures for loop detection. Called after execution."""
+		MAX_SIGNATURES = 10
+		for action in actions:
+			sig = self._compute_action_signature(action, url)
+			if sig is None:
+				continue  # excluded action type; don't pollute loop history
+			self.state.recent_action_signatures.append(sig)
+		# Keep only the last MAX_SIGNATURES entries
+		if len(self.state.recent_action_signatures) > MAX_SIGNATURES:
+			self.state.recent_action_signatures = self.state.recent_action_signatures[-MAX_SIGNATURES:]
+
+	# ── CONTROLLER-SIDE ACTION GROUNDING ────────────────────────────────────────
+
+	@dataclass
+	class GroundingResult:
+		"""Result of pre-execution action grounding validation."""
+		is_valid: bool
+		reason: str
+		reacquired_index: int | None = None
+
+	async def _validate_action_grounding(
+		self,
+		action: ActionModel,
+		captured_nav_gen: int,
+	) -> 'Agent.GroundingResult':
+		"""Validate that an index-based action is still grounded in current page state.
+
+		Checks performed (in order):
+		1. Navigation/rerender since state was captured (nav_gen changed).
+		2. Index present in current selector map.
+		3. If stale, attempt fingerprint reacquisition.
+
+		Returns GroundingResult(is_valid=False) with a reason when the action should
+		NOT be executed.  The caller is expected to return an error ActionResult and
+		force a re-observe cycle instead of blindly executing.
+		"""
+		assert self.browser_session is not None
+
+		# Extract index from the action payload
+		action_data = action.model_dump(exclude_unset=True)
+		action_payload = next(iter(action_data.values()), {}) if action_data else {}
+		index = action_payload.get('index') if isinstance(action_payload, dict) else None
+
+		if index is None:
+			return Agent.GroundingResult(is_valid=True, reason='no index required')
+
+		# 1. Check if nav_gen changed since state capture (navigation/full rerender)
+		current_nav_gen = self.browser_session.nav_gen
+		if current_nav_gen != captured_nav_gen:
+			return Agent.GroundingResult(
+				is_valid=False,
+				reason=f'page changed since state was captured (nav_gen {captured_nav_gen}→{current_nav_gen}). Re-observe before acting.',
+			)
+
+		# 2. Check index is in current selector map
+		cached = self.browser_session._cached_browser_state_summary
+		selector_map = cached.dom_state.selector_map if (cached and cached.dom_state) else {}
+		if selector_map and index not in selector_map:
+			# 3. Attempt fingerprint reacquisition
+			try:
+				reacquired = await self.browser_session.reacquire_element_by_fingerprint(index)
+				if reacquired:
+					new_index = reacquired.backend_node_id if hasattr(reacquired, 'backend_node_id') else index
+					self.logger.debug(f'Grounding: re-acquired stale index {index}→{new_index}')
+					return Agent.GroundingResult(is_valid=True, reason='reacquired via fingerprint', reacquired_index=new_index)
+			except Exception:
+				pass
+			return Agent.GroundingResult(
+				is_valid=False,
+				reason=f'element index {index} not in current selector map (page may have re-rendered). Re-observe.',
+			)
+
+		# 4. Container specificity: reject generic container divs when better descendants exist
+		node = selector_map.get(index)
+		if node is not None:
+			container_result = self._check_container_specificity(node, selector_map, action)
+			if container_result is not None:
+				return container_result
+
+		return Agent.GroundingResult(is_valid=True, reason='index confirmed in selector map')
+
+	# ────────────────────────────────────────────────────────────────────────────
 
 	@observe(ignore_input=True, ignore_output=False)
 	async def _judge_trace(self) -> JudgementResult | None:
@@ -2041,6 +2395,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			cached_selector_map = {}
 			cached_element_hashes = set()
 
+		# Capture nav_gen at the start of multi_act so we can detect navigations
+		# that happen between state capture and action execution.
+		captured_nav_gen = self.browser_session.nav_gen
+
+		# Capture URL for signature recording (best-effort)
+		try:
+			_cached = self.browser_session._cached_browser_state_summary
+			_current_url = _cached.url if _cached else ''
+		except Exception:
+			_current_url = ''
+
+		executed_actions: list[ActionModel] = []
+
 		for i, action in enumerate(actions):
 			if i > 0:
 				# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
@@ -2056,6 +2423,50 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			try:
 				await self._check_stop_or_pause()
+
+				# ── LOOP HARD-BLOCK ───────────────────────────────────────────────
+				# If the same conceptual action has been attempted 3+ times without
+				# material progress, hard-block execution and force strategy change.
+				loop_signal = self._check_action_loop([action])
+				if loop_signal and loop_signal.startswith('LOOP_BLOCKED:'):
+					_parts = loop_signal.split(':', 2)
+					_count = _parts[2] if len(_parts) > 2 else '3+'
+					self.logger.warning(f'⛔ Loop hard-block: action blocked after {_count} repeats')
+					results.append(ActionResult(
+						error=(
+							f'LOOP BLOCKED: This action has been attempted {_count} times without progress. '
+							f'You MUST choose a completely different strategy — try a different UI path, '
+							f'navigate directly to the target, or report if the goal is impossible.'
+						),
+						include_in_memory=True,
+					))
+					break  # force re-observe cycle
+
+				# ── CONTROLLER-SIDE GROUNDING VALIDATION ──────────────────────────
+				# Before executing any index-based action, confirm the target element
+				# still exists in the current page state.  This prevents acting on
+				# stale indices from a re-rendered DOM.
+				grounding = await self._validate_action_grounding(action, captured_nav_gen)
+				if not grounding.is_valid:
+					self.logger.warning(f'⛔ Action grounding failed (action {i+1}/{total_actions}): {grounding.reason}')
+					results.append(ActionResult(
+						error=f'Action target not grounded: {grounding.reason}',
+						long_term_memory=f'Element grounding failed: {grounding.reason}. Re-observe the page before acting.',
+					))
+					break  # Force re-observe cycle instead of executing remaining actions
+				# If the element was reacquired at a new index, update the action
+				if grounding.reacquired_index is not None:
+					try:
+						action_data = action.model_dump(exclude_unset=True)
+						action_key = next(iter(action_data.keys()))
+						payload = action_data[action_key]
+						if isinstance(payload, dict) and 'index' in payload:
+							payload['index'] = grounding.reacquired_index
+							action = action.model_validate({action_key: payload})
+					except Exception:
+						pass  # non-fatal; proceed with original action
+				# ──────────────────────────────────────────────────────────────────
+
 				# Get action name from the action model
 				action_data = action.model_dump(exclude_unset=True)
 				action_name = next(iter(action_data.keys())) if action_data else 'unknown'
@@ -2082,6 +2493,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				time_elapsed = time_end - time_start
 
 				results.append(result)
+				executed_actions.append(action)
 
 				if results[-1].is_done or results[-1].error or i == total_actions - 1:
 					break
@@ -2090,6 +2502,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Handle any exceptions during action execution
 				self.logger.error(f'❌ Executing action {i + 1} failed -> {type(e).__name__}: {e}')
 				raise e
+
+		# Record signatures of successfully dispatched actions for loop detection
+		if executed_actions:
+			self._record_action_signatures(executed_actions, _current_url)
 
 		return results
 

@@ -44,7 +44,7 @@ from browser_use.browser.events import (
 	TabCreatedEvent,
 )
 from browser_use.browser.profile import BrowserProfile, ProxySettings
-from browser_use.browser.views import BrowserStateSummary, ElementFingerprint, TabInfo
+from browser_use.browser.views import BrowserStateSummary, ElementFingerprint, OverlayInfo, PageReadinessInfo, TabInfo
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, NodeType, SerializedDOMState, TargetInfo
 from browser_use.observability import observe_debug
 from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
@@ -873,6 +873,154 @@ class BrowserSession(BaseModel):
 				return UiStabilityResult(is_stable=True, metrics=last_metrics)
 
 		return UiStabilityResult(is_stable=False, metrics=last_metrics)
+
+	async def detect_blocking_overlays(self) -> list[OverlayInfo]:
+		"""Detect CSS-positioned overlays that may be blocking user interaction.
+
+		General, site-agnostic detection: finds fixed/absolute-positioned high-z-index
+		visible elements covering significant viewport area. Returns overlays sorted by
+		z-index descending (most blocking first).
+		"""
+		try:
+			cdp_session = await self.get_or_create_cdp_session(focus=True)
+		except Exception:
+			return []
+
+		# JavaScript snippet: find overlay candidates using computed styles.
+		# General heuristics, no site-specific logic.
+		js_code = """
+(() => {
+  const results = [];
+  const vw = window.innerWidth || document.documentElement.clientWidth || 1;
+  const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+  const viewportArea = vw * vh;
+
+  // Candidates: all elements (capped for performance)
+  const all = Array.from(document.querySelectorAll('*')).slice(0, 2000);
+  for (const el of all) {
+    try {
+      const style = window.getComputedStyle(el);
+      const pos = style.position;
+      if (pos !== 'fixed' && pos !== 'absolute' && pos !== 'sticky') continue;
+      const display = style.display;
+      if (display === 'none') continue;
+      const vis = style.visibility;
+      if (vis === 'hidden') continue;
+      const opacity = parseFloat(style.opacity);
+      if (opacity < 0.1) continue;
+      const zRaw = parseInt(style.zIndex, 10);
+      if (isNaN(zRaw) || zRaw < 50) continue;
+
+      const rect = el.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area < 1000) continue;  // ignore tiny elements
+      const coverage = area / viewportArea;
+      if (coverage < 0.05) continue;  // must cover at least 5% of viewport
+
+      // Infer description from role/tag/aria/class
+      const role = (el.getAttribute('role') || '').toLowerCase();
+      const tag = el.tagName.toLowerCase();
+      const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+      const classList = (el.className || '').toLowerCase();
+      let description = 'overlay';
+      if (role === 'dialog' || ariaLabel.includes('dialog') || classList.includes('modal') || classList.includes('dialog')) {
+        description = 'modal dialog';
+      } else if (classList.includes('drawer') || classList.includes('sidebar') || classList.includes('panel')) {
+        description = 'drawer';
+      } else if (classList.includes('toast') || classList.includes('snackbar') || classList.includes('notification')) {
+        description = 'toast';
+      } else if (classList.includes('spinner') || classList.includes('loading') || classList.includes('loader')) {
+        description = 'loading spinner';
+      } else if (classList.includes('backdrop') || classList.includes('overlay') || classList.includes('mask')) {
+        description = 'backdrop overlay';
+      } else if (tag === 'dialog') {
+        description = 'dialog';
+      }
+
+      // Look for a close/dismiss button inside this element
+      let closeBtnText = null;
+      const closeSelectors = [
+        '[aria-label*="close" i]', '[aria-label*="dismiss" i]', '[aria-label*="cancel" i]',
+        'button[class*="close" i]', 'button[class*="dismiss" i]',
+        '[data-dismiss]', '[data-close]',
+      ];
+      for (const sel of closeSelectors) {
+        const btn = el.querySelector(sel);
+        if (btn) { closeBtnText = (btn.getAttribute('aria-label') || btn.textContent || '').trim().slice(0, 30); break; }
+      }
+      // Also look for × or X text buttons
+      if (!closeBtnText) {
+        const btns = el.querySelectorAll('button, [role="button"]');
+        for (const btn of btns) {
+          const t = btn.textContent.trim();
+          if (t === '×' || t === 'X' || t === '✕' || t === 'Close' || t === 'Dismiss') {
+            closeBtnText = t; break;
+          }
+        }
+      }
+
+      // Goal-relevance signals
+      // Is this element explicitly a dialog/modal?
+      const isDialogType = role === 'dialog' || tag === 'dialog' ||
+                           el.getAttribute('aria-modal') === 'true';
+
+      const inputs = el.querySelectorAll(
+        'input:not([disabled]):not([type="hidden"]):not([type="submit"]):not([type="button"]), ' +
+        'textarea:not([disabled]), select:not([disabled])'
+      );
+      const hasActiveInputs = inputs.length > 0;
+
+      const activeEl = document.activeElement;
+      const hasFocusedElement = !!(activeEl && el !== activeEl && el.contains(activeEl));
+
+      const submitBtns = el.querySelectorAll(
+        '[type="submit"], button[class*="submit" i], button[class*="save" i], ' +
+        'button[class*="create" i], button[class*="add" i], button[class*="confirm" i], ' +
+        'button[class*="primary" i], [data-testid*="submit" i], [data-testid*="save" i]'
+      );
+      const hasSubmitCta = submitBtns.length > 0;
+
+      results.push({ zIndex: zRaw, coveragePct: coverage, description, closeBtnText,
+                     isBlocking: coverage >= 0.20, isDialogType,
+                     hasActiveInputs, hasFocusedElement, hasSubmitCta });
+    } catch (e) {}
+  }
+  // Sort by z-index descending
+  results.sort((a, b) => b.zIndex - a.zIndex);
+  return results.slice(0, 5);  // cap at 5 overlays
+})()
+"""
+		try:
+			result = await cdp_session.cdp_client.send.Runtime.evaluate(
+				params={'expression': js_code, 'returnByValue': True, 'awaitPromise': False},
+				session_id=cdp_session.session_id,
+			)
+			raw_list = result.get('result', {}).get('value') if result else None
+			if not isinstance(raw_list, list):
+				return []
+		except Exception as e:
+			self.logger.debug(f'detect_blocking_overlays failed: {e}')
+			return []
+
+		overlays: list[OverlayInfo] = []
+		for item in raw_list:
+			if not isinstance(item, dict):
+				continue
+			# close_index is None here — resolved later when selector map is available
+			overlays.append(
+				OverlayInfo(
+					is_blocking=bool(item.get('isBlocking', False)),
+					description=str(item.get('description', 'overlay')),
+					close_index=None,  # set by caller after DOM extraction
+					z_index=int(item.get('zIndex', 0)),
+					coverage_pct=float(item.get('coveragePct', 0.0)),
+					has_active_inputs=bool(item.get('hasActiveInputs', False)),
+					has_focused_element=bool(item.get('hasFocusedElement', False)),
+					has_submit_cta=bool(item.get('hasSubmitCta', False)),
+					is_dialog_type=bool(item.get('isDialogType', False)),
+				)
+			)
+		return overlays
 
 	async def _navigate_and_wait(self, url: str, target_id: str, timeout: float | None = None) -> None:
 		"""Navigate to URL and wait for page readiness using CDP lifecycle events.

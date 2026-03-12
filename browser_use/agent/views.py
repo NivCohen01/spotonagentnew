@@ -80,6 +80,10 @@ class AgentState(BaseModel):
 	message_manager_state: MessageManagerState = Field(default_factory=MessageManagerState)
 	file_system_state: FileSystemState | None = None
 
+	# Loop detection: circular buffer of "<action_type>:<normalized_label>:<url_hash>" signatures
+	# from executed actions. Used to detect repeated conceptual intent loops.
+	recent_action_signatures: list[str] = Field(default_factory=list)
+
 
 @dataclass
 class AgentStepInfo:

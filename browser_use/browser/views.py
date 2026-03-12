@@ -99,6 +99,31 @@ class PaginationButton:
 	is_disabled: bool = False  # Whether the button appears disabled
 
 
+@dataclass(slots=True)
+class PageReadinessInfo:
+	"""Snapshot of page readiness at the time of state capture."""
+
+	is_ready: bool
+	ready_state: str  # 'loading' | 'interactive' | 'complete' | 'unknown'
+	stable_for_ms: int  # ms of DOM quiet time observed (0 if unknown)
+
+
+@dataclass(slots=True)
+class OverlayInfo:
+	"""A CSS-positioned overlay element that may be blocking user interaction."""
+
+	is_blocking: bool  # covers >= 20% of viewport
+	description: str  # inferred type: 'modal', 'drawer', 'toast', 'spinner', 'overlay'
+	close_index: int | None  # element index of a detected close/dismiss button, if any
+	z_index: int
+	coverage_pct: float  # percentage of viewport covered (0.0–1.0)
+	# Goal-relevance signals (set by detect_blocking_overlays JS)
+	has_active_inputs: bool = False  # contains enabled input/textarea/select elements
+	has_focused_element: bool = False  # document.activeElement is inside this overlay
+	has_submit_cta: bool = False  # contains a primary submit/save/create/add button
+	is_dialog_type: bool = False  # role=dialog, tag=dialog, or aria-modal=true
+
+
 @dataclass
 class BrowserStateSummary:
 	"""The summary of the browser's current state designed for an LLM to process"""
@@ -121,6 +146,10 @@ class BrowserStateSummary:
 	pending_network_requests: list[NetworkRequest] = field(default_factory=list)  # Currently loading network requests
 	pagination_buttons: list[PaginationButton] = field(default_factory=list)  # Detected pagination buttons
 	closed_popup_messages: list[str] = field(default_factory=list)  # Messages from auto-closed JavaScript dialogs
+
+	# New: page readiness and overlay detection
+	page_readiness: PageReadinessInfo | None = None
+	blocking_overlays: list[OverlayInfo] = field(default_factory=list)
 
 
 @dataclass

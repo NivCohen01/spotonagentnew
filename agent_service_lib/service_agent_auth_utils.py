@@ -796,6 +796,26 @@ def _register_mailbox_actions(tools: Tools, sess: Any) -> None:
             msg = "OTP required; cannot continue automatically."
             return ActionResult(error=msg, extracted_content=msg)
 
+        # Check if the runtime guardrail already auto-filled the OTP for this session.
+        # Returns cached code to avoid a redundant IMAP fetch.
+        _cache_key = f'email:{target_email}'
+        _cached_code = (getattr(sess, 'otp_filled_cache', None) or {}).get(_cache_key)
+        if _cached_code:
+            log.info("OTP already auto-filled for %s, returning cached code", target_email)
+            message = (
+                f"OTP already entered automatically.\n"
+                f"Email: {target_email}\n"
+                f"OTP CODE: {_cached_code}\n"
+                f"Digits: {' '.join(list(_cached_code))}\n"
+                f"The code has been filled in for you."
+            )
+            return ActionResult(
+                extracted_content=message,
+                long_term_memory=f"OTP code is {_cached_code} - already entered by runtime",
+                metadata={"otp": _cached_code, "email": target_email},
+                include_in_memory=True,
+            )
+
         password_candidates = _candidate_mailbox_passwords(sess, target_email)
         mailbox_password = password_candidates[0] if password_candidates else None
         if not mailbox_password:

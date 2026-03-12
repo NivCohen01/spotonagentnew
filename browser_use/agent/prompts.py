@@ -7,10 +7,31 @@ from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam
 from browser_use.observability import observe_debug
 from browser_use.utils import is_new_tab_page
 
+from browser_use.browser.views import OverlayInfo
+
 if TYPE_CHECKING:
 	from browser_use.agent.views import AgentStepInfo
 	from browser_use.browser.views import BrowserStateSummary
 	from browser_use.filesystem.file_system import FileSystem
+
+
+def _is_goal_relevant_overlay(o: OverlayInfo) -> bool:
+	"""True if the overlay is an active data-entry dialog the agent should work inside.
+
+	Two classification paths:
+	1. Explicit dialog type (role=dialog, aria-modal) with any active inputs → always
+	   goal-relevant, regardless of focus or submit button detection.  This is the most
+	   reliable signal: dialogs with form fields are intentional data-entry UIs.
+	2. Non-dialog overlay with focused element + inputs, or inputs + explicit submit CTA
+	   → goal-relevant (agent is mid-interaction inside a custom overlay panel).
+
+	Neither path requires hardcoded labels, classes, or site-specific logic.
+	"""
+	# Case 1: Semantically a dialog/modal with any active input field
+	if o.is_dialog_type and o.has_active_inputs:
+		return True
+	# Case 2: Non-dialog overlay where agent is clearly mid-interaction
+	return o.has_active_inputs and (o.has_focused_element or o.has_submit_cta)
 
 
 class SystemPrompt:
@@ -22,17 +43,26 @@ class SystemPrompt:
 		use_thinking: bool = True,
 		flash_mode: bool = False,
 		is_anthropic: bool = False,
+		include_style_guide: bool = False,
 	):
 		self.max_actions_per_step = max_actions_per_step
 		self.use_thinking = use_thinking
 		self.flash_mode = flash_mode
 		self.is_anthropic = is_anthropic
+		self.include_style_guide = include_style_guide
 		prompt = ''
 		if override_system_message is not None:
 			prompt = override_system_message
 		else:
 			self._load_prompt_template()
 			prompt = self.prompt_template.format(max_actions=self.max_actions_per_step)
+
+		# Inject style guide only when the task involves guide/documentation writing.
+		# This keeps the hot action loop free from ~60 lines of documentation policy.
+		if include_style_guide:
+			style_guide_text = self._load_style_guide()
+			if style_guide_text:
+				prompt += f'\n{style_guide_text}'
 
 		if extend_system_message:
 			prompt += f'\n{extend_system_message}'
@@ -57,6 +87,17 @@ class SystemPrompt:
 				self.prompt_template = f.read()
 		except Exception as e:
 			raise RuntimeError(f'Failed to load system prompt template: {e}')
+
+	def _load_style_guide(self) -> str:
+		"""Load the documentation style guide from its dedicated file.
+
+		Returns empty string if the file cannot be loaded (non-fatal).
+		"""
+		try:
+			with importlib.resources.files('browser_use.agent').joinpath('style_guide_prompt.md').open('r', encoding='utf-8') as f:
+				return f.read()
+		except Exception:
+			return ''
 
 	def get_system_message(self) -> SystemMessage:
 		"""
@@ -179,6 +220,56 @@ class AgentMessagePrompt:
 		traverse_node(self.browser_state.dom_state._root)
 		return stats
 
+	def _get_page_readiness_and_overlay_banner(self) -> str:
+		"""Build a banner string for page readiness and blocking overlays.
+
+		Placed at the very top of the browser state so the LLM sees it immediately.
+		Only emits text when there is something actionable to communicate.
+		"""
+		lines: list[str] = []
+
+		# ── Page readiness ────────────────────────────────────────────────────
+		readiness = self.browser_state.page_readiness
+		if readiness is not None:
+			if not readiness.is_ready:
+				lines.append(
+					f'⏳ PAGE NOT READY (ready_state={readiness.ready_state}, stable_for={readiness.stable_for_ms}ms). '
+					f'The DOM may still be loading. Use wait() before interacting with elements.'
+				)
+
+		# ── Blocking overlays ─────────────────────────────────────────────────
+		overlays = self.browser_state.blocking_overlays or []
+		blocking = [o for o in overlays if o.is_blocking]
+		if blocking:
+			top = blocking[0]
+			if _is_goal_relevant_overlay(top):
+				# Agent is actively working inside this dialog — do NOT tell it to close
+				lines.append(
+					f'📋 ACTIVE DIALOG: [{top.description}] — you are filling in a form dialog. '
+					f'Complete all required fields, then click the primary submit/save/create button.'
+				)
+				lines.append('Do NOT close or cancel this dialog unless explicitly abandoning this sub-task.')
+			else:
+				# Unrelated blocker — must close before proceeding
+				close_hint = f' — close button index: [{top.close_index}]' if top.close_index is not None else ''
+				lines.append(
+					f'🚨 BLOCKING OVERLAY: [{top.description}] covering {top.coverage_pct:.0%} of viewport '
+					f'(z-index={top.z_index}){close_hint}.'
+				)
+				lines.append(
+					'⚠️  PRIORITY: Close this overlay FIRST before pursuing your goal. '
+					'Do not attempt to interact with elements behind it.'
+				)
+			if len(blocking) > 1:
+				extras = ', '.join(f'[{o.description}]' for o in blocking[1:])
+				lines.append(f'   Additional overlays present: {extras}')
+		elif overlays:
+			# Non-blocking overlays (e.g. toasts) — mention briefly
+			top = overlays[0]
+			lines.append(f'ℹ️  Overlay present (non-blocking): [{top.description}] at z-index={top.z_index}')
+
+		return '\n'.join(lines) + '\n' if lines else ''
+
 	@observe_debug(ignore_input=True, ignore_output=True, name='_get_browser_state_description')
 	def _get_browser_state_description(self) -> str:
 		# Extract page statistics first
@@ -282,7 +373,9 @@ class AgentMessagePrompt:
 				closed_popups_text += f'  - {popup_msg}\n'
 			closed_popups_text += '\n'
 
-		browser_state = f"""{stats_text}{current_tab_text}
+		readiness_overlay_banner = self._get_page_readiness_and_overlay_banner()
+
+		browser_state = f"""{readiness_overlay_banner}{stats_text}{current_tab_text}
 Available tabs:
 {tabs_text}
 {page_info_text}

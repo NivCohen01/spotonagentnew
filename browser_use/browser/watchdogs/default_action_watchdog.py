@@ -978,15 +978,15 @@ class DefaultActionWatchdog(BaseWatchdog):
 					self.logger.debug(f'✅ Text field cleared successfully using {clear_info.get("method")}')
 					return True
 				else:
-					self.logger.debug(f'⚠️ JavaScript clear partially failed, field still contains: "{final_text}"')
-					return False
+					self.logger.debug(f'⚠️ JavaScript clear partially failed, field still contains: "{final_text}"; falling back')
+					# fall through to Strategy 2
 			else:
-				self.logger.debug(f'❌ JavaScript clear failed: {clear_info.get("error", "Unknown error")}')
-				return False
+				self.logger.debug(f'❌ JavaScript clear failed: {clear_info.get("error", "Unknown error")}; falling back')
+				# fall through to Strategy 2
 
 		except Exception as e:
-			self.logger.debug(f'JavaScript clear failed with exception: {e}')
-			return False
+			self.logger.debug(f'JavaScript clear failed with exception: {e}; falling back')
+			# fall through to Strategy 2
 
 		# Strategy 2: Triple-click + Delete (fallback for stubborn fields)
 		try:
