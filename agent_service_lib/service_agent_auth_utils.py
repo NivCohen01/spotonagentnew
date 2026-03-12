@@ -786,7 +786,7 @@ def _register_mailbox_actions(tools: Tools, sess: Any) -> None:
         "Fetch OTP from a pathix.io mailbox (polls up to ~2 minutes, 4-8 digit codes).",
         param_model=FetchOTPParams,
     )
-    async def fetch_mailbox_otp(params: FetchOTPParams):
+    async def fetch_mailbox_otp(params: FetchOTPParams, browser_session=None):
         chosen_email = params.email or (getattr(sess, "user_credentials", None) or {}).get("email") or (getattr(sess, "generated_credentials", None) or {}).get("email")
         target_email = (chosen_email or "").strip().lower()
         if not target_email:
@@ -798,8 +798,19 @@ def _register_mailbox_actions(tools: Tools, sess: Any) -> None:
 
         # Check if the runtime guardrail already auto-filled the OTP for this session.
         # Returns cached code to avoid a redundant IMAP fetch.
+        current_url = ""
+        with contextlib.suppress(Exception):
+            if browser_session:
+                current_url = await browser_session.get_current_page_url()
         _cache_key = f'email:{target_email}'
         _cached_code = (getattr(sess, 'otp_filled_cache', None) or {}).get(_cache_key)
+        if not _cached_code and current_url:
+            _cached_code = (getattr(sess, 'otp_filled_cache', None) or {}).get(current_url)
+        if not _cached_code:
+            runtime_state = getattr(sess, "otp_runtime_state", None) or {}
+            fingerprint = runtime_state.get("last_fill_fingerprint")
+            if fingerprint:
+                _cached_code = (getattr(sess, "otp_filled_cache", None) or {}).get(f"fingerprint:{fingerprint}")
         if _cached_code:
             log.info("OTP already auto-filled for %s, returning cached code", target_email)
             message = (
@@ -826,6 +837,11 @@ def _register_mailbox_actions(tools: Tools, sess: Any) -> None:
         if code:
             # Make OTP extremely explicit so LLM cannot miss it
             digits_display = " ".join(list(code))  # e.g. "1 2 3 4 5 6"
+            if not hasattr(sess, "otp_filled_cache"):
+                sess.otp_filled_cache = {}
+            sess.otp_filled_cache[f"email:{target_email}"] = code
+            if current_url:
+                sess.otp_filled_cache[current_url] = code
             message = (
                 f"SUCCESS: OTP CODE RETRIEVED!\n"
                 f"Email: {target_email}\n"

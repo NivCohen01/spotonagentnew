@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import hashlib
+import json
 import logging
+import time
 from typing import Any, Optional
 
 from browser_use.agent.views import ActionResult
@@ -41,6 +44,8 @@ _COMMON_DUMMY = {
     "password",
     "test123",
 }
+_OTP_SUBMISSION_PENDING_SECONDS = 20.0
+_OTP_POST_SUBMIT_STABILIZATION_SECONDS = 3.0
 
 
 def _record_auth_event(sess: Any, event: dict[str, Any]) -> None:
@@ -97,6 +102,143 @@ def _email_is_otp_capable(email: str, allowed_otp_domains: list[str]) -> bool:
     return any(email_lower.endswith(f'@{d.lower().lstrip("@")}') for d in allowed_otp_domains)
 
 
+def _get_otp_runtime_state(sess: Any) -> dict[str, Any]:
+    state = getattr(sess, "otp_runtime_state", None)
+    if isinstance(state, dict):
+        return state
+    state = {
+        "generation": 0,
+        "last_page_signature": None,
+        "last_fields_signature": None,
+        "last_fill_fingerprint": None,
+        "last_fill_time": 0.0,
+        "last_email": None,
+        "submission_pending": False,
+        "submission_started_at": 0.0,
+        "submission_page_signature": None,
+        "submission_fields_signature": None,
+        "submission_fill_fingerprint": None,
+    }
+    setattr(sess, "otp_runtime_state", state)
+    return state
+
+
+def _stable_hash(text: str) -> str:
+    return hashlib.sha1((text or "").encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _read_attr(node: Any, key: str) -> str:
+    attrs = getattr(node, "attributes", None) or {}
+    raw = attrs.get(key)
+    return str(raw).strip() if raw is not None else ""
+
+
+async def _get_current_url_safe(browser_session) -> str:
+    if not browser_session:
+        return ""
+    with contextlib.suppress(Exception):
+        return await browser_session.get_current_page_url()
+    return ""
+
+
+def _compute_otp_fields_signature(selector_map: dict[int, Any], otp_indices: list[int]) -> str:
+    parts: list[str] = []
+    for idx in sorted(otp_indices):
+        node = selector_map.get(idx)
+        if not node:
+            parts.append(f"{idx}:missing")
+            continue
+        tag = (getattr(node, "tag_name", None) or getattr(node, "node_name", None) or "").lower()
+        attrs = [
+            _read_attr(node, "type"),
+            _read_attr(node, "autocomplete"),
+            _read_attr(node, "name"),
+            _read_attr(node, "id"),
+            _read_attr(node, "maxlength"),
+            _read_attr(node, "inputmode"),
+            _read_attr(node, "pattern"),
+        ]
+        parts.append(f"{idx}:{tag}:{'|'.join(attrs)}")
+    return _stable_hash("||".join(parts))
+
+
+async def _read_otp_field_values(
+    browser_session,
+    selector_map: dict[int, Any],
+    otp_indices: list[int],
+) -> dict[int, str]:
+    values: dict[int, str] = {}
+    for idx in otp_indices:
+        node = selector_map.get(idx)
+        if not node:
+            continue
+        attrs = getattr(node, "attributes", None) or {}
+        raw = attrs.get("value")
+        if isinstance(raw, str):
+            values[idx] = raw.strip()
+
+    page = None
+    with contextlib.suppress(Exception):
+        page = await browser_session.get_current_page()
+    if not page:
+        return values
+
+    try:
+        js_indices = json.dumps([int(i) for i in otp_indices])
+        script = (
+            "() => {"
+            f"const ids = {js_indices};"
+            "const out = {};"
+            "for (const idx of ids) {"
+            "  const selector = `[data-highlight-index=\"${idx}\"]`;"
+            "  const el = document.querySelector(selector);"
+            "  if (!el) continue;"
+            "  let raw = '';"
+            "  if ('value' in el && typeof el.value === 'string') raw = el.value;"
+            "  else if (el.textContent) raw = el.textContent;"
+            "  out[String(idx)] = (raw || '').trim();"
+            "}"
+            "return out;"
+            "}"
+        )
+        js_values = await page.evaluate(script)
+        if isinstance(js_values, dict):
+            for key, raw_val in js_values.items():
+                try:
+                    idx = int(key)
+                except Exception:
+                    continue
+                if idx not in otp_indices:
+                    continue
+                if isinstance(raw_val, str):
+                    values[idx] = raw_val.strip()
+    except Exception:
+        pass
+
+    return values
+
+
+def _is_probable_otp_submit_click(action_data: dict[str, Any], selector_map: dict[int, Any]) -> bool:
+    click_data = action_data.get("click")
+    if not isinstance(click_data, dict):
+        return False
+    idx = click_data.get("index")
+    if idx is None:
+        return False
+    node = selector_map.get(idx)
+    if not node:
+        return False
+    tag = (getattr(node, "tag_name", None) or getattr(node, "node_name", None) or "").lower()
+    attrs = getattr(node, "attributes", None) or {}
+    role = str(attrs.get("role") or "").strip().lower()
+    input_type = str(attrs.get("type") or "").strip().lower()
+    if tag == "button":
+        return True
+    if tag == "input" and input_type in {"submit", "button", "image"}:
+        return True
+    return role in {"button", "menuitem", "option"}
+
+
 def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[str] | None = None) -> None:
     """Install runtime guardrails on tools.act.
 
@@ -148,39 +290,100 @@ def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[s
             or (getattr(sess, "intent", None) and getattr(sess.intent, "needs_auth", False))
         )
 
-        # OTP auto-fill before executing any action
         otp_indices: list[int] = []
+        selector_map: dict[int, Any] = {}
+        otp_runtime_state = _get_otp_runtime_state(sess)
+        otp_fill_fingerprint: str | None = None
+        otp_submission_click_candidate = False
         if browser_session:
+            with contextlib.suppress(Exception):
+                selector_map = await browser_session.get_selector_map() or {}
             otp_indices = await _detect_otp_indices(browser_session)
             if otp_indices:
-                current_url = None
-                with contextlib.suppress(Exception):
-                    current_url = await browser_session.get_current_page_url()
+                target_email = ""
+                if allowed_email and _email_is_otp_capable(allowed_email, allowed_otp_domains):
+                    target_email = allowed_email.lower()
+                elif _email_is_otp_capable((getattr(sess, "user_credentials", None) or {}).get("email", ""), allowed_otp_domains):
+                    target_email = (getattr(sess, "user_credentials", None) or {}).get("email", "").lower()
 
-                attempted = getattr(sess, "otp_attempted_urls", None)
-                if attempted is None:
-                    sess.otp_attempted_urls = set()
-                    attempted = sess.otp_attempted_urls
+                current_url = await _get_current_url_safe(browser_session)
+                redacted_url = _redact_url(current_url)
+                page_signature = _stable_hash(redacted_url)
+                fields_signature = _compute_otp_fields_signature(selector_map, otp_indices)
+                otp_fill_fingerprint = _stable_hash(f"{target_email}|{page_signature}|{fields_signature}")
+                otp_values = await _read_otp_field_values(browser_session, selector_map, otp_indices)
+                filled_count = sum(1 for idx in otp_indices if (otp_values.get(idx) or "").strip())
+                otp_is_filled = bool(otp_indices) and filled_count >= len(otp_indices)
+                now = time.time()
 
-                if current_url and current_url in attempted:
-                    pass
-                else:
-                    attempted.add(current_url or "")
-                    if not allowed_email:
+                material_change = (
+                    otp_runtime_state.get("last_page_signature") != page_signature
+                    or otp_runtime_state.get("last_fields_signature") != fields_signature
+                    or otp_runtime_state.get("last_email") != target_email
+                )
+                if material_change:
+                    otp_runtime_state["generation"] = int(otp_runtime_state.get("generation") or 0) + 1
+                    otp_runtime_state["submission_pending"] = False
+                    otp_runtime_state["submission_started_at"] = 0.0
+                    otp_runtime_state["submission_page_signature"] = None
+                    otp_runtime_state["submission_fields_signature"] = None
+                    otp_runtime_state["submission_fill_fingerprint"] = None
+                    otp_runtime_state["last_page_signature"] = page_signature
+                    otp_runtime_state["last_fields_signature"] = fields_signature
+                    otp_runtime_state["last_email"] = target_email
+
+                submission_pending = bool(otp_runtime_state.get("submission_pending"))
+                if submission_pending:
+                    pending_started = float(otp_runtime_state.get("submission_started_at") or 0.0)
+                    pending_page_sig = otp_runtime_state.get("submission_page_signature")
+                    pending_fields_sig = otp_runtime_state.get("submission_fields_signature")
+                    pending_timed_out = now - pending_started > _OTP_SUBMISSION_PENDING_SECONDS
+                    pending_changed = (
+                        not otp_indices
+                        or pending_page_sig != page_signature
+                        or pending_fields_sig != fields_signature
+                        or not otp_is_filled
+                    )
+                    if pending_timed_out or pending_changed:
+                        otp_runtime_state["submission_pending"] = False
+                        otp_runtime_state["submission_started_at"] = 0.0
+                        otp_runtime_state["submission_page_signature"] = None
+                        otp_runtime_state["submission_fields_signature"] = None
+                        otp_runtime_state["submission_fill_fingerprint"] = None
+                    else:
+                        # OTP was just submitted and state has not materially changed yet.
+                        # Keep waiting for success/failure before attempting another fill.
+                        pass
+
+                if otp_is_filled and otp_fill_fingerprint:
+                    otp_runtime_state["last_fill_fingerprint"] = otp_fill_fingerprint
+                    otp_runtime_state["last_fill_time"] = now
+
+                already_satisfied = bool(
+                    otp_fill_fingerprint
+                    and otp_runtime_state.get("last_fill_fingerprint") == otp_fill_fingerprint
+                    and otp_is_filled
+                )
+                waiting_on_submit = bool(
+                    otp_runtime_state.get("submission_pending")
+                    and (now - float(otp_runtime_state.get("submission_started_at") or 0.0)) <= _OTP_SUBMISSION_PENDING_SECONDS
+                )
+
+                if not already_satisfied and not waiting_on_submit:
+                    if not target_email:
                         return ActionResult(error="OTP required; cannot continue automatically.")
-                    if not _email_is_otp_capable(allowed_email, allowed_otp_domains):
+                    if not _email_is_otp_capable(target_email, allowed_otp_domains):
                         return ActionResult(error="OTP required; cannot continue automatically.")
-
-                    password_candidates = _candidate_mailbox_passwords(sess, allowed_email, allowed_password)
+                    password_candidates = _candidate_mailbox_passwords(sess, target_email, allowed_password)
                     mailbox_password = password_candidates[0] if password_candidates else None
                     if not mailbox_password:
                         return ActionResult(error="OTP required; IMAP unavailable.")
 
                     since_ts = getattr(sess, "generated_credentials_created_at", None) or (dt.datetime.utcnow() - dt.timedelta(minutes=10))
                     try:
-                        code = await fetch_latest_otp_imap(allowed_email, mailbox_password, since_ts, attempts=18, interval=10)
+                        code = await fetch_latest_otp_imap(target_email, mailbox_password, since_ts, attempts=18, interval=10)
                     except Exception as exc:
-                        log.info("OTP auto-fill aborted: IMAP fetch failed for %s | %r", allowed_email, exc)
+                        log.info("OTP auto-fill aborted: IMAP fetch failed for %s | %r", target_email, exc)
                         return ActionResult(error="OTP required; IMAP unavailable.")
                     if not code:
                         return ActionResult(error="OTP not received")
@@ -207,14 +410,19 @@ def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[s
                                 break
                             await _send_otp(otp_indices[pos], digit)
 
-                    log.info("OTP auto-fill completed for %s on %s", allowed_email, current_url or "<unknown>")
-                    # Cache the code so the agent's explicit fetch_mailbox_otp tool
-                    # returns it immediately without a second IMAP fetch.
-                    # Keyed by (url, email) to survive URL changes within the same session.
-                    if not hasattr(sess, 'otp_filled_cache'):
+                    otp_values = await _read_otp_field_values(browser_session, selector_map, otp_indices)
+                    filled_count = sum(1 for idx in otp_indices if (otp_values.get(idx) or "").strip())
+                    if filled_count >= len(otp_indices):
+                        otp_runtime_state["last_fill_fingerprint"] = otp_fill_fingerprint
+                        otp_runtime_state["last_fill_time"] = time.time()
+
+                    log.info("OTP auto-fill completed for %s on %s", target_email, current_url or "<unknown>")
+                    if not hasattr(sess, "otp_filled_cache"):
                         sess.otp_filled_cache = {}
-                    sess.otp_filled_cache[current_url or ''] = code
-                    sess.otp_filled_cache[f'email:{allowed_email.lower()}'] = code
+                    sess.otp_filled_cache[current_url or ""] = code
+                    sess.otp_filled_cache[f"email:{target_email}"] = code
+                    if otp_fill_fingerprint:
+                        sess.otp_filled_cache[f"fingerprint:{otp_fill_fingerprint}"] = code
                     _record_auth_event(
                         sess,
                         {
@@ -222,13 +430,19 @@ def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[s
                             "step": getattr(sess, "current_step", None),
                             "page_url": current_url,
                             "params": {
-                                "email": allowed_email,
+                                "email": target_email,
                                 "since_ts": since_ts.isoformat() if isinstance(since_ts, dt.datetime) else None,
                                 "digits": len(code),
+                                "generation": otp_runtime_state.get("generation"),
                             },
                             "ts": int(dt.datetime.utcnow().timestamp() * 1000),
                         },
                     )
+
+                otp_submission_click_candidate = bool(
+                    otp_is_filled
+                    and _is_probable_otp_submit_click(action_data, selector_map)
+                )
 
         if "fetch_mailbox_verification_link" in action_data and browser_session:
             current_url = ""
@@ -436,94 +650,6 @@ def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[s
                     with contextlib.suppress(Exception):
                         setattr(sess, "pending_verification_url", None)
 
-        # Auto-handle OTP if we detect OTP fields and have a pathix.io mailbox we can read.
-        if "click" in action_data and browser_session:
-            otp_indices = await _detect_otp_indices(browser_session)
-            if otp_indices:
-                target_email = None
-                if allowed_email and _email_is_otp_capable(allowed_email, allowed_otp_domains):
-                    target_email = allowed_email.lower()
-                elif _email_is_otp_capable((getattr(sess, "user_credentials", None) or {}).get("email", ""), allowed_otp_domains):
-                    target_email = (getattr(sess, "user_credentials", None) or {}).get("email", "").lower()
-
-                if target_email and _email_is_otp_capable(target_email, allowed_otp_domains):
-                    current_url = ""
-                    with contextlib.suppress(Exception):
-                        current_url = await browser_session.get_current_page_url()
-
-                    # Deduplication: skip if already handled for this URL or email
-                    _otp_attempted = getattr(sess, "otp_attempted_urls", None)
-                    if _otp_attempted is None:
-                        sess.otp_attempted_urls = set()
-                        _otp_attempted = sess.otp_attempted_urls
-
-                    _already_done = (
-                        (current_url and current_url in _otp_attempted) or
-                        (f"email:{target_email}" in (getattr(sess, "otp_filled_cache", None) or {}))
-                    )
-                    if _already_done:
-                        log.debug("OTP click handler: already handled for %s, skipping", target_email)
-                    else:
-                        log.info("OTP fields detected %s; attempting auto-fill using %s", otp_indices, target_email)
-                        _otp_attempted.add(current_url or "")
-                        password_candidates = _candidate_mailbox_passwords(sess, target_email, allowed_password)
-                        mailbox_password = password_candidates[0] if password_candidates else None
-                        if not mailbox_password:
-                            return ActionResult(error="OTP required; IMAP unavailable.")
-
-                        since_ts = getattr(sess, "generated_credentials_created_at", None) or (dt.datetime.utcnow() - dt.timedelta(minutes=10))
-                        try:
-                            code = await fetch_latest_otp_imap(target_email, mailbox_password, since_ts, attempts=18, interval=10)
-                        except Exception as exc:
-                            log.info("OTP auto-fill aborted: IMAP fetch failed for %s | %r", target_email, exc)
-                            return ActionResult(error="OTP required; IMAP unavailable.")
-                        if not code:
-                            log.info("OTP auto-fill exhausted polling for %s", target_email)
-                            return ActionResult(error="OTP not received")
-
-                        async def _send_otp_text(idx: int, txt: str):
-                            new_input = InputTextAction(index=idx, text=txt, clear=True)
-                            input_action = action.__class__(**{"input": new_input})
-                            return await orig_act(
-                                action=input_action,
-                                browser_session=browser_session,
-                                page_extraction_llm=page_extraction_llm,
-                                sensitive_data=sensitive_data,
-                                available_file_paths=available_file_paths,
-                                file_system=file_system,
-                                action_screenshot_recorder=action_screenshot_recorder,
-                                step_number=step_number,
-                            )
-
-                        if len(otp_indices) == 1:
-                            await _send_otp_text(otp_indices[0], code)
-                        else:
-                            for pos, digit in enumerate(code):
-                                if pos >= len(otp_indices):
-                                    break
-                                await _send_otp_text(otp_indices[pos], digit)
-                        log.info("OTP auto-fill completed for %s", target_email)
-                        if not hasattr(sess, "otp_filled_cache"):
-                            sess.otp_filled_cache = {}
-                        sess.otp_filled_cache[current_url or ""] = code
-                        sess.otp_filled_cache[f"email:{target_email}"] = code
-                        _record_auth_event(
-                            sess,
-                            {
-                                "action": "otp",
-                                "step": getattr(sess, "current_step", None),
-                                "page_url": current_url,
-                                "params": {
-                                    "email": target_email,
-                                    "since_ts": since_ts.isoformat() if isinstance(since_ts, dt.datetime) else None,
-                                    "digits": len(code),
-                                },
-                                "ts": int(dt.datetime.utcnow().timestamp() * 1000),
-                            },
-                        )
-                else:
-                    return ActionResult(error="OTP required; cannot continue automatically.")
-
         # Credential enforcement on input actions
         if "input" in action_data and action_data["input"] is not None:
             params = action_data["input"]
@@ -617,6 +743,15 @@ def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[s
                     # For otp/other fields, allow without credential enforcement.
                     pass
 
+        # When OTP fields are already filled and a submit-like button is clicked,
+        # enter a short pending state so helper logic waits for verification outcome.
+        if otp_submission_click_candidate and otp_fill_fingerprint:
+            otp_runtime_state["submission_pending"] = True
+            otp_runtime_state["submission_started_at"] = time.time()
+            otp_runtime_state["submission_page_signature"] = otp_runtime_state.get("last_page_signature")
+            otp_runtime_state["submission_fields_signature"] = otp_runtime_state.get("last_fields_signature")
+            otp_runtime_state["submission_fill_fingerprint"] = otp_fill_fingerprint
+
         # Execute the action
         result = await orig_act(
             action=action,
@@ -628,6 +763,21 @@ def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[s
             action_screenshot_recorder=action_screenshot_recorder,
             step_number=step_number,
         )
+
+        if browser_session and otp_runtime_state.get("submission_pending"):
+            # Observe immediate post-submit outcome before allowing another OTP fetch/fill cycle.
+            with contextlib.suppress(Exception):
+                await browser_session.wait_for_stable_ui(
+                    timeout=_OTP_POST_SUBMIT_STABILIZATION_SECONDS,
+                    quiet_ms=250,
+                )
+            post_indices = await _detect_otp_indices(browser_session)
+            if not post_indices:
+                otp_runtime_state["submission_pending"] = False
+                otp_runtime_state["submission_started_at"] = 0.0
+                otp_runtime_state["submission_page_signature"] = None
+                otp_runtime_state["submission_fields_signature"] = None
+                otp_runtime_state["submission_fill_fingerprint"] = None
 
         # After click actions on auth pages, wait for navigation/page stability and check for login errors
         if "click" in action_data and browser_session and requires_auth:
@@ -669,6 +819,11 @@ def install_auth_guardrails(tools: Tools, sess: Any, allowed_otp_domains: list[s
                 error_msg = error_state.error_message
 
             if has_error:
+                otp_runtime_state["submission_pending"] = False
+                otp_runtime_state["submission_started_at"] = 0.0
+                otp_runtime_state["submission_page_signature"] = None
+                otp_runtime_state["submission_fields_signature"] = None
+                otp_runtime_state["submission_fill_fingerprint"] = None
                 error_type = error_type or "unknown"
                 error_msg = error_msg or "Authentication error detected"
                 log.info("Login error detected: type=%s, message=%s", error_type, error_msg)

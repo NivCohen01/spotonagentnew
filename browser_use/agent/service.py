@@ -1104,6 +1104,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		'capture_screenshot',
 		'done',           # terminal action, never a loop
 	})
+	_LOOP_EXCLUDED_ACTION_KEYS: frozenset[str] = frozenset({
+		'fetch_mailbox_otp',
+		'fetch_mailbox_verification_link',
+		'wait',
+		'screenshot',
+		'take_screenshot',
+		'capture_screenshot',
+		'done',
+	})
 
 	# Generic container HTML tags that should not be click targets when more specific
 	# interactive descendants exist in the selector map.
@@ -1253,13 +1262,26 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		Does NOT hardcode any domain, label, or element class.
 		"""
 		action_type = type(action).__name__
-		if action_type in self._LOOP_EXCLUDED_ACTION_TYPES:
+		action_type_lower = action_type.lower()
+		action_data = {}
+		action_key = ''
+		try:
+			action_data = action.model_dump(exclude_unset=True)
+			if action_data:
+				action_key = str(next(iter(action_data.keys()), '')).strip().lower()
+		except Exception:
+			action_data = {}
+			action_key = ''
+		if (
+			action_type in self._LOOP_EXCLUDED_ACTION_TYPES
+			or action_type_lower in self._LOOP_EXCLUDED_ACTION_TYPES
+			or action_key in self._LOOP_EXCLUDED_ACTION_KEYS
+		):
 			return None
 		url_bucket = hashlib.md5(url.encode('utf-8', errors='replace')).hexdigest()[:8]
 
 		label = ''
 		try:
-			action_data = action.model_dump(exclude_unset=True)
 			# Try to get the index for element-based actions
 			action_payload = next(iter(action_data.values()), {}) if action_data else {}
 			index = action_payload.get('index') if isinstance(action_payload, dict) else None

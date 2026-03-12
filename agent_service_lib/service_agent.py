@@ -50,10 +50,8 @@ from .service_models import (
 from .service_trace import (
     _apply_relevance_labels,
     _attach_images_by_evidence,
-    _attach_target_phashes,
     _build_evidence_table,
     _build_action_trace,
-    _build_page_baselines,
     _coerce_guide_output_dict,
     _ensure_json_text,
     _filter_relevant_actions,
@@ -63,7 +61,12 @@ from .service_trace import (
     _shape_steps_with_placeholders,
     _summarize_action_trace,
 )
+from . import service_trace as _service_trace
 import json
+
+
+_attach_target_phashes = getattr(_service_trace, "_attach_target_phashes", None)
+_build_page_baselines = getattr(_service_trace, "_build_page_baselines", None)
 
 
 _SUBMIT_TERMS: tuple[str, ...] = ()
@@ -229,6 +232,50 @@ def _flatten_guide_steps(guide: GuideOutputWithEvidence | dict | None) -> list[s
     return flat
 
 
+def _is_low_signal_nav_label(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not cleaned:
+        return True
+    if len(cleaned) <= 2:
+        return True
+    generic = {
+        "button",
+        "link",
+        "item",
+        "menu",
+        "div",
+        "span",
+        "click",
+        "open",
+    }
+    return cleaned in generic
+
+
+def _build_verified_navigation_trace(entries: list[ActionTraceEntry], max_items: int = 30) -> str:
+    if not entries:
+        return ""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        action_name = (entry.action or "").strip().lower()
+        if action_name not in {"navigate", "go_to", "open_tab", "switch_tab", "click"}:
+            continue
+        label = (entry.element_text or entry.value or "").strip()
+        if action_name == "click" and _is_low_signal_nav_label(label):
+            continue
+        page_url = (entry.page_url or "").strip()
+        key = f"{action_name}|{page_url}|{label.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(
+            f"- order={entry.order} step={entry.step} action={action_name} page={page_url or '<unknown>'} target={label or '<none>'}"
+        )
+        if len(lines) >= max_items:
+            break
+    return "\n".join(lines)
+
+
 def _summarize_action_for_rank(entry: ActionTraceEntry) -> dict[str, Any]:
     payload = {
         "order": entry.order,
@@ -361,6 +408,7 @@ async def _generate_final_guide_with_evidence(
     draft: dict | None,
     evidence_table: list[EvidenceEvent],
     llm: ChatOpenAI,
+    action_trace: list[ActionTraceEntry] | None = None,
     include_auth: bool = False,
 ) -> GuideOutputWithEvidence:
     draft = draft or {}
@@ -415,6 +463,8 @@ async def _generate_final_guide_with_evidence(
 
         GROUNDING REQUIREMENTS (HARD RULES)
         - Steps must be supported by the evidence table or draft. Do not invent UI labels or controls.
+        - The verified navigation trace is authoritative for action order. Do NOT omit intermediate, distinct navigation actions
+          unless they are exact retries of the same action on the same page.
         - Banned hedging words/phrases in user-facing text: "usually", "typically", "might", "may", "often", "likely",
           "around", "approximately", "roughly", "or a similar option", "or equivalent", "if needed".
         - Do not use vague placeholders like "appropriate button", "checkmark", "save icon", or "some menu".
@@ -458,6 +508,7 @@ async def _generate_final_guide_with_evidence(
 
     draft_steps_text = _draft_steps_to_text(draft.get("steps") or [])
     evidence_text = _format_evidence_table(evidence_table) or "No evidence captured. Leave evidence_ids empty."
+    navigation_trace = _build_verified_navigation_trace(action_trace or [])
 
     user_payload = dedent(f"""
         User task: {task}
@@ -470,6 +521,9 @@ async def _generate_final_guide_with_evidence(
         Evidence table:
         {evidence_text}
 
+        Verified navigation trace (ordered):
+        {navigation_trace or "None"}
+
         Reminder (must follow):
         - Only use evidence_ids from the evidence table.
         - 3+ micro-actions (enter/type/select/check/toggle/click submit/save/send) on the SAME pageUrl => one parent summary with sub_steps; do NOT leave them as separate parent steps.
@@ -480,6 +534,8 @@ async def _generate_final_guide_with_evidence(
         - primary_evidence_id must be either null or one of evidence_ids.
         - Always set images: [] for steps and sub_steps.
         - Do not invent UI labels or controls; avoid vague placeholders like "appropriate button" or "checkmark".
+        - Preserve verified intermediate navigation actions from the trace when they are distinct (different target and/or page).
+          Do not silently skip an observed navigation hop.
         - Do NOT guess element positions (e.g., "top-right corner", "bottom-left"). The screenshot shows where to click — do not hallucinate locations.
         - NEVER have a parent step with only ONE sub_step. Flatten it to a standalone step with sub_steps=[].
         - Do not use hedging words like "usually", "typically", "might", or "may".
@@ -664,6 +720,7 @@ class Session:
         self.user_credentials: Optional[dict[str, str]] = None
         self.intent: Optional[TaskIntent] = None
         self.otp_attempted_urls: set[str] = set()
+        self.otp_runtime_state: dict[str, Any] = {}
         self.verification_attempted_urls: set[str] = set()
         self.pending_verification_url: Optional[str] = None
         self.agent_profile: dict[str, str] = dict(DEFAULT_AGENT_PROFILE)
@@ -1096,8 +1153,9 @@ async def run_session(sess: Session):
                 log.info("Evidence item | id=%s actions=%s best_image=%s", ev.evidence_id, ev.action_types, ev.best_image)
 
         # Enrich trace + evidence with target crop hashes (best-effort; never fail run)
-        with contextlib.suppress(Exception):
-            _attach_target_phashes(full_trace or [], evidence_table or [])
+        if _attach_target_phashes:
+            with contextlib.suppress(Exception):
+                _attach_target_phashes(full_trace or [], evidence_table or [])
 
         extracted = _coerce_guide_output_dict(result)
         if extracted is None:
@@ -1113,6 +1171,7 @@ async def run_session(sess: Session):
             draft=draft,
             evidence_table=evidence_table,
             llm=guide_llm,
+            action_trace=full_trace,
             include_auth=bool(sess.intent.include_auth_in_final_guide) if sess.intent else False,
         )
 
@@ -1160,7 +1219,10 @@ async def run_session(sess: Session):
                         if sub_url:
                             page_urls.add(sub_url)
         final_with_images = dict(final_with_images)
-        final_with_images["page_baselines"] = _build_page_baselines(sorted(page_urls), evidence_table or [])
+        if _build_page_baselines:
+            final_with_images["page_baselines"] = _build_page_baselines(sorted(page_urls), evidence_table or [])
+        else:
+            final_with_images["page_baselines"] = {}
 
         if sess.generated_credentials:
             final_with_images = _sanitize_credentials_payload(final_with_images, sess.generated_credentials)
