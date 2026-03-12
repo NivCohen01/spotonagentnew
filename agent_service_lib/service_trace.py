@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import logging
 import re
@@ -13,7 +14,26 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 
 from .service_config import SCREENSHOTS_BASE, STEP_IMG_RE
-from .service_models import ActionTraceEntry, EvidenceEvent, EvidenceImage, GuideOutputWithEvidence, GuideStepWithEvidence
+from .service_models import (
+    ActionTraceEntry,
+    ElementSignature,
+    EvidenceEvent,
+    EvidenceImage,
+    GuideOutputWithEvidence,
+    GuideStepWithEvidence,
+    LocatorCandidate,
+    TargetBBox,
+)
+
+try:  # Optional image hashing dependencies
+    from PIL import Image
+except Exception:  # pragma: no cover - best-effort import
+    Image = None
+
+try:  # Optional, used for pHash
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - best-effort import
+    np = None
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +271,393 @@ def _normalize_element_dict(element: Any) -> Optional[dict]:
     return None
 
 
+_ELEMENT_ACTIONS = {
+    "click",
+    "type",
+    "input",
+    "fill",
+    "select",
+    "send_keys",
+    "press",
+    "tap",
+    "choose",
+    "check",
+    "uncheck",
+}
+
+_STABLE_ATTR_KEYS = ("id", "name", "type", "href", "data-testid", "aria-label", "placeholder")
+
+_DCT_CACHE: dict[int, Any] = {}
+
+
+def _is_element_action(action_name: str | None) -> bool:
+    return bool(action_name and action_name in _ELEMENT_ACTIONS)
+
+
+def _normalize_text_value(text: Any, max_len: int = 120) -> Optional[str]:
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw:
+        return None
+    cleaned = " ".join(raw.split())
+    cleaned = re.sub(r"\b[a-f0-9]{8,}\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b\d{6,}\b", "", cleaned)
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return None
+    return cleaned[:max_len]
+
+
+def _derive_role(tag: str | None, attrs: dict[str, Any]) -> Optional[str]:
+    if isinstance(attrs, dict):
+        role = attrs.get("role")
+        if isinstance(role, str) and role.strip():
+            return role.strip().lower()
+    if not tag:
+        return None
+    tag = tag.lower()
+    if tag == "a":
+        return "link"
+    if tag == "button":
+        return "button"
+    if tag in ("select", "textarea"):
+        return "textbox" if tag == "textarea" else "combobox"
+    if tag == "input":
+        input_type = (attrs or {}).get("type") if isinstance(attrs, dict) else None
+        if isinstance(input_type, str):
+            it = input_type.lower()
+            if it in ("checkbox", "radio", "submit", "button"):
+                return it if it in ("checkbox", "radio") else "button"
+        return "textbox"
+    return None
+
+
+def _extract_element_name(attrs: dict[str, Any], element_text: str | None) -> Optional[str]:
+    if not isinstance(attrs, dict):
+        attrs = {}
+    for key in ("display_name", "aria-label", "aria_label", "name", "title", "placeholder"):
+        val = attrs.get(key)
+        name = _normalize_text_value(val)
+        if name:
+            return name
+    return _normalize_text_value(element_text)
+
+
+def _extract_element_signature(
+    action_name: str | None,
+    element_tag: str | None,
+    element_text: str | None,
+    element_attributes: dict[str, Any] | None,
+) -> ElementSignature | None:
+    if not _is_element_action(action_name):
+        return None
+    attrs = element_attributes or {}
+    tag = element_tag.upper() if isinstance(element_tag, str) and element_tag else None
+    role = _derive_role(element_tag, attrs)
+    name = _extract_element_name(attrs, element_text)
+    text_snippet = _normalize_text_value(element_text or attrs.get("display_name") if isinstance(attrs, dict) else element_text)
+    stable_attrs: dict[str, Optional[str]] = {}
+    if isinstance(attrs, dict):
+        for key in _STABLE_ATTR_KEYS:
+            val = attrs.get(key)
+            if isinstance(val, str) and val.strip():
+                stable_attrs[key] = val.strip()
+            elif val is not None and key in ("type",):
+                stable_attrs[key] = str(val)
+    return ElementSignature(tag=tag, role=role, name=name, text_snippet=text_snippet, attrs=stable_attrs)
+
+
+def _escape_css_value(value: str) -> str:
+    return value.replace('"', '\\"').strip()
+
+
+def _append_candidate(
+    candidates: list[LocatorCandidate],
+    seen: set[tuple[str, str | None, str | None, str | None, str | None]],
+    candidate: LocatorCandidate,
+) -> None:
+    key = (candidate.type, candidate.role, candidate.name, candidate.value, candidate.match)
+    if key in seen:
+        return
+    seen.add(key)
+    candidates.append(candidate)
+
+
+def _build_locator_candidates(
+    action_name: str | None,
+    *,
+    element_tag: str | None,
+    element_text: str | None,
+    element_attributes: dict[str, Any] | None,
+    xpath: str | None,
+) -> list[LocatorCandidate] | None:
+    if not _is_element_action(action_name):
+        return None
+    attrs = element_attributes or {}
+    tag = element_tag.lower() if isinstance(element_tag, str) else None
+    candidates: list[LocatorCandidate] = []
+    seen: set[tuple[str, str | None, str | None, str | None, str | None]] = set()
+
+    role = _derive_role(tag, attrs)
+    name = _extract_element_name(attrs, element_text)
+    if role and name:
+        _append_candidate(
+            candidates,
+            seen,
+            LocatorCandidate(type="role", role=role, name=name, confidence=0.9),
+        )
+
+    if isinstance(attrs, dict):
+        data_testid = attrs.get("data-testid")
+        if isinstance(data_testid, str) and data_testid.strip():
+            value = f'[data-testid="{_escape_css_value(data_testid)}"]'
+            _append_candidate(
+                candidates,
+                seen,
+                LocatorCandidate(type="css", value=value, confidence=0.9),
+            )
+
+        element_id = attrs.get("id")
+        if isinstance(element_id, str) and element_id.strip():
+            value = f"#{_escape_css_value(element_id)}"
+            _append_candidate(
+                candidates,
+                seen,
+                LocatorCandidate(type="css", value=value, confidence=0.85),
+            )
+
+        name_attr = attrs.get("name")
+        if isinstance(name_attr, str) and name_attr.strip():
+            name_value = _escape_css_value(name_attr)
+            value = f'{tag}[name="{name_value}"]' if tag else f'[name="{name_value}"]'
+            _append_candidate(
+                candidates,
+                seen,
+                LocatorCandidate(type="css", value=value, confidence=0.7),
+            )
+
+        href = attrs.get("href")
+        if isinstance(href, str) and href.strip():
+            href_value = _escape_css_value(href)
+            value = f'a[href="{href_value}"]' if tag == "a" else f'[href="{href_value}"]'
+            _append_candidate(
+                candidates,
+                seen,
+                LocatorCandidate(type="css", value=value, confidence=0.65),
+            )
+
+        input_type = attrs.get("type")
+        if isinstance(input_type, str) and input_type.strip():
+            type_value = _escape_css_value(input_type)
+            value = f'{tag}[type="{type_value}"]' if tag else f'[type="{type_value}"]'
+            _append_candidate(
+                candidates,
+                seen,
+                LocatorCandidate(type="css", value=value, confidence=0.55),
+            )
+
+    text_value = _normalize_text_value(element_text or name)
+    if text_value:
+        match = "exact" if len(text_value) <= 80 else "contains"
+        confidence = 0.6 if match == "exact" else 0.45
+        _append_candidate(
+            candidates,
+            seen,
+            LocatorCandidate(type="text", value=text_value, match=match, confidence=confidence),
+        )
+
+    if xpath:
+        _append_candidate(
+            candidates,
+            seen,
+            LocatorCandidate(type="xpath", value=str(xpath), confidence=0.2),
+        )
+
+    return candidates
+
+
+def _extract_target_bbox(element_dict: dict[str, Any]) -> TargetBBox | None:
+    if not isinstance(element_dict, dict):
+        return None
+    bounds = element_dict.get("bounds") or element_dict.get("bounding_box")
+    if not isinstance(bounds, dict):
+        return None
+    try:
+        x = float(bounds.get("x"))
+        y = float(bounds.get("y"))
+        w = float(bounds.get("width", bounds.get("w")))
+        h = float(bounds.get("height", bounds.get("h")))
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return TargetBBox(x=x, y=y, w=w, h=h)
+
+
+def _resolve_image_path(path: str | None) -> Optional[Path]:
+    if not path:
+        return None
+    raw = str(path)
+    candidate = Path(raw)
+    if candidate.exists():
+        return candidate
+    rel = raw.lstrip("/")
+    fallback = (SCREENSHOTS_BASE / rel).resolve()
+    if fallback.exists():
+        return fallback
+    return None
+
+
+def _dct_matrix(n: int) -> Any:
+    if np is None:
+        return None
+    if n in _DCT_CACHE:
+        return _DCT_CACHE[n]
+    x = np.arange(n, dtype=float)
+    k = x.reshape((n, 1))
+    mat = np.cos(np.pi * (2 * x + 1) * k / (2 * n))
+    mat[0, :] *= 1.0 / np.sqrt(2)
+    mat *= np.sqrt(2 / n)
+    _DCT_CACHE[n] = mat
+    return mat
+
+
+def _compute_phash(image: Any) -> Optional[str]:
+    if Image is None or np is None or image is None:
+        return None
+    try:
+        img = image.convert("L").resize((32, 32), Image.LANCZOS)
+        pixels = np.asarray(img, dtype=float)
+        mat = _dct_matrix(32)
+        if mat is None:
+            return None
+        dct = mat @ pixels @ mat.T
+        low = dct[:8, :8].flatten()
+        if low.size < 2:
+            return None
+        median = float(np.median(low[1:]))
+        bits = [1 if v > median else 0 for v in low]
+        hex_str = ""
+        for i in range(0, 64, 4):
+            nibble = (bits[i] << 3) | (bits[i + 1] << 2) | (bits[i + 2] << 1) | bits[i + 3]
+            hex_str += f"{nibble:x}"
+        return f"phash:{hex_str}"
+    except Exception:
+        return None
+
+
+def _crop_bbox(image: Any, bbox: TargetBBox, padding: int = 16) -> Any:
+    if image is None or bbox is None:
+        return None
+    try:
+        x1 = int(bbox.x) - padding
+        y1 = int(bbox.y) - padding
+        x2 = int(bbox.x + bbox.w) + padding
+        y2 = int(bbox.y + bbox.h) + padding
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(image.width, x2)
+        y2 = min(image.height, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return image.crop((x1, y1, x2, y2))
+    except Exception:
+        return None
+
+
+def _phash_for_image_path(path: str | None, bbox: TargetBBox | None) -> Optional[str]:
+    if not path:
+        return None
+    if Image is None or np is None:
+        return None
+    resolved = _resolve_image_path(path)
+    if not resolved:
+        return None
+    try:
+        with Image.open(resolved) as img:
+            img = img.convert("RGB")
+            if bbox:
+                cropped = _crop_bbox(img, bbox)
+                if cropped is None:
+                    return None
+                return _compute_phash(cropped)
+            return _compute_phash(img)
+    except Exception:
+        return None
+
+
+def _attach_target_phashes(action_trace: list[ActionTraceEntry], evidence: list[EvidenceEvent]) -> None:
+    if not action_trace or not evidence:
+        return
+    evidence_by_step = {ev.evidence_id: ev for ev in evidence}
+    for ev in evidence:
+        if ev.target_bbox and ev.best_image:
+            ev.target_crop_phash = _phash_for_image_path(ev.best_image, ev.target_bbox)
+        elif ev.target_bbox and (ev.before_image or ev.after_image):
+            img_path = ev.before_image or ev.after_image
+            ev.target_crop_phash = _phash_for_image_path(img_path, ev.target_bbox)
+        else:
+            ev.target_crop_phash = None
+    for entry in action_trace:
+        if not entry.target_bbox:
+            entry.target_crop_phash = None
+            continue
+        ev = evidence_by_step.get(entry.step)
+        if not ev:
+            entry.target_crop_phash = None
+            continue
+        img_path = ev.best_image or ev.before_image or ev.after_image
+        entry.target_crop_phash = _phash_for_image_path(img_path, entry.target_bbox)
+
+
+def _iso_from_ts(ts: int | None) -> str:
+    if ts is None:
+        return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    try:
+        return dt.datetime.utcfromtimestamp(ts / 1000.0).replace(microsecond=0).isoformat() + "Z"
+    except Exception:
+        return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _pick_baseline_ts(ev: EvidenceEvent | None) -> int | None:
+    if not ev or not ev.images:
+        return None
+    ts_values = [img.ts for img in ev.images if img.ts is not None]
+    if not ts_values:
+        return None
+    return min(ts_values)
+
+
+def _build_page_baselines(page_urls: list[str], evidence: list[EvidenceEvent]) -> dict[str, Any]:
+    baselines: dict[str, Any] = {}
+    if not page_urls:
+        return baselines
+    for url in page_urls:
+        if not url or url in baselines:
+            continue
+        candidates = [ev for ev in evidence if ev.page_url == url]
+        chosen = None
+        for ev in candidates:
+            if ev.best_image:
+                chosen = ev
+                break
+        if chosen is None and candidates:
+            chosen = candidates[0]
+        img_path = None
+        if chosen:
+            img_path = chosen.best_image or chosen.before_image or chosen.after_image
+        ts = _pick_baseline_ts(chosen)
+        baselines[url] = {
+            "page_url": url,
+            "dom_hash": None,
+            "screenshot_phash": _phash_for_image_path(img_path, None) if img_path else None,
+            "viewport": None,
+            "captured_at": _iso_from_ts(ts),
+        }
+    return baselines
+
+
 def _stringify_action_value(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         parts = [str(v) for v in value if v not in (None, "")]
@@ -342,6 +749,25 @@ def _build_action_trace(agent_result: Any) -> list[ActionTraceEntry]:
 
             interacted_element = interacted_elements[action_pos] if action_pos < len(interacted_elements) else None
             element_dict = _normalize_element_dict(interacted_element) or {}
+            element_tag = element_dict.get("node_name")
+            element_text = element_dict.get("node_value")
+            element_attrs = element_dict.get("attributes")
+            xpath = element_dict.get("x_path") or element_dict.get("xpath")
+
+            element_signature = _extract_element_signature(
+                action_name,
+                element_tag=element_tag,
+                element_text=element_text,
+                element_attributes=element_attrs if isinstance(element_attrs, dict) else None,
+            )
+            locator_candidates = _build_locator_candidates(
+                action_name,
+                element_tag=element_tag,
+                element_text=element_text,
+                element_attributes=element_attrs if isinstance(element_attrs, dict) else None,
+                xpath=xpath,
+            )
+            target_bbox = _extract_target_bbox(element_dict)
             action_result = results[action_pos] if action_pos < len(results) else None
             if isinstance(action_result, dict) and action_result.get("error"):
                 continue
@@ -353,11 +779,14 @@ def _build_action_trace(agent_result: Any) -> list[ActionTraceEntry]:
                     action=action_name,
                     value=_extract_action_value(action_name, params_dict),
                     page_url=page_url,
-                    xpath=element_dict.get("x_path") or element_dict.get("xpath"),
-                    element_text=element_dict.get("node_value"),
-                    element_tag=element_dict.get("node_name"),
-                    element_attributes=element_dict.get("attributes"),
+                    xpath=xpath,
+                    element_text=element_text,
+                    element_tag=element_tag,
+                    element_attributes=element_attrs,
                     params=params_dict,
+                    locator_candidates=locator_candidates,
+                    target_bbox=target_bbox,
+                    element_signature=element_signature,
                 )
             )
             order += 1
@@ -781,6 +1210,10 @@ def _build_evidence_table(action_trace: list[ActionTraceEntry], images: list[Evi
                 after_image=after_image,
                 images=images_for_step,
                 params=primary_entry.params if primary_entry else {},
+                locator_candidates=primary_entry.locator_candidates if primary_entry else None,
+                target_bbox=primary_entry.target_bbox if primary_entry else None,
+                element_signature=primary_entry.element_signature if primary_entry else None,
+                target_crop_phash=None,
             )
         )
 

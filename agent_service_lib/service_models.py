@@ -94,6 +94,40 @@ class EvidenceEvent(BaseModel):
     after_image: Optional[str] = None
     images: list[EvidenceImage] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    locator_candidates: list["LocatorCandidate"] | None = None
+    target_bbox: "TargetBBox" | None = None
+    element_signature: "ElementSignature" | None = None
+    target_crop_phash: Optional[str] = None
+
+
+class LocatorCandidate(BaseModel):
+    """Preferred element locator candidate for replay or matching."""
+
+    type: Literal["role", "css", "text", "xpath"]
+    role: Optional[str] = None
+    name: Optional[str] = None
+    value: Optional[str] = None
+    match: Optional[Literal["exact", "contains"]] = None
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class TargetBBox(BaseModel):
+    """Element bounding box (page coordinates)."""
+
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+class ElementSignature(BaseModel):
+    """Stable element identity snapshot for future matching."""
+
+    tag: Optional[str] = None
+    role: Optional[str] = None
+    name: Optional[str] = None
+    text_snippet: Optional[str] = None
+    attrs: dict[str, Optional[str]] = Field(default_factory=dict)
 
 
 class ActionTraceEntry(BaseModel):
@@ -110,6 +144,10 @@ class ActionTraceEntry(BaseModel):
     element_attributes: Optional[dict[str, Any]] = None
     params: dict[str, Any] = Field(default_factory=dict)
     relevance: int = Field(default=1, ge=0, le=1)
+    locator_candidates: list[LocatorCandidate] | None = None
+    target_bbox: TargetBBox | None = None
+    element_signature: ElementSignature | None = None
+    target_crop_phash: Optional[str] = None
 
 
 class ReplayHumanizationOptions(BaseModel):

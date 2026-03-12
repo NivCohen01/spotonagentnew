@@ -50,8 +50,10 @@ from .service_models import (
 from .service_trace import (
     _apply_relevance_labels,
     _attach_images_by_evidence,
+    _attach_target_phashes,
     _build_evidence_table,
     _build_action_trace,
+    _build_page_baselines,
     _coerce_guide_output_dict,
     _ensure_json_text,
     _filter_relevant_actions,
@@ -1093,6 +1095,10 @@ async def run_session(sess: Session):
             for ev in evidence_table:
                 log.info("Evidence item | id=%s actions=%s best_image=%s", ev.evidence_id, ev.action_types, ev.best_image)
 
+        # Enrich trace + evidence with target crop hashes (best-effort; never fail run)
+        with contextlib.suppress(Exception):
+            _attach_target_phashes(full_trace or [], evidence_table or [])
+
         extracted = _coerce_guide_output_dict(result)
         if extracted is None:
             with contextlib.suppress(Exception):
@@ -1135,6 +1141,26 @@ async def run_session(sess: Session):
         if usage_summary is not None:
             final_with_images = dict(final_with_images)
             final_with_images["token_usage"] = usage_summary
+
+        # Page baselines for future update checks
+        page_urls: set[str] = set()
+        for ev in evidence_table or []:
+            if ev.page_url:
+                page_urls.add(ev.page_url)
+        steps = final_with_images.get("steps") or []
+        for step in steps:
+            if isinstance(step, dict):
+                page_url = step.get("pageUrl") or step.get("page_url")
+                if page_url:
+                    page_urls.add(page_url)
+                sub_steps = step.get("sub_steps") if isinstance(step.get("sub_steps"), list) else []
+                for sub in sub_steps:
+                    if isinstance(sub, dict):
+                        sub_url = sub.get("pageUrl") or sub.get("page_url")
+                        if sub_url:
+                            page_urls.add(sub_url)
+        final_with_images = dict(final_with_images)
+        final_with_images["page_baselines"] = _build_page_baselines(sorted(page_urls), evidence_table or [])
 
         if sess.generated_credentials:
             final_with_images = _sanitize_credentials_payload(final_with_images, sess.generated_credentials)
